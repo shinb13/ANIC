@@ -1,0 +1,20 @@
+{
+  "task_id": "public-shared-ag",
+  "instance_id": "public-shared-ag",
+  "operator": "all-gather",
+  "ranks": ["r0", "r1"],
+  "npu": ["r0", "r1"],
+  "data_size": {"per_rank_bytes": 32768},
+  "split_policy": {"mode": "search_allowed", "candidates": [1, 2], "alignment_bytes": 4096},
+  "split": 1,
+  "chunk_size": 32768,
+  "max_nonempty_rounds": 4,
+  "allow_copy": true,
+  "allow_detour": true,
+  "communication_constraints": {
+    "receive_unique_chunk_once": true,
+    "send_only_possessed_chunks": true,
+    "send_unique_chunk_pair_once": true,
+    "switches_forward_same_round_without_storage": true
+  }
+}

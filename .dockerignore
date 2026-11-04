@@ -1,0 +1,16 @@
+.env
+.git
+__pycache__/
+*.pyc
+*.tar
+agentcc_zip_tmp/
+topology-output-zip.zip
+anic_index.js
+Challenge*.js
+challenge-*.js
+description-v4.md
+development-notice-v11.md
+shared-resources-v22.md
+topology-input-guide.md
+agentcc.json
+test_agentcc.py

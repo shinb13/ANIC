@@ -1,0 +1,21 @@
+{
+  "task_id": "public-shared-ar",
+  "status": "success",
+  "output": {
+    "answer": {
+      "operator": "all-reduce",
+      "chunks": ["r0_c0", "r1_c0"],
+      "initial_possession": {"r0": ["r0_c0"], "r1": ["r1_c0"]},
+      "final_chunks": ["c0_sum"],
+      "round_count": 2,
+      "rounds": [
+        {"round": 1, "transfers": [
+          {"action": "reduce", "src": "r0", "dst": "r1", "chunk_ranges": ["r0_c0"], "path": ["r0", "S0", "r1"]}
+        ]},
+        {"round": 2, "transfers": [
+          {"action": "copy", "src": "r1", "dst": "r0", "chunk_ranges": ["r0_c0+r1_c0"], "path": ["r1", "S0", "r0"]}
+        ]}
+      ]
+    }
+  }
+}

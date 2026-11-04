@@ -1,0 +1,20 @@
+{
+  "description": "public-shared-resource-demo",
+  "operator": ["all-gather", "all-reduce"],
+  "ranks": ["r0", "r1"],
+  "switches": ["S0"],
+  "data_size": {"per_rank_bytes": 32768},
+  "communication_startup_time_us": 1,
+  "switch_processing_overhead_us": 0.3,
+  "split_policy": {"candidates": [1, 2]},
+  "allow_copy": true,
+  "allow_detour": true,
+  "edges": [
+    {"src": "r0", "dst": "S0", "bw": "1GB/s", "bidirectional": true},
+    {"src": "r1", "dst": "S0", "bw": "2GB/s", "bidirectional": true}
+  ],
+  "resources": [
+    {"id": "ingress", "capacity": "1GB/s", "edges": [{"src": "r0", "dst": "S0"}, {"src": "r1", "dst": "S0"}]},
+    {"id": "egress", "capacity": "1GB/s", "edges": [{"src": "S0", "dst": "r0"}, {"src": "S0", "dst": "r1"}]}
+  ]
+}

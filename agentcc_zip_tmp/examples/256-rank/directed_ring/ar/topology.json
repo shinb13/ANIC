@@ -1,0 +1,2818 @@
+{
+  "allow_copy": true,
+  "allow_detour": true,
+  "communication_constraints": {
+    "receive_unique_chunk_once": true,
+    "send_only_possessed_chunks": true,
+    "send_unique_chunk_pair_once": true,
+    "switches_forward_same_round_without_storage": true
+  },
+  "communication_startup_time_us": 1,
+  "data_size": {
+    "per_rank_bytes": 1048576
+  },
+  "description": "public-illustration-directed_ring-256-ar",
+  "edges": [
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A0",
+      "src": "r0"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A0",
+      "src": "r1"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A0",
+      "src": "r2"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A0",
+      "src": "r3"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A0",
+      "src": "r4"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A0",
+      "src": "r5"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A0",
+      "src": "r6"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A0",
+      "src": "r7"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A0",
+      "src": "r8"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A0",
+      "src": "r9"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A0",
+      "src": "r10"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A0",
+      "src": "r11"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A0",
+      "src": "r12"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A0",
+      "src": "r13"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A0",
+      "src": "r14"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A0",
+      "src": "r15"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A1",
+      "src": "r16"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A1",
+      "src": "r17"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A1",
+      "src": "r18"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A1",
+      "src": "r19"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A1",
+      "src": "r20"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A1",
+      "src": "r21"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A1",
+      "src": "r22"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A1",
+      "src": "r23"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A1",
+      "src": "r24"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A1",
+      "src": "r25"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A1",
+      "src": "r26"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A1",
+      "src": "r27"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A1",
+      "src": "r28"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A1",
+      "src": "r29"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A1",
+      "src": "r30"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A1",
+      "src": "r31"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A2",
+      "src": "r32"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A2",
+      "src": "r33"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A2",
+      "src": "r34"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A2",
+      "src": "r35"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A2",
+      "src": "r36"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A2",
+      "src": "r37"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A2",
+      "src": "r38"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A2",
+      "src": "r39"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A2",
+      "src": "r40"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A2",
+      "src": "r41"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A2",
+      "src": "r42"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A2",
+      "src": "r43"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A2",
+      "src": "r44"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A2",
+      "src": "r45"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A2",
+      "src": "r46"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A2",
+      "src": "r47"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A3",
+      "src": "r48"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A3",
+      "src": "r49"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A3",
+      "src": "r50"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A3",
+      "src": "r51"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A3",
+      "src": "r52"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A3",
+      "src": "r53"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A3",
+      "src": "r54"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A3",
+      "src": "r55"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A3",
+      "src": "r56"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A3",
+      "src": "r57"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A3",
+      "src": "r58"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A3",
+      "src": "r59"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A3",
+      "src": "r60"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A3",
+      "src": "r61"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A3",
+      "src": "r62"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A3",
+      "src": "r63"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A4",
+      "src": "r64"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A4",
+      "src": "r65"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A4",
+      "src": "r66"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A4",
+      "src": "r67"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A4",
+      "src": "r68"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A4",
+      "src": "r69"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A4",
+      "src": "r70"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A4",
+      "src": "r71"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A4",
+      "src": "r72"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A4",
+      "src": "r73"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A4",
+      "src": "r74"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A4",
+      "src": "r75"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A4",
+      "src": "r76"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A4",
+      "src": "r77"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A4",
+      "src": "r78"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A4",
+      "src": "r79"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A5",
+      "src": "r80"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A5",
+      "src": "r81"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A5",
+      "src": "r82"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A5",
+      "src": "r83"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A5",
+      "src": "r84"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A5",
+      "src": "r85"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A5",
+      "src": "r86"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A5",
+      "src": "r87"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A5",
+      "src": "r88"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A5",
+      "src": "r89"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A5",
+      "src": "r90"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A5",
+      "src": "r91"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A5",
+      "src": "r92"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A5",
+      "src": "r93"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A5",
+      "src": "r94"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A5",
+      "src": "r95"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A6",
+      "src": "r96"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A6",
+      "src": "r97"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A6",
+      "src": "r98"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A6",
+      "src": "r99"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A6",
+      "src": "r100"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A6",
+      "src": "r101"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A6",
+      "src": "r102"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A6",
+      "src": "r103"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A6",
+      "src": "r104"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A6",
+      "src": "r105"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A6",
+      "src": "r106"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A6",
+      "src": "r107"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A6",
+      "src": "r108"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A6",
+      "src": "r109"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A6",
+      "src": "r110"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A6",
+      "src": "r111"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A7",
+      "src": "r112"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A7",
+      "src": "r113"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A7",
+      "src": "r114"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A7",
+      "src": "r115"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A7",
+      "src": "r116"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A7",
+      "src": "r117"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A7",
+      "src": "r118"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A7",
+      "src": "r119"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A7",
+      "src": "r120"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A7",
+      "src": "r121"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A7",
+      "src": "r122"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A7",
+      "src": "r123"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A7",
+      "src": "r124"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A7",
+      "src": "r125"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A7",
+      "src": "r126"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A7",
+      "src": "r127"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A8",
+      "src": "r128"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A8",
+      "src": "r129"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A8",
+      "src": "r130"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A8",
+      "src": "r131"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A8",
+      "src": "r132"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A8",
+      "src": "r133"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A8",
+      "src": "r134"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A8",
+      "src": "r135"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A8",
+      "src": "r136"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A8",
+      "src": "r137"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A8",
+      "src": "r138"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A8",
+      "src": "r139"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A8",
+      "src": "r140"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A8",
+      "src": "r141"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A8",
+      "src": "r142"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A8",
+      "src": "r143"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A9",
+      "src": "r144"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A9",
+      "src": "r145"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A9",
+      "src": "r146"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A9",
+      "src": "r147"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A9",
+      "src": "r148"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A9",
+      "src": "r149"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A9",
+      "src": "r150"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A9",
+      "src": "r151"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A9",
+      "src": "r152"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A9",
+      "src": "r153"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A9",
+      "src": "r154"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A9",
+      "src": "r155"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A9",
+      "src": "r156"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A9",
+      "src": "r157"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A9",
+      "src": "r158"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A9",
+      "src": "r159"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A10",
+      "src": "r160"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A10",
+      "src": "r161"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A10",
+      "src": "r162"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A10",
+      "src": "r163"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A10",
+      "src": "r164"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A10",
+      "src": "r165"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A10",
+      "src": "r166"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A10",
+      "src": "r167"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A10",
+      "src": "r168"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A10",
+      "src": "r169"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A10",
+      "src": "r170"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A10",
+      "src": "r171"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A10",
+      "src": "r172"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A10",
+      "src": "r173"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A10",
+      "src": "r174"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A10",
+      "src": "r175"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A11",
+      "src": "r176"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A11",
+      "src": "r177"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A11",
+      "src": "r178"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A11",
+      "src": "r179"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A11",
+      "src": "r180"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A11",
+      "src": "r181"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A11",
+      "src": "r182"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A11",
+      "src": "r183"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A11",
+      "src": "r184"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A11",
+      "src": "r185"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A11",
+      "src": "r186"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A11",
+      "src": "r187"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A11",
+      "src": "r188"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A11",
+      "src": "r189"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A11",
+      "src": "r190"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A11",
+      "src": "r191"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A12",
+      "src": "r192"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A12",
+      "src": "r193"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A12",
+      "src": "r194"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A12",
+      "src": "r195"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A12",
+      "src": "r196"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A12",
+      "src": "r197"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A12",
+      "src": "r198"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A12",
+      "src": "r199"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A12",
+      "src": "r200"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A12",
+      "src": "r201"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A12",
+      "src": "r202"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A12",
+      "src": "r203"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A12",
+      "src": "r204"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A12",
+      "src": "r205"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A12",
+      "src": "r206"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A12",
+      "src": "r207"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A13",
+      "src": "r208"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A13",
+      "src": "r209"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A13",
+      "src": "r210"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A13",
+      "src": "r211"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A13",
+      "src": "r212"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A13",
+      "src": "r213"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A13",
+      "src": "r214"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A13",
+      "src": "r215"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A13",
+      "src": "r216"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A13",
+      "src": "r217"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A13",
+      "src": "r218"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A13",
+      "src": "r219"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A13",
+      "src": "r220"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A13",
+      "src": "r221"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A13",
+      "src": "r222"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A13",
+      "src": "r223"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A14",
+      "src": "r224"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A14",
+      "src": "r225"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A14",
+      "src": "r226"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A14",
+      "src": "r227"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A14",
+      "src": "r228"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A14",
+      "src": "r229"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A14",
+      "src": "r230"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A14",
+      "src": "r231"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A14",
+      "src": "r232"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A14",
+      "src": "r233"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A14",
+      "src": "r234"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A14",
+      "src": "r235"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A14",
+      "src": "r236"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A14",
+      "src": "r237"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A14",
+      "src": "r238"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A14",
+      "src": "r239"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A15",
+      "src": "r240"
+    },
+    {
+      "bidirectional": true,
+      "bw": "75GB/s",
+      "dst": "A15",
+      "src": "r241"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A15",
+      "src": "r242"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A15",
+      "src": "r243"
+    },
+    {
+      "bidirectional": true,
+      "bw": "71GB/s",
+      "dst": "A15",
+      "src": "r244"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A15",
+      "src": "r245"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A15",
+      "src": "r246"
+    },
+    {
+      "bidirectional": true,
+      "bw": "72GB/s",
+      "dst": "A15",
+      "src": "r247"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A15",
+      "src": "r248"
+    },
+    {
+      "bidirectional": true,
+      "bw": "73GB/s",
+      "dst": "A15",
+      "src": "r249"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A15",
+      "src": "r250"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A15",
+      "src": "r251"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A15",
+      "src": "r252"
+    },
+    {
+      "bidirectional": true,
+      "bw": "74GB/s",
+      "dst": "A15",
+      "src": "r253"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "A15",
+      "src": "r254"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "A15",
+      "src": "r255"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "R0",
+      "src": "A0"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "R1",
+      "src": "A1"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "R2",
+      "src": "A2"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "R3",
+      "src": "A3"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "R4",
+      "src": "A4"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "R5",
+      "src": "A5"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "R6",
+      "src": "A6"
+    },
+    {
+      "bidirectional": true,
+      "bw": "65GB/s",
+      "dst": "R7",
+      "src": "A7"
+    },
+    {
+      "bidirectional": true,
+      "bw": "66GB/s",
+      "dst": "R8",
+      "src": "A8"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "R9",
+      "src": "A9"
+    },
+    {
+      "bidirectional": true,
+      "bw": "64GB/s",
+      "dst": "R10",
+      "src": "A10"
+    },
+    {
+      "bidirectional": true,
+      "bw": "70GB/s",
+      "dst": "R11",
+      "src": "A11"
+    },
+    {
+      "bidirectional": true,
+      "bw": "64GB/s",
+      "dst": "R12",
+      "src": "A12"
+    },
+    {
+      "bidirectional": true,
+      "bw": "69GB/s",
+      "dst": "R13",
+      "src": "A13"
+    },
+    {
+      "bidirectional": true,
+      "bw": "65GB/s",
+      "dst": "R14",
+      "src": "A14"
+    },
+    {
+      "bidirectional": true,
+      "bw": "65GB/s",
+      "dst": "R15",
+      "src": "A15"
+    },
+    {
+      "bidirectional": false,
+      "bw": "18GB/s",
+      "dst": "R1",
+      "src": "R0"
+    },
+    {
+      "bidirectional": false,
+      "bw": "17GB/s",
+      "dst": "R2",
+      "src": "R1"
+    },
+    {
+      "bidirectional": false,
+      "bw": "14GB/s",
+      "dst": "R3",
+      "src": "R2"
+    },
+    {
+      "bidirectional": false,
+      "bw": "18GB/s",
+      "dst": "R4",
+      "src": "R3"
+    },
+    {
+      "bidirectional": false,
+      "bw": "18GB/s",
+      "dst": "R5",
+      "src": "R4"
+    },
+    {
+      "bidirectional": false,
+      "bw": "12GB/s",
+      "dst": "R6",
+      "src": "R5"
+    },
+    {
+      "bidirectional": false,
+      "bw": "15GB/s",
+      "dst": "R7",
+      "src": "R6"
+    },
+    {
+      "bidirectional": false,
+      "bw": "17GB/s",
+      "dst": "R8",
+      "src": "R7"
+    },
+    {
+      "bidirectional": false,
+      "bw": "17GB/s",
+      "dst": "R9",
+      "src": "R8"
+    },
+    {
+      "bidirectional": false,
+      "bw": "15GB/s",
+      "dst": "R10",
+      "src": "R9"
+    },
+    {
+      "bidirectional": false,
+      "bw": "16GB/s",
+      "dst": "R11",
+      "src": "R10"
+    },
+    {
+      "bidirectional": false,
+      "bw": "12GB/s",
+      "dst": "R12",
+      "src": "R11"
+    },
+    {
+      "bidirectional": false,
+      "bw": "15GB/s",
+      "dst": "R13",
+      "src": "R12"
+    },
+    {
+      "bidirectional": false,
+      "bw": "12GB/s",
+      "dst": "R14",
+      "src": "R13"
+    },
+    {
+      "bidirectional": false,
+      "bw": "18GB/s",
+      "dst": "R15",
+      "src": "R14"
+    },
+    {
+      "bidirectional": false,
+      "bw": "13GB/s",
+      "dst": "R0",
+      "src": "R15"
+    },
+    {
+      "bidirectional": false,
+      "bw": "52GB/s",
+      "dst": "R0",
+      "src": "R1"
+    },
+    {
+      "bidirectional": false,
+      "bw": "51GB/s",
+      "dst": "R1",
+      "src": "R2"
+    },
+    {
+      "bidirectional": false,
+      "bw": "51GB/s",
+      "dst": "R2",
+      "src": "R3"
+    },
+    {
+      "bidirectional": false,
+      "bw": "54GB/s",
+      "dst": "R3",
+      "src": "R4"
+    },
+    {
+      "bidirectional": false,
+      "bw": "49GB/s",
+      "dst": "R4",
+      "src": "R5"
+    },
+    {
+      "bidirectional": false,
+      "bw": "54GB/s",
+      "dst": "R5",
+      "src": "R6"
+    },
+    {
+      "bidirectional": false,
+      "bw": "49GB/s",
+      "dst": "R6",
+      "src": "R7"
+    },
+    {
+      "bidirectional": false,
+      "bw": "55GB/s",
+      "dst": "R7",
+      "src": "R8"
+    },
+    {
+      "bidirectional": false,
+      "bw": "49GB/s",
+      "dst": "R8",
+      "src": "R9"
+    },
+    {
+      "bidirectional": false,
+      "bw": "54GB/s",
+      "dst": "R9",
+      "src": "R10"
+    },
+    {
+      "bidirectional": false,
+      "bw": "55GB/s",
+      "dst": "R10",
+      "src": "R11"
+    },
+    {
+      "bidirectional": false,
+      "bw": "50GB/s",
+      "dst": "R11",
+      "src": "R12"
+    },
+    {
+      "bidirectional": false,
+      "bw": "53GB/s",
+      "dst": "R12",
+      "src": "R13"
+    },
+    {
+      "bidirectional": false,
+      "bw": "54GB/s",
+      "dst": "R13",
+      "src": "R14"
+    },
+    {
+      "bidirectional": false,
+      "bw": "54GB/s",
+      "dst": "R14",
+      "src": "R15"
+    },
+    {
+      "bidirectional": false,
+      "bw": "53GB/s",
+      "dst": "R15",
+      "src": "R0"
+    },
+    {
+      "bidirectional": true,
+      "bw": "16GB/s",
+      "dst": "R4",
+      "src": "R0"
+    },
+    {
+      "bidirectional": true,
+      "bw": "21GB/s",
+      "dst": "R6",
+      "src": "R2"
+    },
+    {
+      "bidirectional": true,
+      "bw": "21GB/s",
+      "dst": "R8",
+      "src": "R4"
+    },
+    {
+      "bidirectional": true,
+      "bw": "17GB/s",
+      "dst": "R10",
+      "src": "R6"
+    },
+    {
+      "bidirectional": true,
+      "bw": "21GB/s",
+      "dst": "R12",
+      "src": "R8"
+    },
+    {
+      "bidirectional": true,
+      "bw": "19GB/s",
+      "dst": "R14",
+      "src": "R10"
+    },
+    {
+      "bidirectional": true,
+      "bw": "16GB/s",
+      "dst": "R0",
+      "src": "R12"
+    },
+    {
+      "bidirectional": true,
+      "bw": "22GB/s",
+      "dst": "R2",
+      "src": "R14"
+    },
+    {
+      "bidirectional": true,
+      "bw": "59GB/s",
+      "dst": "H0",
+      "src": "R0"
+    },
+    {
+      "bidirectional": true,
+      "bw": "56GB/s",
+      "dst": "H0",
+      "src": "R1"
+    },
+    {
+      "bidirectional": true,
+      "bw": "62GB/s",
+      "dst": "H0",
+      "src": "R2"
+    },
+    {
+      "bidirectional": true,
+      "bw": "59GB/s",
+      "dst": "H0",
+      "src": "R3"
+    },
+    {
+      "bidirectional": true,
+      "bw": "58GB/s",
+      "dst": "H0",
+      "src": "R4"
+    },
+    {
+      "bidirectional": true,
+      "bw": "56GB/s",
+      "dst": "H0",
+      "src": "R5"
+    },
+    {
+      "bidirectional": true,
+      "bw": "58GB/s",
+      "dst": "H0",
+      "src": "R6"
+    },
+    {
+      "bidirectional": true,
+      "bw": "58GB/s",
+      "dst": "H0",
+      "src": "R7"
+    },
+    {
+      "bidirectional": true,
+      "bw": "56GB/s",
+      "dst": "H0",
+      "src": "R8"
+    },
+    {
+      "bidirectional": true,
+      "bw": "56GB/s",
+      "dst": "H0",
+      "src": "R9"
+    },
+    {
+      "bidirectional": true,
+      "bw": "60GB/s",
+      "dst": "H0",
+      "src": "R10"
+    },
+    {
+      "bidirectional": true,
+      "bw": "60GB/s",
+      "dst": "H0",
+      "src": "R11"
+    },
+    {
+      "bidirectional": true,
+      "bw": "62GB/s",
+      "dst": "H0",
+      "src": "R12"
+    },
+    {
+      "bidirectional": true,
+      "bw": "60GB/s",
+      "dst": "H0",
+      "src": "R13"
+    },
+    {
+      "bidirectional": true,
+      "bw": "58GB/s",
+      "dst": "H0",
+      "src": "R14"
+    },
+    {
+      "bidirectional": true,
+      "bw": "60GB/s",
+      "dst": "H0",
+      "src": "R15"
+    },
+    {
+      "bidirectional": true,
+      "bw": "20GB/s",
+      "dst": "H1",
+      "src": "R0"
+    },
+    {
+      "bidirectional": true,
+      "bw": "18GB/s",
+      "dst": "H1",
+      "src": "R1"
+    },
+    {
+      "bidirectional": true,
+      "bw": "18GB/s",
+      "dst": "H1",
+      "src": "R2"
+    },
+    {
+      "bidirectional": true,
+      "bw": "14GB/s",
+      "dst": "H1",
+      "src": "R3"
+    },
+    {
+      "bidirectional": true,
+      "bw": "17GB/s",
+      "dst": "H1",
+      "src": "R4"
+    },
+    {
+      "bidirectional": true,
+      "bw": "19GB/s",
+      "dst": "H1",
+      "src": "R5"
+    },
+    {
+      "bidirectional": true,
+      "bw": "17GB/s",
+      "dst": "H1",
+      "src": "R6"
+    },
+    {
+      "bidirectional": true,
+      "bw": "14GB/s",
+      "dst": "H1",
+      "src": "R7"
+    },
+    {
+      "bidirectional": true,
+      "bw": "19GB/s",
+      "dst": "H1",
+      "src": "R8"
+    },
+    {
+      "bidirectional": true,
+      "bw": "16GB/s",
+      "dst": "H1",
+      "src": "R9"
+    },
+    {
+      "bidirectional": true,
+      "bw": "15GB/s",
+      "dst": "H1",
+      "src": "R10"
+    },
+    {
+      "bidirectional": true,
+      "bw": "16GB/s",
+      "dst": "H1",
+      "src": "R11"
+    },
+    {
+      "bidirectional": true,
+      "bw": "18GB/s",
+      "dst": "H1",
+      "src": "R12"
+    },
+    {
+      "bidirectional": true,
+      "bw": "16GB/s",
+      "dst": "H1",
+      "src": "R13"
+    },
+    {
+      "bidirectional": true,
+      "bw": "14GB/s",
+      "dst": "H1",
+      "src": "R14"
+    },
+    {
+      "bidirectional": true,
+      "bw": "20GB/s",
+      "dst": "H1",
+      "src": "R15"
+    },
+    {
+      "bidirectional": true,
+      "bw": "20GB/s",
+      "dst": "H1",
+      "src": "H0"
+    }
+  ],
+  "operator": [
+    "all-gather",
+    "all-reduce"
+  ],
+  "ranks": [
+    "r0",
+    "r1",
+    "r2",
+    "r3",
+    "r4",
+    "r5",
+    "r6",
+    "r7",
+    "r8",
+    "r9",
+    "r10",
+    "r11",
+    "r12",
+    "r13",
+    "r14",
+    "r15",
+    "r16",
+    "r17",
+    "r18",
+    "r19",
+    "r20",
+    "r21",
+    "r22",
+    "r23",
+    "r24",
+    "r25",
+    "r26",
+    "r27",
+    "r28",
+    "r29",
+    "r30",
+    "r31",
+    "r32",
+    "r33",
+    "r34",
+    "r35",
+    "r36",
+    "r37",
+    "r38",
+    "r39",
+    "r40",
+    "r41",
+    "r42",
+    "r43",
+    "r44",
+    "r45",
+    "r46",
+    "r47",
+    "r48",
+    "r49",
+    "r50",
+    "r51",
+    "r52",
+    "r53",
+    "r54",
+    "r55",
+    "r56",
+    "r57",
+    "r58",
+    "r59",
+    "r60",
+    "r61",
+    "r62",
+    "r63",
+    "r64",
+    "r65",
+    "r66",
+    "r67",
+    "r68",
+    "r69",
+    "r70",
+    "r71",
+    "r72",
+    "r73",
+    "r74",
+    "r75",
+    "r76",
+    "r77",
+    "r78",
+    "r79",
+    "r80",
+    "r81",
+    "r82",
+    "r83",
+    "r84",
+    "r85",
+    "r86",
+    "r87",
+    "r88",
+    "r89",
+    "r90",
+    "r91",
+    "r92",
+    "r93",
+    "r94",
+    "r95",
+    "r96",
+    "r97",
+    "r98",
+    "r99",
+    "r100",
+    "r101",
+    "r102",
+    "r103",
+    "r104",
+    "r105",
+    "r106",
+    "r107",
+    "r108",
+    "r109",
+    "r110",
+    "r111",
+    "r112",
+    "r113",
+    "r114",
+    "r115",
+    "r116",
+    "r117",
+    "r118",
+    "r119",
+    "r120",
+    "r121",
+    "r122",
+    "r123",
+    "r124",
+    "r125",
+    "r126",
+    "r127",
+    "r128",
+    "r129",
+    "r130",
+    "r131",
+    "r132",
+    "r133",
+    "r134",
+    "r135",
+    "r136",
+    "r137",
+    "r138",
+    "r139",
+    "r140",
+    "r141",
+    "r142",
+    "r143",
+    "r144",
+    "r145",
+    "r146",
+    "r147",
+    "r148",
+    "r149",
+    "r150",
+    "r151",
+    "r152",
+    "r153",
+    "r154",
+    "r155",
+    "r156",
+    "r157",
+    "r158",
+    "r159",
+    "r160",
+    "r161",
+    "r162",
+    "r163",
+    "r164",
+    "r165",
+    "r166",
+    "r167",
+    "r168",
+    "r169",
+    "r170",
+    "r171",
+    "r172",
+    "r173",
+    "r174",
+    "r175",
+    "r176",
+    "r177",
+    "r178",
+    "r179",
+    "r180",
+    "r181",
+    "r182",
+    "r183",
+    "r184",
+    "r185",
+    "r186",
+    "r187",
+    "r188",
+    "r189",
+    "r190",
+    "r191",
+    "r192",
+    "r193",
+    "r194",
+    "r195",
+    "r196",
+    "r197",
+    "r198",
+    "r199",
+    "r200",
+    "r201",
+    "r202",
+    "r203",
+    "r204",
+    "r205",
+    "r206",
+    "r207",
+    "r208",
+    "r209",
+    "r210",
+    "r211",
+    "r212",
+    "r213",
+    "r214",
+    "r215",
+    "r216",
+    "r217",
+    "r218",
+    "r219",
+    "r220",
+    "r221",
+    "r222",
+    "r223",
+    "r224",
+    "r225",
+    "r226",
+    "r227",
+    "r228",
+    "r229",
+    "r230",
+    "r231",
+    "r232",
+    "r233",
+    "r234",
+    "r235",
+    "r236",
+    "r237",
+    "r238",
+    "r239",
+    "r240",
+    "r241",
+    "r242",
+    "r243",
+    "r244",
+    "r245",
+    "r246",
+    "r247",
+    "r248",
+    "r249",
+    "r250",
+    "r251",
+    "r252",
+    "r253",
+    "r254",
+    "r255"
+  ],
+  "resources": [
+    {
+      "capacity": "60GB/s",
+      "edges": [
+        {
+          "dst": "R1",
+          "src": "R0"
+        },
+        {
+          "dst": "R2",
+          "src": "R1"
+        },
+        {
+          "dst": "R3",
+          "src": "R2"
+        },
+        {
+          "dst": "R4",
+          "src": "R3"
+        },
+        {
+          "dst": "R5",
+          "src": "R4"
+        },
+        {
+          "dst": "R6",
+          "src": "R5"
+        },
+        {
+          "dst": "R7",
+          "src": "R6"
+        },
+        {
+          "dst": "R8",
+          "src": "R7"
+        },
+        {
+          "dst": "R9",
+          "src": "R8"
+        },
+        {
+          "dst": "R10",
+          "src": "R9"
+        },
+        {
+          "dst": "R11",
+          "src": "R10"
+        },
+        {
+          "dst": "R12",
+          "src": "R11"
+        },
+        {
+          "dst": "R13",
+          "src": "R12"
+        },
+        {
+          "dst": "R14",
+          "src": "R13"
+        },
+        {
+          "dst": "R15",
+          "src": "R14"
+        },
+        {
+          "dst": "R0",
+          "src": "R15"
+        }
+      ],
+      "id": "ring-clockwise"
+    },
+    {
+      "capacity": "185GB/s",
+      "edges": [
+        {
+          "dst": "R0",
+          "src": "R1"
+        },
+        {
+          "dst": "R1",
+          "src": "R2"
+        },
+        {
+          "dst": "R2",
+          "src": "R3"
+        },
+        {
+          "dst": "R3",
+          "src": "R4"
+        },
+        {
+          "dst": "R4",
+          "src": "R5"
+        },
+        {
+          "dst": "R5",
+          "src": "R6"
+        },
+        {
+          "dst": "R6",
+          "src": "R7"
+        },
+        {
+          "dst": "R7",
+          "src": "R8"
+        },
+        {
+          "dst": "R8",
+          "src": "R9"
+        },
+        {
+          "dst": "R9",
+          "src": "R10"
+        },
+        {
+          "dst": "R10",
+          "src": "R11"
+        },
+        {
+          "dst": "R11",
+          "src": "R12"
+        },
+        {
+          "dst": "R12",
+          "src": "R13"
+        },
+        {
+          "dst": "R13",
+          "src": "R14"
+        },
+        {
+          "dst": "R14",
+          "src": "R15"
+        },
+        {
+          "dst": "R15",
+          "src": "R0"
+        }
+      ],
+      "id": "ring-counterclockwise"
+    },
+    {
+      "capacity": "136GB/s",
+      "edges": [
+        {
+          "dst": "H0",
+          "src": "R0"
+        },
+        {
+          "dst": "H0",
+          "src": "R1"
+        },
+        {
+          "dst": "H0",
+          "src": "R2"
+        },
+        {
+          "dst": "H0",
+          "src": "R3"
+        },
+        {
+          "dst": "H0",
+          "src": "R4"
+        },
+        {
+          "dst": "H0",
+          "src": "R5"
+        },
+        {
+          "dst": "H0",
+          "src": "R6"
+        },
+        {
+          "dst": "H0",
+          "src": "R7"
+        },
+        {
+          "dst": "H0",
+          "src": "R8"
+        },
+        {
+          "dst": "H0",
+          "src": "R9"
+        },
+        {
+          "dst": "H0",
+          "src": "R10"
+        },
+        {
+          "dst": "H0",
+          "src": "R11"
+        },
+        {
+          "dst": "H0",
+          "src": "R12"
+        },
+        {
+          "dst": "H0",
+          "src": "R13"
+        },
+        {
+          "dst": "H0",
+          "src": "R14"
+        },
+        {
+          "dst": "H0",
+          "src": "R15"
+        }
+      ],
+      "id": "H0-ingress"
+    },
+    {
+      "capacity": "194GB/s",
+      "edges": [
+        {
+          "dst": "R0",
+          "src": "H0"
+        },
+        {
+          "dst": "R1",
+          "src": "H0"
+        },
+        {
+          "dst": "R2",
+          "src": "H0"
+        },
+        {
+          "dst": "R3",
+          "src": "H0"
+        },
+        {
+          "dst": "R4",
+          "src": "H0"
+        },
+        {
+          "dst": "R5",
+          "src": "H0"
+        },
+        {
+          "dst": "R6",
+          "src": "H0"
+        },
+        {
+          "dst": "R7",
+          "src": "H0"
+        },
+        {
+          "dst": "R8",
+          "src": "H0"
+        },
+        {
+          "dst": "R9",
+          "src": "H0"
+        },
+        {
+          "dst": "R10",
+          "src": "H0"
+        },
+        {
+          "dst": "R11",
+          "src": "H0"
+        },
+        {
+          "dst": "R12",
+          "src": "H0"
+        },
+        {
+          "dst": "R13",
+          "src": "H0"
+        },
+        {
+          "dst": "R14",
+          "src": "H0"
+        },
+        {
+          "dst": "R15",
+          "src": "H0"
+        }
+      ],
+      "id": "H0-egress"
+    },
+    {
+      "capacity": "35GB/s",
+      "edges": [
+        {
+          "dst": "H1",
+          "src": "R0"
+        },
+        {
+          "dst": "H1",
+          "src": "R1"
+        },
+        {
+          "dst": "H1",
+          "src": "R2"
+        },
+        {
+          "dst": "H1",
+          "src": "R3"
+        },
+        {
+          "dst": "H1",
+          "src": "R4"
+        },
+        {
+          "dst": "H1",
+          "src": "R5"
+        },
+        {
+          "dst": "H1",
+          "src": "R6"
+        },
+        {
+          "dst": "H1",
+          "src": "R7"
+        },
+        {
+          "dst": "H1",
+          "src": "R8"
+        },
+        {
+          "dst": "H1",
+          "src": "R9"
+        },
+        {
+          "dst": "H1",
+          "src": "R10"
+        },
+        {
+          "dst": "H1",
+          "src": "R11"
+        },
+        {
+          "dst": "H1",
+          "src": "R12"
+        },
+        {
+          "dst": "H1",
+          "src": "R13"
+        },
+        {
+          "dst": "H1",
+          "src": "R14"
+        },
+        {
+          "dst": "H1",
+          "src": "R15"
+        }
+      ],
+      "id": "H1-ingress"
+    },
+    {
+      "capacity": "44GB/s",
+      "edges": [
+        {
+          "dst": "R0",
+          "src": "H1"
+        },
+        {
+          "dst": "R1",
+          "src": "H1"
+        },
+        {
+          "dst": "R2",
+          "src": "H1"
+        },
+        {
+          "dst": "R3",
+          "src": "H1"
+        },
+        {
+          "dst": "R4",
+          "src": "H1"
+        },
+        {
+          "dst": "R5",
+          "src": "H1"
+        },
+        {
+          "dst": "R6",
+          "src": "H1"
+        },
+        {
+          "dst": "R7",
+          "src": "H1"
+        },
+        {
+          "dst": "R8",
+          "src": "H1"
+        },
+        {
+          "dst": "R9",
+          "src": "H1"
+        },
+        {
+          "dst": "R10",
+          "src": "H1"
+        },
+        {
+          "dst": "R11",
+          "src": "H1"
+        },
+        {
+          "dst": "R12",
+          "src": "H1"
+        },
+        {
+          "dst": "R13",
+          "src": "H1"
+        },
+        {
+          "dst": "R14",
+          "src": "H1"
+        },
+        {
+          "dst": "R15",
+          "src": "H1"
+        }
+      ],
+      "id": "H1-egress"
+    }
+  ],
+  "split_policy": {
+    "candidates split": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ]
+  },
+  "switch_processing_overhead_us": 0.3,
+  "switches": [
+    "A0",
+    "A1",
+    "A2",
+    "A3",
+    "A4",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "A9",
+    "A10",
+    "A11",
+    "A12",
+    "A13",
+    "A14",
+    "A15",
+    "R0",
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5",
+    "R6",
+    "R7",
+    "R8",
+    "R9",
+    "R10",
+    "R11",
+    "R12",
+    "R13",
+    "R14",
+    "R15",
+    "H0",
+    "H1"
+  ]
+}

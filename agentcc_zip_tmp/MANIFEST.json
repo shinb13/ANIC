@@ -1,0 +1,225 @@
+{
+  "official_pool_compatible": false,
+  "rank_count": 256,
+  "samples": [
+    {
+      "edge_count": 576,
+      "family": "uneven_pods",
+      "operator": "all-gather",
+      "resource_count": 8,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "switch_count": 36,
+      "task_id": "public_256_uneven_pods_ag"
+    },
+    {
+      "edge_count": 576,
+      "family": "uneven_pods",
+      "operator": "all-reduce",
+      "resource_count": 8,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "switch_count": 36,
+      "task_id": "public_256_uneven_pods_ar"
+    },
+    {
+      "edge_count": 345,
+      "family": "directed_ring",
+      "operator": "all-gather",
+      "resource_count": 6,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "switch_count": 34,
+      "task_id": "public_256_directed_ring_ag"
+    },
+    {
+      "edge_count": 345,
+      "family": "directed_ring",
+      "operator": "all-reduce",
+      "resource_count": 6,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "switch_count": 34,
+      "task_id": "public_256_directed_ring_ar"
+    },
+    {
+      "edge_count": 591,
+      "family": "sparse_fabric",
+      "operator": "all-gather",
+      "resource_count": 16,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "switch_count": 40,
+      "task_id": "public_256_sparse_fabric_ag"
+    },
+    {
+      "edge_count": 591,
+      "family": "sparse_fabric",
+      "operator": "all-reduce",
+      "resource_count": 16,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "switch_count": 40,
+      "task_id": "public_256_sparse_fabric_ar"
+    },
+    {
+      "edge_count": 5376,
+      "family": "cloudmatrix",
+      "operator": "all-gather",
+      "resource_count": 14,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "switch_count": 336,
+      "task_id": "public_256_cloudmatrix_ag"
+    },
+    {
+      "edge_count": 5376,
+      "family": "cloudmatrix",
+      "operator": "all-reduce",
+      "resource_count": 14,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "switch_count": 336,
+      "task_id": "public_256_cloudmatrix_ar"
+    },
+    {
+      "edge_count": 3072,
+      "family": "fullmesh_clos",
+      "operator": "all-gather",
+      "resource_count": 8,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "switch_count": 36,
+      "task_id": "public_256_fullmesh_clos_ag"
+    },
+    {
+      "edge_count": 3072,
+      "family": "fullmesh_clos",
+      "operator": "all-reduce",
+      "resource_count": 8,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "switch_count": 36,
+      "task_id": "public_256_fullmesh_clos_ar"
+    },
+    {
+      "edge_count": 3840,
+      "family": "mesh2d",
+      "operator": "all-gather",
+      "resource_count": 16,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "switch_count": 8,
+      "task_id": "public_256_mesh2d_ag"
+    },
+    {
+      "edge_count": 3840,
+      "family": "mesh2d",
+      "operator": "all-reduce",
+      "resource_count": 16,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "switch_count": 8,
+      "task_id": "public_256_mesh2d_ar"
+    },
+    {
+      "edge_count": 4496,
+      "family": "nvlink_like",
+      "operator": "all-gather",
+      "resource_count": 18,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "switch_count": 89,
+      "task_id": "public_256_nvlink_like_ag"
+    },
+    {
+      "edge_count": 4496,
+      "family": "nvlink_like",
+      "operator": "all-reduce",
+      "resource_count": 18,
+      "split_candidates": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "switch_count": 89,
+      "task_id": "public_256_nvlink_like_ar"
+    }
+  ],
+  "version": "public-agentcc-v22-20261102"
+}
