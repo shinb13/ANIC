@@ -8,6 +8,8 @@ choose a legal split candidate. It then reads the request's `task` and
 `topology`, including directed edge bandwidth and shared resources, builds
 resource-aware switch-only-intermediate routes, and uses recursive doubling
 for AllGather and AllReduce. It does not use fixed public topology data.
+Malformed or out-of-policy model split suggestions fall back to the task's
+first legal candidate before schedule construction.
 
 The local estimator follows the published Replay timing terms to compare split
 candidates. The official platform Replay remains the scoring authority.
@@ -23,8 +25,8 @@ and `AGENT_MODEL_NAME`; these values are never stored in the repository or
 image.
 
 ```powershell
-docker build --platform linux/amd64 -t team-001-agent:0.1.0 .
-docker run --rm -p 18080:8080 team-001-agent:0.1.0
+docker build --platform linux/amd64 -t team-001-agent:0.1.1 .
+docker run --rm -p 18080:8080 team-001-agent:0.1.1
 ```
 
 The runtime exposes `GET /health` and `POST /solve` on port 8080. The request

@@ -4,7 +4,7 @@ import os
 import openai
 from agenthack import BaseAgent, state, turn
 
-from agentcc_solver import solve_input
+from agentcc_solver import _candidate_splits, solve_input
 
 
 class AgentCCAgent(BaseAgent):
@@ -53,18 +53,16 @@ class AgentCCAgent(BaseAgent):
                         max_tokens=32,
                     )
                 content = response.choices[0].message.content
-                if not content:
-                    raise ValueError("the model returned an empty split decision")
-                decision = json.loads(content)
-                preferred_split = decision["split"]
-                if type(preferred_split) is not int:
-                    raise ValueError("the model split decision must be an integer")
-                if preferred_split not in {int(value) for value in task["split_policy"]["candidates"]}:
-                    raise ValueError("the model selected a split outside the task candidates")
-                data_size = int(task["data_size"]["per_rank_bytes"])
-                alignment = int(task["split_policy"]["alignment_bytes"])
-                if data_size % preferred_split != 0 or (data_size // preferred_split) % alignment != 0:
-                    raise ValueError("the model selected a split that violates alignment")
+                valid_splits = _candidate_splits(task)
+                preferred_split = valid_splits[0]
+                if content:
+                    try:
+                        decision = json.loads(content)
+                    except (json.JSONDecodeError, TypeError):
+                        decision = None
+                    model_split = decision.get("split") if isinstance(decision, dict) else None
+                    if type(model_split) is int and model_split in valid_splits:
+                        preferred_split = model_split
 
                 answer = solve_input(task_input, preferred_split=preferred_split)
 
