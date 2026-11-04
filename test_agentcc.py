@@ -23,6 +23,7 @@ class AgentCCBaselineTests(unittest.TestCase):
             self.assertEqual(response["status"], "success")
             answer = response["output"]["answer"]
             self.assertEqual(answer["operator"], operator)
+            self.assertEqual(answer["split"], 1)
             self.assertAlmostEqual(estimate_schedule_time_us(task, topology, answer), 66.836, places=3)
 
     def test_all_public_256_rank_examples(self):
@@ -44,6 +45,7 @@ class AgentCCBaselineTests(unittest.TestCase):
                 self.assertEqual(response["status"], "success")
                 answer = response["output"]["answer"]
                 self.assertEqual(answer["operator"], operator)
+                self.assertEqual(answer["split"], 1)
                 self.assertEqual(answer["round_count"], 8)
 
 

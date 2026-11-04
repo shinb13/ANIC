@@ -376,26 +376,17 @@ def build_solution(
 ) -> dict[str, Any]:
     if list(task["ranks"]) != list(topology["ranks"]):
         raise AgentCCError("task.ranks and topology.ranks must match")
-    candidate_splits = _candidate_splits(task, preferred_split)
-    routes = _routes(task, topology, candidate_splits[0])
-    best_answer: dict[str, Any] | None = None
-    best_time = inf
-    for split in candidate_splits:
-        if task["operator"] == "all-gather":
-            answer = _allgather(task, topology, routes, split)
-        elif task["operator"] == "all-reduce":
-            answer = _allreduce(task, topology, routes, split)
-        else:
-            raise AgentCCError(f"unsupported operator: {task['operator']}")
-        if answer["round_count"] > int(task["max_nonempty_rounds"]):
-            raise AgentCCError("generated schedule exceeds max_nonempty_rounds")
-        estimated_time = estimate_schedule_time_us(task, topology, answer)
-        if estimated_time < best_time:
-            best_time = estimated_time
-            best_answer = answer
-    if best_answer is None:
-        raise AgentCCError("unable to build a schedule")
-    return best_answer
+    split = min(_candidate_splits(task, preferred_split))
+    routes = _routes(task, topology, split)
+    if task["operator"] == "all-gather":
+        answer = _allgather(task, topology, routes, split)
+    elif task["operator"] == "all-reduce":
+        answer = _allreduce(task, topology, routes, split)
+    else:
+        raise AgentCCError(f"unsupported operator: {task['operator']}")
+    if answer["round_count"] > int(task["max_nonempty_rounds"]):
+        raise AgentCCError("generated schedule exceeds max_nonempty_rounds")
+    return answer
 
 
 def solve_input(task_input: dict[str, Any], preferred_split: int | None = None) -> dict[str, Any]:

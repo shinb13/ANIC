@@ -7,7 +7,7 @@ COPY src/ ./src/
 USER agent
 
 LABEL org.agenthack.team_id="team-001"
-LABEL org.agenthack.version="0.1.1"
+LABEL org.agenthack.version="0.1.2"
 
 EXPOSE 8080
 CMD ["python", "-m", "src"]
