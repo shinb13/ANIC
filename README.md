@@ -1,10 +1,12 @@
 # AgentCC baseline
 
-This repository contains an AgentCC scheduling baseline with a model-guided
-split decision and deterministic schedule construction.
+This repository contains an AgentCC scheduling baseline and a numeric foundation
+for bounded schedule search.
 
 The agent calls the configured OpenAI-compatible model once per request to
-choose a legal split candidate. It then reads the request's `task` and
+suggest a legal split candidate. The current baseline always uses the minimum
+legal split, so this suggestion does not yet change the emitted schedule.
+It reads the request's `task` and
 `topology`, including directed edge bandwidth and shared resources, builds
 resource-aware switch-only-intermediate routes, and uses recursive doubling
 for AllGather and AllReduce. It does not use fixed public topology data.
@@ -14,8 +16,15 @@ The current V1 baseline constructs the minimum legal split directly; it keeps
 the eight-round recursive-doubling communication structure while the search
 algorithms are being developed.
 
-The local estimator follows the published Replay timing terms to compare split
-candidates. The official platform Replay remains the scoring authority.
+The first search-infrastructure step compiles directed edges and shared resources
+once per problem, uses integer IDs and bitsets during construction/verification,
+and serializes the verified plan at the output boundary. Routing and recursive
+doubling retain the V1 policy. The local estimator uses the published V22 formula,
+including the maximum startup/switch overhead of the actual paths in each round.
+The official platform Replay remains the scoring authority.
+
+See [numeric schedule APIs](docs/numeric-schedules.md) for incremental validation,
+structured error locations, and per-round edge/resource loads.
 
 The public examples are local fixtures only. Official evaluation data arrives
 inside each `/solve` request.
@@ -39,8 +48,13 @@ the current AgentCC `task` and `topology`.
 ## Local verification
 
 ```powershell
-python -m unittest -v test_agentcc.py
+python -m unittest -v
+python benchmark_agentcc.py --repeat 3
 ```
+
+Tests cover all 14 public 256-rank fixtures, the shared-resource examples,
+hand-computed Replay cases, and illegal state transitions. Benchmarks exclude
+model calls, SDK handling, and HTTP latency; they are not official solve times.
 
 ## Container entry point
 

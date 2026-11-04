@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 import unittest
 
-from agentcc_solver import estimate_schedule_time_us, solve_request
+from agentcc_solver import estimate_schedule_time_us, solve_request, validate_request
 
 
 ROOT = Path(__file__).parent
@@ -14,12 +14,25 @@ def read_json(path: Path):
 
 
 class AgentCCBaselineTests(unittest.TestCase):
+    def test_published_shared_resource_schedules(self):
+        base = PUBLIC / "shared-resource"
+        topology = read_json(base / "topology.json")
+        for operator, expected_us in (("all-gather", 66.836), ("all-reduce", 100.904)):
+            with self.subTest(operator=operator):
+                task = read_json(base / f"{operator}-task.json")
+                response = read_json(base / f"{operator}-solution.json")
+                # The published tiny examples omit the optional explicit split.
+                response["output"]["answer"]["split"] = task["split"]
+                validate_request(task, topology, response)
+                self.assertAlmostEqual(estimate_schedule_time_us(task, topology, response["output"]["answer"]), expected_us, places=3)
+
     def test_shared_resource_examples(self):
         base = PUBLIC / "shared-resource"
         topology = read_json(base / "topology.json")
         for operator in ("all-gather", "all-reduce"):
             task = read_json(base / f"{operator}-task.json")
             response = solve_request(task, topology)
+            validate_request(task, topology, response)
             self.assertEqual(response["status"], "success")
             answer = response["output"]["answer"]
             self.assertEqual(answer["operator"], operator)
@@ -41,12 +54,14 @@ class AgentCCBaselineTests(unittest.TestCase):
                 base = PUBLIC / "256-rank" / family / short_name
                 task = read_json(base / "task.json")
                 topology = read_json(base / "topology.json")
-                response = solve_request(task, topology)
-                self.assertEqual(response["status"], "success")
-                answer = response["output"]["answer"]
-                self.assertEqual(answer["operator"], operator)
-                self.assertEqual(answer["split"], 1)
-                self.assertEqual(answer["round_count"], 8)
+                with self.subTest(family=family, operator=operator):
+                    response = solve_request(task, topology)
+                    validate_request(task, topology, response)
+                    self.assertEqual(response["status"], "success")
+                    answer = response["output"]["answer"]
+                    self.assertEqual(answer["operator"], operator)
+                    self.assertEqual(answer["split"], 1)
+                    self.assertEqual(answer["round_count"], 8)
 
 
 if __name__ == "__main__":
