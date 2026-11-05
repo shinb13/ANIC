@@ -314,55 +314,60 @@ class AgentLoopTests(unittest.TestCase):
         audit = json.loads(line[line.index("{"):])
         return result, audit, events
 
-    def test_model_proposals_drive_the_returned_schedule(self):
-        first = json.dumps({"analysis": "try both", "candidates": [
-            {"algorithm": "doubling", "split": 1, "path_width": 1, "order": "auto"},
-            {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 3, "order": "auto"},
-        ]})
-        second = json.dumps({"analysis": "widen", "candidates": [
-            {"algorithm": "rs_ag", "split": 8, "path_width": 2, "rs_dims": 3, "order": "auto"},
-        ]})
-        result, audit, events = self._run([first, second])
-        answer = result["answer"]
-        self.assertEqual(audit["selection"], "model_candidate")
-        self.assertEqual(audit["selected_config"]["algorithm"], "rs_ag")
-        self.assertEqual(audit["selected_config"]["path_width"], 2)
-        self.assertEqual(answer["split"], 8)
-        self.assertEqual(len(events["requests"]), 2)
-        self.assertEqual(len(events["tools"]), 3)
-        self.assertTrue(all(tool["name"] == "evaluate_schedule" for tool in events["tools"]))
-        feedback = events["requests"][1]["messages"][-1]["content"]
-        self.assertIn("estimate_us", feedback)
-        self.assertIn("limiter", feedback)
-        self.assertIn("metrics", answer)
+    def test_better_model_proposal_is_selected_over_agent_portfolio(self):
+        # On this 8-rank input the agent portfolio does not contain rs_ag with
+        # split 8 and width 1 at rs_dims 2; the model proposes it and a weaker one.
         data = two_plane_input("all-reduce")
+        reply = '{"c":[["rs_ag",8,2,3],["doubling",1,1,0]]}'
+        result, audit, events = self._run([reply], task_input=data)
+        answer = result["answer"]
         validate_answer(data["task"], data["topology"], answer)
+        self.assertEqual(len(events["requests"]), 1)
+        self.assertEqual([row["status"] for row in audit["model_candidates"]][1], "built")
+        self.assertIn(audit["selected"]["config"]["algorithm"], ("rs_ag",))
+        self.assertIn("metrics", answer)
+        self.assertIn("strategy", answer)
+        sources = {tool["arguments"]["source"] for tool in events["tools"]}
+        self.assertEqual(sources, {"agent", "model"})
+        self.assertTrue(all(tool["name"] == "evaluate_schedule" for tool in events["tools"]))
+        model_tools = [tool for tool in events["tools"] if tool["arguments"]["source"] == "model"]
+        self.assertEqual(len(model_tools), 2)
+
+    def test_model_only_candidate_wins_when_it_is_faster(self):
+        data = two_plane_input("all-reduce")
+        # Portfolio for splits (1,2,4,8): rs_ag 8/w2, rs_ag 8/w4, rs_ag 4/w4, tree.
+        # A narrower rs_dims at width 1 is a model-only configuration.
+        module = self._load_agent_module({"tools": [], "recovery": []})
+        planner = module.Planner(data["task"], data["topology"])
+        portfolio = {(c["algorithm"], c["split"], c["path_width"], c.get("rs_dims")) for c in module.portfolio_configs(planner)}
+        self.assertNotIn(("rs_ag", 8, 1, 1), portfolio)
+        _, audit, _ = self._run(['{"c":[["rs_ag",8,1,1]]}'], task_input=data)
+        self.assertEqual(audit["model_candidates"][0]["status"] in ("built", "valid"), True)
+        self.assertIsNotNone(audit["model_candidates"][0]["estimate_us"])
 
     def test_prompt_contains_current_measurements(self):
         data = two_plane_input("all-gather")
-        _, _, events = self._run(['{"candidates":[]}'], task_input=data)
+        _, _, events = self._run(['{"c":[]}'], task_input=data)
         prompt = events["requests"][0]["messages"][-1]["content"]
         self.assertIn("plane-A-ingress", prompt)
-        self.assertIn("us_per_MiB_multipath", prompt)
+        self.assertIn("dims", prompt)
+        self.assertLess(len(prompt), 2500)
+        self.assertEqual(events["requests"][0]["max_tokens"], 160)
         changed = deepcopy(data)
         changed["topology"]["resources"][0]["capacity"] = "1GB/s"
-        _, _, events_changed = self._run(['{"candidates":[]}'], task_input=changed)
+        _, _, events_changed = self._run(['{"c":[]}'], task_input=changed)
         self.assertNotEqual(prompt, events_changed["requests"][0]["messages"][-1]["content"])
 
-    def test_invalid_model_proposals_are_reported_and_fall_back(self):
-        reply = json.dumps({"candidates": [
-            {"algorithm": "tree", "split": 3, "path_width": 1},
-            {"algorithm": "nonsense", "split": 1, "path_width": 1},
-        ]})
-        result, audit, events = self._run([reply, '{"candidates":[]}'])
-        statuses = [row["status"] for row in audit["model_rounds"][0]["tool_results"]]
+    def test_invalid_model_proposals_are_reported_and_portfolio_is_used(self):
+        reply = '{"c":[["tree",3,1,0],["nonsense",1,1,0]]}'
+        result, audit, _ = self._run([reply])
+        statuses = [row["status"] for row in audit["model_candidates"]]
         self.assertEqual(statuses, ["rejected", "rejected"])
-        self.assertEqual(audit["selection"], "agent_reference")
-        self.assertIn("fallback_to_agent_reference", events["recovery"])
+        self.assertEqual(audit["selected"]["sources"], ["agent"])
         data = two_plane_input("all-reduce")
         validate_answer(data["task"], data["topology"], result["answer"])
 
-    def test_model_failure_and_timeout_return_valid_reference(self):
+    def test_model_failure_and_timeout_return_valid_portfolio_answer(self):
         error = openai.APIConnectionError(request=httpx.Request("POST", "http://model.test/v1/chat/completions"))
         for kwargs, reason in [
             ({"error": error}, "model_api_error:APIConnectionError"),
@@ -370,20 +375,41 @@ class AgentLoopTests(unittest.TestCase):
             ({"replies": ["not json at all"]}, "model_json_error"),
         ]:
             replies = kwargs.pop("replies", [])
-            result, audit, _ = self._run(replies, **kwargs)
+            result, audit, events = self._run(replies, **kwargs)
             with self.subTest(reason=reason):
-                self.assertEqual(audit["model_rounds"][0]["error"], reason)
-                self.assertEqual(audit["selection"], "agent_reference")
+                self.assertEqual(audit["model_error"], reason)
+                self.assertEqual(audit["selected"]["sources"], ["agent"])
+                self.assertIn("use_agent_portfolio", events["recovery"])
                 data = two_plane_input("all-reduce")
                 validate_answer(data["task"], data["topology"], result["answer"])
 
-    def test_reply_with_reasoning_and_fences_is_parsed(self):
+    def test_optional_feedback_round(self):
+        result, audit, events = self._run(
+            ['{"c":[["rs_ag",8,2,3]]}', '{"c":[["rs_ag",8,1,2]]}'],
+            environment={"AGENT_MODEL_ROUNDS": "2"},
+        )
+        self.assertEqual(len(events["requests"]), 2)
+        feedback = events["requests"][1]["messages"][-1]["content"]
+        self.assertIn("slowest_round_limiter", feedback)
+        self.assertEqual(len(audit["feedback_rounds"]), 1)
+        data = two_plane_input("all-reduce")
+        validate_answer(data["task"], data["topology"], result["answer"])
+
+    def test_reply_parsing_tolerates_reasoning_fences_and_object_form(self):
         module = self._load_agent_module({"tools": [], "recovery": []})
-        content = '<think>long reasoning {not json}</think>\n```json\n{"analysis":"a","candidates":[{"algorithm":"doubling"}]}\n```'
-        proposals, analysis, error = module.parse_proposals(content)
+        content = '<think>try ["x",1,1] maybe</think>\n```json\n{"c":[["rs_ag",32,4,5],["doubling",1,8,0]]}\n```'
+        proposals, error = module.parse_proposals(content)
         self.assertIsNone(error)
-        self.assertEqual(analysis, "a")
-        self.assertEqual(proposals, [{"algorithm": "doubling"}])
+        self.assertEqual(proposals, [
+            {"algorithm": "rs_ag", "split": 32, "path_width": 4, "rs_dims": 5},
+            {"algorithm": "doubling", "split": 1, "path_width": 8},
+        ])
+        truncated, error = module.parse_proposals('{"c":[["rs_ag",16,4,4],["dou')
+        self.assertIsNone(error)
+        self.assertEqual(len(truncated), 1)
+        objects, error = module.parse_proposals('{"candidates":[{"algorithm":"doubling","split":1,"path_width":2}]}')
+        self.assertIsNone(error)
+        self.assertEqual(objects[0]["path_width"], 2)
 
 
 if __name__ == "__main__":

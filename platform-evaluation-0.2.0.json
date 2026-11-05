@@ -1,0 +1,41 @@
+{
+  "submission": "team-001-agent-0.2.0.tar",
+  "archive_sha256": "5a123fa6b7e24bd5b5ea338d3f88d2696c99f4cf8e8cb31778e7f2d12f90532d",
+  "source_commit": "efaa09f",
+  "completed_at": "2026-11-05 20:27",
+  "source": "platform report pasted by the user",
+  "summary": {
+    "feasible": "14/14",
+    "replay_calls": 14,
+    "rounds": 140,
+    "model_calls": 28,
+    "total_tokens": 59627,
+    "correctness": 15.0,
+    "communication": 44.7,
+    "solve_time": 19.9,
+    "total_from_components": 79.6,
+    "previous_platform_total_0_1_5": 88.324
+  },
+  "cases": [
+    {"instance": "v22_256_uneven_pods_ag", "score": 77.021, "communication": 46.250, "solve_time_score": 15.771, "rounds": 8, "replay_us": 24609.129, "solve_s": 46.322, "tokens": 4327},
+    {"instance": "v22_256_uneven_pods_ar", "score": 70.941, "communication": 44.576, "solve_time_score": 11.365, "rounds": 12, "replay_us": 609.988, "solve_s": 62.744, "tokens": 4492},
+    {"instance": "v22_256_directed_ring_ag", "score": 87.120, "communication": 45.520, "solve_time_score": 26.600, "rounds": 8, "replay_us": 40660.003, "solve_s": 17.432, "tokens": 3667},
+    {"instance": "v22_256_directed_ring_ar", "score": 84.690, "communication": 42.221, "solve_time_score": 27.469, "rounds": 16, "replay_us": 2394.035, "solve_s": 15.497, "tokens": 4065},
+    {"instance": "v22_256_sparse_fabric_ag", "score": 74.418, "communication": 47.996, "solve_time_score": 11.422, "rounds": 8, "replay_us": 16327.801, "solve_s": 62.620, "tokens": 4412},
+    {"instance": "v22_256_sparse_fabric_ar", "score": 77.244, "communication": 44.976, "solve_time_score": 17.268, "rounds": 12, "replay_us": 548.924, "solve_s": 41.188, "tokens": 4483},
+    {"instance": "v22_256_cloudmatrix_ag", "score": 91.262, "communication": 45.245, "solve_time_score": 31.017, "rounds": 8, "replay_us": 11910.070, "solve_s": 27.267, "tokens": 3732},
+    {"instance": "v22_256_cloudmatrix_ar", "score": 77.285, "communication": 43.896, "solve_time_score": 18.390, "rounds": 11, "replay_us": 379.026, "solve_s": 51.347, "tokens": 4450},
+    {"instance": "v22_256_fullmesh_clos_ag", "score": 78.275, "communication": 45.807, "solve_time_score": 17.468, "rounds": 8, "replay_us": 6770.341, "solve_s": 44.584, "tokens": 4517},
+    {"instance": "v22_256_fullmesh_clos_ar", "score": 81.458, "communication": 43.227, "solve_time_score": 23.231, "rounds": 11, "replay_us": 472.744, "solve_s": 28.955, "tokens": 4468},
+    {"instance": "v22_256_mesh2d_ag", "score": 81.182, "communication": 44.642, "solve_time_score": 21.540, "rounds": 8, "replay_us": 14625.168, "solve_s": 28.994, "tokens": 3966},
+    {"instance": "v22_256_mesh2d_ar", "score": 75.973, "communication": 42.136, "solve_time_score": 18.837, "rounds": 10, "replay_us": 862.947, "solve_s": 36.263, "tokens": 4610},
+    {"instance": "v22_256_nvlink_like_ag", "score": 82.090, "communication": 46.778, "solve_time_score": 20.312, "rounds": 8, "replay_us": 2768.936, "solve_s": 36.052, "tokens": 3881},
+    {"instance": "v22_256_nvlink_like_ar", "score": 76.191, "communication": 42.984, "solve_time_score": 18.207, "rounds": 12, "replay_us": 212.091, "solve_s": 40.515, "tokens": 4557}
+  ],
+  "observations": [
+    "Communication improved from 38.840 (0.1.5) to 44.7; solve time fell from 34.484 to 19.9; total fell from 88.324 to about 79.6.",
+    "Back-solving the time formula from displayed scores gives t_good of roughly 1.4-1.7 s; each extra second costs about 0.5-0.6 of 35 points.",
+    "Local compute under 1 CPU is about 1-3 s per solve, so most of the 15-63 s is outside local compute (model latency and/or platform CPU); raw logs are not exposed, so the split is not measured.",
+    "directed_ring AR used 16 rounds (tree, 2394 us) although rs_ag measured about 630 us locally on the public example: the model's proposals did not include a better configuration and the agent seed was not evaluated."
+  ]
+}

@@ -354,20 +354,32 @@ class Network:
             first = np.array([c for _, c in out_list])
             last = np.array([c for _, c in in_list])
             total = first[:, None] + self.switch_distance[np.ix_(ui, vi)] + last[None, :]
-            order = np.argsort(total, axis=None, kind="stable")[: 4 * MAX_PATH_WIDTH]
-            for flat in order:
-                a, b = divmod(int(flat), len(vi))
-                if not np.isfinite(total[a, b]):
+            flat_total = total.ravel()
+            limit = min(2 * MAX_PATH_WIDTH, flat_total.size)
+            if limit < flat_total.size:
+                head = np.argpartition(flat_total, limit - 1)[:limit]
+                head = head[np.argsort(flat_total[head], kind="stable")]
+            else:
+                head = np.argsort(flat_total, kind="stable")
+            columns = len(vi)
+            names = self.switch_names
+            for flat in head.tolist():
+                cost_ab = flat_total[flat]
+                if not np.isfinite(cost_ab):
                     break
+                a, b = divmod(flat, columns)
                 u, v = int(ui[a]), int(vi[b])
                 if u == v:
-                    candidates.setdefault((src, self.switch_names[u], dst), float(first[a] + last[b]))
+                    candidates.setdefault((src, names[u], dst), float(cost_ab))
                     continue
-                for segment, cost in self._segments(u, v):
-                    candidates.setdefault((src,) + segment + (dst,), float(first[a] + cost + last[b]))
+                edge_cost = float(first[a] + last[b])
+                # Two-hop segments are only expanded for the best few switch pairs.
+                for segment, cost in (self._segments(u, v) if len(candidates) < MAX_PATH_WIDTH else
+                                      self._segments(u, v)[:1]):
+                    candidates.setdefault((src,) + segment + (dst,), edge_cost + cost)
         if not candidates:
             raise AgentCCError(f"no legal route from {src} to {dst}")
-        ordered = sorted(candidates.items(), key=lambda item: (item[1], len(item[0]), item[0]))
+        ordered = sorted(candidates.items(), key=lambda item: (item[1], len(item[0])))
         if not self.allow_detour:
             fewest = min(len(nodes) for nodes, _ in ordered)
             ordered = [item for item in ordered if len(item[0]) == fewest]
@@ -1130,6 +1142,47 @@ def validate_request(
 # ---------------------------------------------------------------------------
 # Deterministic reference configuration and CLI
 # ---------------------------------------------------------------------------
+
+
+def answer_size_estimate(answer: dict[str, Any]) -> int:
+    """Approximate serialized size in bytes without building the JSON string."""
+
+    total = 0
+    for round_data in answer["rounds"]:
+        for transfer in round_data["transfers"]:
+            total += 80 + sum(len(item) + 3 for item in transfer["chunk_ranges"])
+            total += sum(len(node) + 3 for node in transfer["path"])
+    return total + 16 * len(answer["chunks"])
+
+
+def portfolio_configs(planner: Planner) -> list[dict[str, Any]]:
+    """Agent-side candidates evaluated while the model is consulted.
+
+    The set is small and derived from the current input: the smallest split
+    for AllGather at three path widths, and for AllReduce reduce-scatter at
+    the largest and a middle split.  Anything the round limit or copy rules
+    forbid is skipped.
+    """
+
+    raw: list[dict[str, Any]] = []
+    if planner.operator == "all-gather":
+        for width in (2, 8, 16):
+            raw.append({"algorithm": "doubling", "split": planner.splits[0], "path_width": width})
+    else:
+        large = planner.splits[-1]
+        middle = [split for split in planner.splits if 2 <= split < large]
+        for split, width in [(large, 2), (large, 4)] + ([(middle[-1], 4)] if middle else []):
+            raw.append({"algorithm": "rs_ag", "split": split, "path_width": width})
+        raw.append({"algorithm": "tree", "split": planner.splits[0], "path_width": 4})
+    configs = []
+    for item in raw:
+        try:
+            configs.append(planner.normalize_config(item))
+        except AgentCCError:
+            continue
+    if not configs:
+        configs.append(reference_config(planner))
+    return configs
 
 
 def reference_config(planner: Planner) -> dict[str, Any]:
