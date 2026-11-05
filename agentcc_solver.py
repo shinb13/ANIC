@@ -1,9 +1,4 @@
-"""Small deterministic AgentCC baseline and local validator.
-
-The solver works on the public AgentCC task/topology contract.  It uses
-recursive doubling, which is a good correctness baseline for the official
-256-rank power-of-two instances and for the public two-rank examples.
-"""
+"""AgentCC schedule construction, topology-based optimization, and validation."""
 
 from __future__ import annotations
 
@@ -12,11 +7,26 @@ import json
 from math import inf
 import re
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 
 class AgentCCError(ValueError):
     """Raised when an input or generated solution violates the task contract."""
+
+
+ROUTE_POLICIES = {
+    "baseline": 1.0,
+    "bandwidth_first": 0.25,
+    "resource_first": 2.0,
+}
+
+SCHEDULE_ALGORITHMS = {
+    "all-gather": ("recursive_doubling", "ordered_doubling"),
+    "all-reduce": ("recursive_doubling", "tree"),
+}
+
+BALANCE_MAX_PATH_SEARCHES = 64
 
 
 def _bandwidth_bytes_per_second(value: Any) -> float:
@@ -93,8 +103,16 @@ def _topology_network(
     return edge_capacity, edge_resources, resource_capacity, adjacency
 
 
-def _edge_set(topology: dict[str, Any]) -> set[tuple[str, str]]:
-    edge_capacity, _, _, _ = _topology_network(topology)
+def _edge_set(
+    topology: dict[str, Any],
+    network: tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], set[str]],
+        dict[str, float],
+        dict[str, list[str]],
+    ] | None = None,
+) -> set[tuple[str, str]]:
+    edge_capacity, _, _, _ = network if network is not None else _topology_network(topology)
     return set(edge_capacity)
 
 
@@ -102,27 +120,45 @@ def _routes(
     task: dict[str, Any],
     topology: dict[str, Any],
     split: int,
+    route_policy: str = "baseline",
+    network: tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], set[str]],
+        dict[str, float],
+        dict[str, list[str]],
+    ] | None = None,
 ) -> dict[tuple[str, str], list[str]]:
-    """Find weighted switch-only-intermediate paths for every rank pair."""
+    """Find weighted paths for the XOR pairs used by all supported schedules."""
 
     ranks = list(task["ranks"])
+    if not ranks or len(ranks) & (len(ranks) - 1):
+        raise AgentCCError("the baseline requires a power-of-two rank count")
     switches = set(topology.get("switches", []))
-    edge_capacity, edge_resources, resource_capacity, adjacency = _topology_network(topology)
+    if route_policy not in ROUTE_POLICIES:
+        raise AgentCCError(f"unknown route policy: {route_policy}")
+    edge_capacity, edge_resources, resource_capacity, adjacency = (
+        network if network is not None else _topology_network(topology)
+    )
     data_size = int(task["data_size"]["per_rank_bytes"])
     reference_bytes = data_size // split
     if task["operator"] == "all-reduce":
         reference_bytes = data_size
+    resource_penalty = ROUTE_POLICIES[route_policy]
     switch_overhead = float(topology.get("switch_processing_overhead_us", 0))
 
-    def edge_cost(src: str, dst: str) -> float:
-        cost = 1e6 * reference_bytes / edge_capacity[(src, dst)]
-        for resource_id in edge_resources.get((src, dst), ()):
-            cost += 1e6 * reference_bytes / resource_capacity[resource_id]
-        return cost
+    edge_costs = {
+        edge: 1e6 * reference_bytes / capacity
+        + resource_penalty * sum(
+            1e6 * reference_bytes / resource_capacity[resource_id]
+            for resource_id in edge_resources.get(edge, ())
+        )
+        for edge, capacity in edge_capacity.items()
+    }
 
     routes: dict[tuple[str, str], list[str]] = {}
     rank_set = set(ranks)
-    for source in ranks:
+    for source_index, source in enumerate(ranks):
+        targets = {ranks[source_index ^ (1 << bit)] for bit in range(len(ranks).bit_length() - 1)}
         distance: dict[str, float] = {source: 0.0}
         previous: dict[str, str | None] = {source: None}
         queue: list[tuple[float, str]] = [(0.0, source)]
@@ -132,22 +168,22 @@ def _routes(
                 continue
             for neighbour in adjacency.get(node, []):
                 if neighbour in rank_set and neighbour != source:
-                    candidate = current_distance + edge_cost(node, neighbour)
+                    if neighbour not in targets:
+                        continue
+                    candidate = current_distance + edge_costs[(node, neighbour)]
                     if candidate < distance.get(neighbour, inf):
                         distance[neighbour] = candidate
                         previous[neighbour] = node
                     continue
                 if neighbour in rank_set:
                     continue
-                candidate = current_distance + edge_cost(node, neighbour) + switch_overhead
+                candidate = current_distance + edge_costs[(node, neighbour)] + switch_overhead
                 if candidate < distance.get(neighbour, inf):
                     distance[neighbour] = candidate
                     previous[neighbour] = node
                     heappush(queue, (candidate, neighbour))
 
-        for destination in ranks:
-            if destination == source:
-                continue
+        for destination in sorted(targets):
             if destination not in previous:
                 raise AgentCCError(f"no legal route from {source} to {destination}")
             path: list[str] = []
@@ -197,22 +233,131 @@ def _ordered_chunks(chunks: set[str], order: dict[str, int]) -> list[str]:
     return sorted(chunks, key=lambda chunk: order[chunk])
 
 
-def _pair_rounds(ranks: list[str]):
+def _pair_rounds(ranks: list[str], dimension_order: list[int] | None = None):
     count = len(ranks)
     if count == 0 or count & (count - 1):
         raise AgentCCError("the baseline requires a power-of-two rank count")
-    step = 1
-    while step < count:
+    steps = (
+        [1 << bit for bit in range(count.bit_length() - 1)]
+        if dimension_order is None else dimension_order
+    )
+    for step in steps:
         pairs = []
         for index in range(count):
             partner = index ^ step
             if index < partner:
                 pairs.append((index, partner))
         yield pairs
-        step <<= 1
 
 
-def _allgather(task: dict[str, Any], topology: dict[str, Any], routes: dict[tuple[str, str], list[str]], split: int) -> dict[str, Any]:
+def doubling_round_profiles(
+    task: dict[str, Any],
+    topology: dict[str, Any],
+    routes: dict[tuple[str, str], list[str]],
+    network: tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], set[str]],
+        dict[str, float],
+        dict[str, list[str]],
+    ],
+) -> list[dict[str, Any]]:
+    """Measure each XOR dimension using the current paths and shared resources."""
+
+    edge_capacity, edge_resources, resource_capacity, _ = network
+    ranks = task["ranks"]
+    data_size = int(task["data_size"]["per_rank_bytes"])
+    dimension_count = len(ranks).bit_length() - 1
+    payloads = (
+        [data_size * (1 << position) for position in range(dimension_count)]
+        if task["operator"] == "all-gather" else [data_size]
+    )
+    startup_us = float(topology.get("communication_startup_time_us", 0))
+    switch_us = float(topology.get("switch_processing_overhead_us", 0))
+    profiles = []
+    for bit in range(dimension_count):
+        step = 1 << bit
+        edge_counts: dict[tuple[str, str], int] = {}
+        resource_counts: dict[str, int] = {}
+        path_costs = []
+        paths = [routes[(source, ranks[index ^ step])] for index, source in enumerate(ranks)]
+        for path in paths:
+            overhead = startup_us + (len(path) - 2) * switch_us
+            per_byte_us = 0.0
+            for edge in zip(path, path[1:]):
+                edge_counts[edge] = edge_counts.get(edge, 0) + 1
+                per_byte_us += 1e6 / edge_capacity[edge]
+                for resource_id in edge_resources.get(edge, ()):
+                    resource_counts[resource_id] = resource_counts.get(resource_id, 0) + 1
+            path_costs.append((overhead, per_byte_us))
+
+        bottleneck_edge = max(edge_counts, key=lambda edge: edge_counts[edge] / edge_capacity[edge])
+        busy_per_byte_us = max(
+            max(1e6 * count / edge_capacity[edge] for edge, count in edge_counts.items()),
+            max(
+                (1e6 * count / resource_capacity[rid] for rid, count in resource_counts.items()),
+                default=0.0,
+            ),
+        )
+        max_overhead = max(overhead for overhead, _ in path_costs)
+        resource_evidence = None
+        if resource_counts:
+            rid = max(resource_counts, key=lambda item: resource_counts[item] / resource_capacity[item])
+            used_edges = sorted(edge for edge in edge_counts if rid in edge_resources.get(edge, ()))
+            resource_evidence = {
+                "id": rid,
+                "capacity_bytes_per_second": resource_capacity[rid],
+                "path_edge_traversals": resource_counts[rid],
+                "used_member_count": len(used_edges),
+                "used_member_examples": [list(edge) for edge in used_edges[:4]],
+            }
+        src, dst = bottleneck_edge
+        profiles.append({
+            "step": step,
+            "times_us": [
+                max(
+                    max(overhead + per_byte * size for overhead, per_byte in path_costs),
+                    max_overhead + busy_per_byte_us * size,
+                )
+                for size in payloads
+            ],
+            "bottleneck_edge": {
+                "src": src,
+                "dst": dst,
+                "bandwidth_bytes_per_second": edge_capacity[bottleneck_edge],
+                "path_traversals": edge_counts[bottleneck_edge],
+                "resource_ids": sorted(edge_resources.get(bottleneck_edge, ())),
+            },
+            "bottleneck_resource": resource_evidence,
+            "example_path": paths[0],
+        })
+    return profiles
+
+
+def optimal_doubling_order(profiles: list[dict[str, Any]]) -> list[int]:
+    """Find the cheapest order for fixed XOR dimensions and fixed routes."""
+
+    dimension_count = len(profiles)
+    plans: dict[int, tuple[float, list[int]]] = {0: (0.0, [])}
+    for mask in range(1 << dimension_count):
+        cost, order = plans[mask]
+        position = mask.bit_count()
+        for dimension, profile in enumerate(profiles):
+            if mask & (1 << dimension):
+                continue
+            next_mask = mask | (1 << dimension)
+            candidate = cost + profile["times_us"][position]
+            if next_mask not in plans or candidate < plans[next_mask][0]:
+                plans[next_mask] = candidate, order + [profile["step"]]
+    return plans[(1 << dimension_count) - 1][1]
+
+
+def _allgather(
+    task: dict[str, Any],
+    topology: dict[str, Any],
+    routes: dict[tuple[str, str], list[str]],
+    split: int,
+    dimension_order: list[int] | None = None,
+) -> dict[str, Any]:
     ranks = list(task["ranks"])
     if not task.get("allow_copy", True):
         raise AgentCCError("AllGather requires copy support")
@@ -222,7 +367,7 @@ def _allgather(task: dict[str, Any], topology: dict[str, Any], routes: dict[tupl
     }
     chunk_order = {chunk: index for index, chunk in enumerate(_all_chunks(ranks, split))}
     rounds: list[dict[str, Any]] = []
-    for pairs in _pair_rounds(ranks):
+    for pairs in _pair_rounds(ranks, dimension_order):
         start = _copy_possession(possession)
         transfers: list[dict[str, Any]] = []
         updates: dict[str, set[str]] = {rank: set() for rank in ranks}
@@ -329,29 +474,130 @@ def _allreduce(task: dict[str, Any], topology: dict[str, Any], routes: dict[tupl
     }
 
 
-def estimate_schedule_time_us(task: dict[str, Any], topology: dict[str, Any], answer: dict[str, Any]) -> float:
+def _allreduce_tree(
+    task: dict[str, Any],
+    routes: dict[tuple[str, str], list[str]],
+    split: int,
+) -> dict[str, Any]:
+    ranks = list(task["ranks"])
+    if not task.get("allow_copy", True):
+        raise AgentCCError("tree AllReduce requires copy support")
+    contributors = {index: {index} for index in range(len(ranks))}
+    active = set(contributors)
+    stages = []
+    rounds = []
+    for pairs in _pair_rounds(ranks):
+        transfers = []
+        active_pairs = []
+        for left, right in pairs:
+            if left not in active:
+                continue
+            transfers.append({
+                "action": "reduce",
+                "src": ranks[right],
+                "dst": ranks[left],
+                "chunk_ranges": [
+                    _reduce_expression(contributors[right], ranks, slot) for slot in range(split)
+                ],
+                "path": routes[(ranks[right], ranks[left])],
+            })
+            contributors[left].update(contributors[right])
+            active.remove(right)
+            active_pairs.append((left, right))
+        stages.append(active_pairs)
+        rounds.append({"round": len(rounds) + 1, "transfers": transfers})
+
+    complete = [
+        _reduce_expression(set(range(len(ranks))), ranks, slot) for slot in range(split)
+    ]
+    for pairs in reversed(stages):
+        rounds.append({
+            "round": len(rounds) + 1,
+            "transfers": [
+                {
+                    "action": "copy",
+                    "src": ranks[left],
+                    "dst": ranks[right],
+                    "chunk_ranges": complete,
+                    "path": routes[(ranks[left], ranks[right])],
+                }
+                for left, right in pairs
+            ],
+        })
+    return {
+        "operator": "all-reduce",
+        "split": split,
+        "chunks": _all_chunks(ranks, split),
+        "initial_possession": {
+            rank: [_raw_chunk(rank, slot) for slot in range(split)] for rank in ranks
+        },
+        "final_chunks": [f"c{slot}_sum" for slot in range(split)],
+        "round_count": len(rounds),
+        "rounds": rounds,
+    }
+
+
+def _schedule_loads(
+    task: dict[str, Any],
+    topology: dict[str, Any],
+    answer: dict[str, Any],
+    network: tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], set[str]],
+        dict[str, float],
+        dict[str, list[str]],
+    ] | None = None,
+) -> list[tuple[dict[tuple[str, str], int], dict[str, int]]]:
+    _, edge_resources, _, _ = network if network is not None else _topology_network(topology)
+    chunk_bytes = int(task["data_size"]["per_rank_bytes"]) // int(answer["split"])
+    round_loads: list[tuple[dict[tuple[str, str], int], dict[str, int]]] = []
+    for round_data in answer["rounds"]:
+        edge_load: dict[tuple[str, str], int] = {}
+        resource_load: dict[str, int] = {}
+        for transfer in round_data["transfers"]:
+            byte_count = chunk_bytes * len(transfer["chunk_ranges"])
+            for src, dst in zip(transfer["path"], transfer["path"][1:]):
+                edge = (src, dst)
+                edge_load[edge] = edge_load.get(edge, 0) + byte_count
+                for resource_id in edge_resources.get(edge, ()):
+                    resource_load[resource_id] = resource_load.get(resource_id, 0) + byte_count
+        round_loads.append((edge_load, resource_load))
+    return round_loads
+
+
+def estimate_schedule_time_us(
+    task: dict[str, Any],
+    topology: dict[str, Any],
+    answer: dict[str, Any],
+    network: tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], set[str]],
+        dict[str, float],
+        dict[str, list[str]],
+    ] | None = None,
+) -> float:
     """Estimate the V22 Replay communication time for a generated answer."""
 
-    edge_capacity, edge_resources, resource_capacity, _ = _topology_network(topology)
+    edge_capacity, _, resource_capacity, _ = network if network is not None else _topology_network(topology)
+    round_loads = _schedule_loads(task, topology, answer, network)
     chunk_bytes = int(task["data_size"]["per_rank_bytes"]) // int(answer["split"])
     startup_us = float(topology.get("communication_startup_time_us", 0))
     switch_overhead_us = float(topology.get("switch_processing_overhead_us", 0))
     total_us = 0.0
 
-    for round_data in answer["rounds"]:
-        edge_load: dict[tuple[str, str], int] = {}
-        resource_load: dict[str, int] = {}
+    for round_index, round_data in enumerate(answer["rounds"]):
+        edge_load, resource_load = round_loads[round_index]
         transfer_times: list[float] = []
+        max_startup_and_switch_us = 0.0
         for transfer in round_data["transfers"]:
             byte_count = chunk_bytes * len(transfer["chunk_ranges"])
             path = transfer["path"]
-            path_time = startup_us + max(0, len(path) - 2) * switch_overhead_us
+            startup_and_switch_us = startup_us + max(0, len(path) - 2) * switch_overhead_us
+            max_startup_and_switch_us = max(max_startup_and_switch_us, startup_and_switch_us)
+            path_time = startup_and_switch_us
             for src, dst in zip(path, path[1:]):
                 edge = (src, dst)
                 path_time += 1e6 * byte_count / edge_capacity[edge]
-                edge_load[edge] = edge_load.get(edge, 0) + byte_count
-                for resource_id in edge_resources.get(edge, ()):
-                    resource_load[resource_id] = resource_load.get(resource_id, 0) + byte_count
             transfer_times.append(path_time)
 
         if not transfer_times:
@@ -364,38 +610,202 @@ def estimate_schedule_time_us(task: dict[str, Any], topology: dict[str, Any], an
             (1e6 * byte_count / resource_capacity[resource_id] for resource_id, byte_count in resource_load.items()),
             default=0.0,
         )
-        contention_time = startup_us + switch_overhead_us + max(edge_busy_us, resource_busy_us)
+        contention_time = max_startup_and_switch_us + max(edge_busy_us, resource_busy_us)
         total_us += max(max(transfer_times), contention_time)
     return total_us
+
+
+def _least_loaded_path(source, destination, adjacency, edge_load, resource_load, byte_count, deadline):
+    """Minimize incremental squared utilization; the caller checks Replay cost."""
+
+    distance = {source: 0.0}
+    previous = {}
+    queue = [(0.0, source)]
+    while queue:
+        if perf_counter() >= deadline:
+            return None
+        cost, node = heappop(queue)
+        if cost != distance[node]:
+            continue
+        if node == destination:
+            path = [destination]
+            while path[-1] != source:
+                path.append(previous[path[-1]])
+            return list(reversed(path))
+        for neighbour, edge, per_byte_us, resources, is_switch in adjacency.get(node, ()):
+            if not is_switch and neighbour != destination:
+                continue
+            weight = (2 * edge_load.get(edge, 0) + byte_count) * per_byte_us**2
+            weight += sum(
+                (2 * resource_load.get(rid, 0) + byte_count) * resource_us**2
+                for rid, resource_us in resources
+            )
+            candidate = cost + weight
+            if candidate < distance.get(neighbour, inf):
+                distance[neighbour] = candidate
+                previous[neighbour] = node
+                heappush(queue, (candidate, neighbour))
+    raise AgentCCError(f"no legal route from {source} to {destination}")
+
+
+def balance_schedule_routes(task, topology, answer, network, *, deadline, max_searches=BALANCE_MAX_PATH_SEARCHES):
+    """Refine paths in place without increasing any round's Replay estimate."""
+
+    started = perf_counter()
+    edge_capacity, edge_resources, resource_capacity, adjacency = network
+    switches = set(topology.get("switches", []))
+    weighted_adjacency = {
+        node: [
+            (
+                neighbour, (node, neighbour), 1e6 / edge_capacity[(node, neighbour)],
+                [(rid, 1e6 / resource_capacity[rid]) for rid in sorted(edge_resources.get((node, neighbour), ()))],
+                neighbour in switches,
+            )
+            for neighbour in neighbours
+        ]
+        for node, neighbours in adjacency.items()
+    }
+    chunk_bytes = int(task["data_size"]["per_rank_bytes"]) // int(answer["split"])
+    loads = _schedule_loads(task, topology, answer, network)
+    round_times = [
+        estimate_schedule_time_us(task, topology, {"split": answer["split"], "rounds": [round_data]}, network)
+        for round_data in answer["rounds"]
+    ]
+    initial_time = sum(round_times)
+    searches = changed = 0
+    stop_reason = "candidates_exhausted"
+    for round_index in sorted(range(len(round_times)), key=lambda index: (-round_times[index], index)):
+        round_data = answer["rounds"][round_index]
+        edge_load, resource_load = loads[round_index]
+        energy = sum((value * 1e6 / edge_capacity[edge])**2 for edge, value in edge_load.items())
+        energy += sum((value * 1e6 / resource_capacity[rid])**2 for rid, value in resource_load.items())
+        ranked_transfers = sorted(
+            round_data["transfers"],
+            key=lambda transfer: -max(
+                max(
+                    [edge_load[edge] / edge_capacity[edge]]
+                    + [resource_load[rid] / resource_capacity[rid] for rid in edge_resources.get(edge, ())]
+                )
+                for edge in zip(transfer["path"], transfer["path"][1:])
+            ),
+        )
+        for transfer in ranked_transfers[:16]:
+            if perf_counter() >= deadline or searches >= max_searches:
+                stop_reason = "deadline" if perf_counter() >= deadline else "search_limit"
+                break
+            old_path = transfer["path"]
+            byte_count = chunk_bytes * len(transfer["chunk_ranges"])
+            other_edges, other_resources = dict(edge_load), dict(resource_load)
+            for edge in zip(old_path, old_path[1:]):
+                other_edges[edge] -= byte_count
+                for rid in edge_resources.get(edge, ()):
+                    other_resources[rid] -= byte_count
+            searches += 1
+            path = _least_loaded_path(
+                transfer["src"], transfer["dst"], weighted_adjacency,
+                other_edges, other_resources, byte_count, deadline,
+            )
+            if path is None:
+                stop_reason = "deadline"
+                break
+            if path == old_path:
+                continue
+            transfer["path"] = path
+            single_round = {"split": answer["split"], "rounds": [round_data]}
+            new_time = estimate_schedule_time_us(task, topology, single_round, network)
+            new_edges, new_resources = _schedule_loads(task, topology, single_round, network)[0]
+            new_energy = sum((value * 1e6 / edge_capacity[edge])**2 for edge, value in new_edges.items())
+            new_energy += sum((value * 1e6 / resource_capacity[rid])**2 for rid, value in new_resources.items())
+            if new_time < round_times[round_index] or (new_time == round_times[round_index] and new_energy < energy):
+                round_times[round_index] = new_time
+                edge_load, resource_load = new_edges, new_resources
+                energy = new_energy
+                changed += 1
+            else:
+                transfer["path"] = old_path
+        if stop_reason != "candidates_exhausted":
+            break
+    return {
+        "path_searches": searches,
+        "changed_paths": changed,
+        "initial_estimate_us": initial_time,
+        "final_estimate_us": sum(round_times),
+        "elapsed_ms": round((perf_counter() - started) * 1000, 3),
+        "stop_reason": stop_reason,
+    }
 
 
 def build_solution(
     task: dict[str, Any],
     topology: dict[str, Any],
     preferred_split: int | None = None,
+    route_policy: str = "baseline",
+    network: tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], set[str]],
+        dict[str, float],
+        dict[str, list[str]],
+    ] | None = None,
+    *,
+    algorithm: str = "recursive_doubling",
+    routes: dict[tuple[str, str], list[str]] | None = None,
+    dimension_order: list[int] | None = None,
 ) -> dict[str, Any]:
     if list(task["ranks"]) != list(topology["ranks"]):
         raise AgentCCError("task.ranks and topology.ranks must match")
+    if network is None:
+        network = _topology_network(topology)
+    operator = task["operator"]
+    if operator not in SCHEDULE_ALGORITHMS:
+        raise AgentCCError(f"unsupported operator: {operator}")
+    if algorithm not in SCHEDULE_ALGORITHMS[operator]:
+        raise AgentCCError(f"unsupported algorithm for {operator}: {algorithm}")
     split = min(_candidate_splits(task, preferred_split))
-    routes = _routes(task, topology, split)
-    if task["operator"] == "all-gather":
+    if routes is None:
+        routes = _routes(task, topology, split, route_policy, network)
+    if algorithm == "ordered_doubling":
+        if dimension_order is None:
+            dimension_order = optimal_doubling_order(
+                doubling_round_profiles(task, topology, routes, network)
+            )
+        answer = _allgather(task, topology, routes, split, dimension_order)
+    elif algorithm == "tree":
+        answer = _allreduce_tree(task, routes, split)
+    elif operator == "all-gather":
         answer = _allgather(task, topology, routes, split)
-    elif task["operator"] == "all-reduce":
-        answer = _allreduce(task, topology, routes, split)
     else:
-        raise AgentCCError(f"unsupported operator: {task['operator']}")
+        answer = _allreduce(task, topology, routes, split)
     if answer["round_count"] > int(task["max_nonempty_rounds"]):
         raise AgentCCError("generated schedule exceeds max_nonempty_rounds")
     return answer
 
 
-def solve_input(task_input: dict[str, Any], preferred_split: int | None = None) -> dict[str, Any]:
+def solve_input(
+    task_input: dict[str, Any],
+    preferred_split: int | None = None,
+    route_policy: str = "baseline",
+    network: tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], set[str]],
+        dict[str, float],
+        dict[str, list[str]],
+    ] | None = None,
+    *,
+    algorithm: str = "recursive_doubling",
+    routes: dict[tuple[str, str], list[str]] | None = None,
+    dimension_order: list[int] | None = None,
+) -> dict[str, Any]:
     """Return the business response expected from BaseAgent.solve()."""
 
     task = task_input["task"]
     topology = task_input["topology"]
-    answer = build_solution(task, topology, preferred_split)
-    validate_answer(task, topology, answer)
+    if network is None:
+        network = _topology_network(topology)
+    answer = build_solution(
+        task, topology, preferred_split, route_policy, network,
+        algorithm=algorithm, routes=routes, dimension_order=dimension_order,
+    )
+    validate_answer(task, topology, answer, network)
     return {"answer": answer}
 
 
@@ -429,7 +839,17 @@ def _parse_expression(
     return parsed[0][1], {rank for rank, _ in parsed}
 
 
-def validate_answer(task: dict[str, Any], topology: dict[str, Any], answer: dict[str, Any]) -> None:
+def validate_answer(
+    task: dict[str, Any],
+    topology: dict[str, Any],
+    answer: dict[str, Any],
+    network: tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], set[str]],
+        dict[str, float],
+        dict[str, list[str]],
+    ] | None = None,
+) -> None:
     """Validate the correctness invariants needed by the public format."""
 
     ranks = list(task["ranks"])
@@ -456,7 +876,7 @@ def validate_answer(task: dict[str, Any], topology: dict[str, Any], answer: dict
     if answer["round_count"] > int(task["max_nonempty_rounds"]):
         raise AgentCCError("too many rounds")
 
-    edge_set = _edge_set(topology)
+    edge_set = _edge_set(topology, network)
     switches = set(topology.get("switches", []))
     rank_set = set(ranks)
     routes = set()
@@ -567,14 +987,25 @@ def _validate_allreduce(task: dict[str, Any], answer: dict[str, Any], ranks: lis
         raise AgentCCError("AllReduce did not finish at every rank")
 
 
-def validate_request(task: dict[str, Any], topology: dict[str, Any], response: dict[str, Any]) -> None:
+def validate_request(
+    task: dict[str, Any],
+    topology: dict[str, Any],
+    response: dict[str, Any],
+    network: tuple[
+        dict[tuple[str, str], float],
+        dict[tuple[str, str], set[str]],
+        dict[str, float],
+        dict[str, list[str]],
+    ] | None = None,
+) -> None:
     if response.get("status") != "success":
         raise AgentCCError("response status is not success")
-    validate_answer(task, topology, response["output"]["answer"])
+    validate_answer(task, topology, response["output"]["answer"], network)
 
 
 def solve_request(task: dict[str, Any], topology: dict[str, Any]) -> dict[str, Any]:
-    answer = build_solution(task, topology)
+    network = _topology_network(topology)
+    answer = build_solution(task, topology, network=network)
     response = {
         "task_id": task["task_id"],
         "status": "success",
@@ -582,7 +1013,7 @@ def solve_request(task: dict[str, Any], topology: dict[str, Any]) -> dict[str, A
     }
     if "instance_id" in task:
         response["instance_id"] = task["instance_id"]
-    validate_request(task, topology, response)
+    validate_request(task, topology, response, network)
     return response
 
 
