@@ -69,6 +69,24 @@ docker run --rm -p 127.0.0.1:18080:8080 -e PLATFORM_LLM_URL -e PLATFORM_API_KEY 
 python -m unittest -v test_agentcc.py
 ```
 
+### Local test with a real model
+
+Use your own development API, never the platform credentials. In PowerShell:
+
+```powershell
+docker load -i team-001-agent-0.2.0.tar        # only if the image is not loaded yet
+$env:PLATFORM_LLM_URL = "https://your-dev-gateway/v1"
+$env:AGENT_MODEL_NAME = "your-model"
+$env:PLATFORM_API_KEY = Read-Host "dev API key" -MaskInput
+docker run --rm --name agentcc-test --cpus 1 --memory 1024m --pids-limit 256 `
+  -p 127.0.0.1:18080:8080 -e PLATFORM_LLM_URL -e PLATFORM_API_KEY -e AGENT_MODEL_NAME `
+  -e AGENTHACK_TELEMETRY_REQUIRED=false team-001-agent:0.2.0
+```
+
+In a second terminal: `python local_test.py`. Model decisions are in
+`docker logs agentcc-test | Select-String agentcc.audit`. Stop with
+`docker stop agentcc-test`, then `Remove-Item Env:PLATFORM_API_KEY`.
+
 The entry point is `AgentRuntime(AgentCCAgent()).run()` ([src/__main__.py](src/__main__.py)).
 It exposes only the SDK's `/health` and `/solve`.
 
