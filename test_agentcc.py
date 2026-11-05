@@ -250,6 +250,94 @@ class SolverTests(unittest.TestCase):
                     )
 
 
+STRATEGY_REPLY = """Tree is cheap in bytes; compare with rs_ag.
+```python
+def strategy(api):
+    rows = api.sweep(limit=3)
+    for row in rows:
+        api.measure(row["cfg"])
+    api.log(len(rows))
+    return [row["cfg"] for row in rows]
+```"""
+
+REVISION_REPLY = """Widen the last rounds.
+```python
+def strategy(api):
+    n = 2 * len(api.steps) if api.operator == "all-reduce" else len(api.steps)
+    c = {"algorithm": "tree" if api.operator == "all-reduce" else "doubling", "split": api.splits[0],
+         "path_width": 2, "widths": [1] * (n // 2) + [2] * (n - n // 2)}
+    api.measure(c)
+    return [c]
+```"""
+
+
+def strategy_code(reply: str) -> str:
+    return reply.split("```python\n")[1].split("```")[0]
+
+
+class SandboxTests(unittest.TestCase):
+    def test_dangerous_code_is_rejected(self):
+        from strategy_sandbox import StrategyError, run_strategy
+
+        cases = {
+            "import": "import os\ndef strategy(api): return []",
+            "dunder": "def strategy(api): return ().__class__",
+            "open": 'def strategy(api): return open("x")',
+            "private": "def strategy(api): return api._planner",
+            "unknown api": "def strategy(api): return api.secret",
+            "while": "def strategy(api):\n    while True: pass",
+            "getattr": 'def strategy(api): return getattr(api, "x")',
+            "top level": "x = 1\ndef strategy(api): return []",
+            "format": 'def strategy(api): return "{0}".format(api)',
+            "try": "def strategy(api):\n    try:\n        return 1\n    except Exception:\n        return 2",
+        }
+        for name, source in cases.items():
+            with self.subTest(name=name), self.assertRaises(StrategyError):
+                run_strategy(source, SimpleNamespace(), max_seconds=1.0)
+
+    def test_runaway_code_hits_step_limit(self):
+        from strategy_sandbox import StrategyError, run_strategy
+
+        source = "def strategy(api):\n    x = 0\n    for i in range(10**9):\n        x += i\n    return x"
+        with self.assertRaisesRegex(StrategyError, "exceeded"):
+            run_strategy(source, SimpleNamespace(), max_steps=50_000, max_seconds=2.0)
+
+    def test_runtime_error_reports_line(self):
+        from strategy_sandbox import StrategyError, run_strategy
+
+        with self.assertRaisesRegex(StrategyError, "ZeroDivisionError at line 3"):
+            run_strategy("def strategy(api):\n    x = 1\n    return x / 0", SimpleNamespace())
+
+    def test_strategy_api_measures_on_current_topology(self):
+        from time import perf_counter
+
+        from agentcc_solver import StrategyAPI
+        from strategy_sandbox import run_strategy
+
+        data = two_plane_input("all-reduce")
+        planner = Planner(data["task"], data["topology"])
+        api = StrategyAPI(planner, planner.dimension_profiles(4), 0.33, perf_counter() + 5, max_measures=2)
+        returned = run_strategy(strategy_code(STRATEGY_REPLY), api)
+        self.assertEqual(len(returned), 3)
+        self.assertEqual(len(api.measured), 2)  # measure budget is enforced
+        self.assertIn("measure budget exhausted", json.dumps(api.calls))
+        for row in api.measured:
+            validate_answer(data["task"], data["topology"], row["answer"])
+
+    def test_per_round_widths_build_valid_schedules(self):
+        for operator, algorithm in (("all-gather", "doubling"), ("all-reduce", "rs_ag"), ("all-reduce", "tree")):
+            data = two_plane_input(operator)
+            planner = Planner(data["task"], data["topology"])
+            raw = {"algorithm": algorithm, "split": 8, "path_width": 2}
+            rounds = planner.round_count(planner.normalize_config(raw))
+            raw["widths"] = [1 + (index % 2) for index in range(rounds)]
+            answer = planner.build(planner.normalize_config(raw))
+            with self.subTest(operator=operator, algorithm=algorithm):
+                validate_answer(data["task"], data["topology"], answer)
+            with self.subTest(bad="widths length"), self.assertRaisesRegex(AgentCCError, "widths"):
+                planner.normalize_config({**raw, "widths": [1]})
+
+
 class AgentLoopTests(unittest.TestCase):
     @staticmethod
     def _load_agent_module(events):
@@ -289,7 +377,7 @@ class AgentLoopTests(unittest.TestCase):
                     await asyncio.sleep(delay)
                 if error is not None:
                     raise error
-                content = pending.pop(0) if pending else '{"analysis":"done","candidates":[]}'
+                content = pending.pop(0) if pending else "no code"
                 return SimpleNamespace(
                     choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason="stop")],
                     usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
@@ -314,102 +402,70 @@ class AgentLoopTests(unittest.TestCase):
         audit = json.loads(line[line.index("{"):])
         return result, audit, events
 
-    def test_better_model_proposal_is_selected_over_agent_portfolio(self):
-        # On this 8-rank input the agent portfolio does not contain rs_ag with
-        # split 8 and width 1 at rs_dims 2; the model proposes it and a weaker one.
+    def test_model_code_drives_search_and_is_revised_from_feedback(self):
         data = two_plane_input("all-reduce")
-        reply = '{"c":[["rs_ag",8,2,3],["doubling",1,1,0]]}'
-        result, audit, events = self._run([reply], task_input=data)
-        answer = result["answer"]
-        validate_answer(data["task"], data["topology"], answer)
-        self.assertEqual(len(events["requests"]), 1)
-        self.assertEqual([row["status"] for row in audit["model_candidates"]][1], "built")
-        self.assertIn(audit["selected"]["config"]["algorithm"], ("rs_ag",))
-        self.assertIn("metrics", answer)
-        self.assertIn("strategy", answer)
-        sources = {tool["arguments"]["source"] for tool in events["tools"]}
-        self.assertEqual(sources, {"agent", "model"})
-        self.assertTrue(all(tool["name"] == "evaluate_schedule" for tool in events["tools"]))
-        model_tools = [tool for tool in events["tools"] if tool["arguments"]["source"] == "model"]
-        self.assertEqual(len(model_tools), 2)
+        result, audit, events = self._run([STRATEGY_REPLY, REVISION_REPLY], task_input=data)
+        validate_answer(data["task"], data["topology"], result["answer"])
+        self.assertEqual(len(events["requests"]), 2)
+        self.assertEqual([r.get("error") for r in audit["rounds"]], [None, None])
+        self.assertIn("def strategy", audit["rounds"][0]["code"])
+        self.assertNotEqual(audit["rounds"][0]["code"], audit["rounds"][1]["code"])
+        feedback = events["requests"][1]["messages"][-1]["content"]
+        self.assertIn("measured", feedback)
+        self.assertIn("best_so_far", feedback)
+        self.assertTrue(audit["selected"]["origin"].startswith("model_round_"))
+        runs = [tool for tool in events["tools"] if tool["name"] == "run_strategy"]
+        self.assertEqual(len(runs), 2)
+        self.assertIn("metrics", result["answer"])
+        self.assertIn("origin=model_round_", result["answer"]["strategy"])
 
-    def test_model_only_candidate_wins_when_it_is_faster(self):
-        data = two_plane_input("all-reduce")
-        # Portfolio for splits (1,2,4,8): rs_ag 8/w2, rs_ag 8/w4, rs_ag 4/w4, tree.
-        # A narrower rs_dims at width 1 is a model-only configuration.
-        module = self._load_agent_module({"tools": [], "recovery": []})
-        planner = module.Planner(data["task"], data["topology"])
-        portfolio = {(c["algorithm"], c["split"], c["path_width"], c.get("rs_dims")) for c in module.portfolio_configs(planner)}
-        self.assertNotIn(("rs_ag", 8, 1, 1), portfolio)
-        _, audit, _ = self._run(['{"c":[["rs_ag",8,1,1]]}'], task_input=data)
-        self.assertEqual(audit["model_candidates"][0]["status"] in ("built", "valid"), True)
-        self.assertIsNotNone(audit["model_candidates"][0]["estimate_us"])
-
-    def test_prompt_contains_current_measurements(self):
+    def test_prompt_carries_current_measurements_and_baseline_code(self):
         data = two_plane_input("all-gather")
-        _, _, events = self._run(['{"c":[]}'], task_input=data)
+        _, _, events = self._run([STRATEGY_REPLY, REVISION_REPLY], task_input=data)
         prompt = events["requests"][0]["messages"][-1]["content"]
         self.assertIn("plane-A-ingress", prompt)
-        self.assertIn("dims", prompt)
-        self.assertLess(len(prompt), 2500)
-        self.assertEqual(events["requests"][0]["max_tokens"], 160)
+        self.assertIn("def strategy(api)", prompt)
         changed = deepcopy(data)
         changed["topology"]["resources"][0]["capacity"] = "1GB/s"
-        _, _, events_changed = self._run(['{"c":[]}'], task_input=changed)
+        _, _, events_changed = self._run([STRATEGY_REPLY, REVISION_REPLY], task_input=changed)
         self.assertNotEqual(prompt, events_changed["requests"][0]["messages"][-1]["content"])
 
-    def test_invalid_model_proposals_are_reported_and_portfolio_is_used(self):
-        reply = '{"c":[["tree",3,1,0],["nonsense",1,1,0]]}'
-        result, audit, _ = self._run([reply])
-        statuses = [row["status"] for row in audit["model_candidates"]]
-        self.assertEqual(statuses, ["rejected", "rejected"])
-        self.assertEqual(audit["selected"]["sources"], ["agent"])
+    def test_broken_code_error_is_fed_back_and_fixed(self):
+        broken = "```python\ndef strategy(api):\n    return api.secret()\n```"
+        result, audit, events = self._run([broken, STRATEGY_REPLY])
+        self.assertIn("api.secret does not exist", audit["rounds"][0]["error"])
+        self.assertIn("api.secret does not exist", events["requests"][1]["messages"][-1]["content"])
+        self.assertIsNone(audit["rounds"][1].get("error"))
+        self.assertEqual(audit["selected"]["origin"], "model_round_2")
+        self.assertIn("retry_with_error_feedback", events["recovery"])
         data = two_plane_input("all-reduce")
         validate_answer(data["task"], data["topology"], result["answer"])
 
-    def test_model_failure_and_timeout_return_valid_portfolio_answer(self):
+    def test_model_failures_fall_back_to_agent_strategy(self):
         error = openai.APIConnectionError(request=httpx.Request("POST", "http://model.test/v1/chat/completions"))
         for kwargs, reason in [
             ({"error": error}, "model_api_error:APIConnectionError"),
             ({"delay": 0.5, "environment": {"AGENT_LLM_BUDGET_SECONDS": "0.2"}}, "model_timeout"),
-            ({"replies": ["not json at all"]}, "model_json_error"),
+            ({"replies": ["I would use a tree."]}, "model_no_code"),
         ]:
             replies = kwargs.pop("replies", [])
             result, audit, events = self._run(replies, **kwargs)
             with self.subTest(reason=reason):
-                self.assertEqual(audit["model_error"], reason)
-                self.assertEqual(audit["selected"]["sources"], ["agent"])
-                self.assertIn("use_agent_portfolio", events["recovery"])
+                self.assertEqual(audit["rounds"][0]["error"], reason)
+                self.assertEqual(audit["selected"]["origin"], "agent_fallback")
+                self.assertIn("agent_strategy_fallback", events["recovery"])
                 data = two_plane_input("all-reduce")
                 validate_answer(data["task"], data["topology"], result["answer"])
 
-    def test_optional_feedback_round(self):
-        result, audit, events = self._run(
-            ['{"c":[["rs_ag",8,2,3]]}', '{"c":[["rs_ag",8,1,2]]}'],
-            environment={"AGENT_MODEL_ROUNDS": "2"},
-        )
-        self.assertEqual(len(events["requests"]), 2)
-        feedback = events["requests"][1]["messages"][-1]["content"]
-        self.assertIn("slowest_round_limiter", feedback)
-        self.assertEqual(len(audit["feedback_rounds"]), 1)
-        data = two_plane_input("all-reduce")
-        validate_answer(data["task"], data["topology"], result["answer"])
-
-    def test_reply_parsing_tolerates_reasoning_fences_and_object_form(self):
+    def test_code_extraction(self):
         module = self._load_agent_module({"tools": [], "recovery": []})
-        content = '<think>try ["x",1,1] maybe</think>\n```json\n{"c":[["rs_ag",32,4,5],["doubling",1,8,0]]}\n```'
-        proposals, error = module.parse_proposals(content)
+        code, error = module.extract_code("<think>x</think>\n```python\ndef strategy(api):\n    return []\n```")
         self.assertIsNone(error)
-        self.assertEqual(proposals, [
-            {"algorithm": "rs_ag", "split": 32, "path_width": 4, "rs_dims": 5},
-            {"algorithm": "doubling", "split": 1, "path_width": 8},
-        ])
-        truncated, error = module.parse_proposals('{"c":[["rs_ag",16,4,4],["dou')
+        self.assertTrue(code.startswith("def strategy"))
+        truncated, error = module.extract_code("reason\n```python\ndef strategy(api):\n    return []")
         self.assertIsNone(error)
-        self.assertEqual(len(truncated), 1)
-        objects, error = module.parse_proposals('{"candidates":[{"algorithm":"doubling","split":1,"path_width":2}]}')
-        self.assertIsNone(error)
-        self.assertEqual(objects[0]["path_width"], 2)
+        self.assertIn("def strategy", truncated)
+        self.assertEqual(module.extract_code("no code here")[1], "model_no_code")
 
 
 if __name__ == "__main__":

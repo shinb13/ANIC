@@ -9,6 +9,7 @@ published Replay formula, and validates the result before it may be returned.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -598,6 +599,24 @@ class Planner:
             return 2 * dims
         return dims
 
+    @staticmethod
+    def round_width(config: dict[str, Any], index: int) -> int:
+        widths = config.get("widths")
+        return widths[index] if widths else config["path_width"]
+
+    def tree_stages(self, order: list[int]) -> list[tuple[tuple, list[tuple[int, int]], str]]:
+        """(plan key, pairs, action) for every tree round, reduce rounds first."""
+
+        active = set(range(self.rank_count))
+        up = []
+        for position, step in enumerate(order):
+            pairs = [(index ^ step, index) for index in sorted(active) if not index & step]
+            up.append((("tree-up", tuple(order[:position + 1])), pairs))
+            for src, _ in pairs:
+                active.discard(src)
+        down = [(("tree-down", key[1]), [(dst, src) for src, dst in pairs]) for key, pairs in reversed(up)]
+        return [(key, pairs, "reduce") for key, pairs in up] + [(key, pairs, "copy") for key, pairs in down]
+
     def normalize_config(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Check a proposed configuration and fill in agent-derived values."""
 
@@ -617,6 +636,7 @@ class Planner:
             raise AgentCCError(f"path_width must be an integer in [1, {MAX_PATH_WIDTH}]")
         order = raw.get("order", "auto")
         config: dict[str, Any] = {"algorithm": algorithm, "split": split, "path_width": width}
+        widths = raw.get("widths")
         if algorithm == "rs_ag":
             max_dims = min(split.bit_length() - 1, len(self.steps))
             if max_dims < 1:
@@ -633,11 +653,71 @@ class Planner:
                 raise AgentCCError(f"order must be 'auto' or a permutation of {self.steps}")
             config["order"] = [int(step) for step in order]
             config["order_source"] = "proposed"
-        if self.round_count(config) > self.max_rounds:
+        rounds = self.round_count(config)
+        if rounds > self.max_rounds:
             raise AgentCCError(
-                f"{algorithm} needs {self.round_count(config)} rounds, above max_nonempty_rounds {self.max_rounds}"
+                f"{algorithm} needs {rounds} rounds, above max_nonempty_rounds {self.max_rounds}"
             )
+        if widths is not None:
+            if (not isinstance(widths, list) or len(widths) != rounds
+                    or any(isinstance(w, bool) or not isinstance(w, int) or not 1 <= w <= MAX_PATH_WIDTH for w in widths)):
+                raise AgentCCError(f"widths must list {rounds} integers in [1, {MAX_PATH_WIDTH}], one per round")
+            config["widths"] = [int(w) for w in widths]
         return config
+
+    # -- fast prediction -------------------------------------------------------
+    def _mean_name_length(self, split: int) -> float:
+        names = self.chunk_names(split)
+        return sum(len(name) for rank_names in names for name in rank_names) / (self.rank_count * split)
+
+    def round_specs(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        """Per round: optimized plan, chunks per pair and contributors per chunk."""
+
+        split, order, n = config["split"], config["order"], self.rank_count
+        specs = []
+        if config["algorithm"] == "tree":
+            for index, (key, pairs, action) in enumerate(self.tree_stages(order)):
+                plan = self.round_plan(key, pairs, self.round_width(config, index))
+                group = n if action == "copy" else 1 << index
+                specs.append({"plan": plan, "pairs": len(pairs), "chunks": split, "group": group})
+            return specs
+        for index, (step, chunks) in enumerate(self.round_payloads(config)):
+            plan = self.exchange_plan(step, self.round_width(config, index))
+            if self.operator == "all-gather":
+                group = 1
+            elif config["algorithm"] == "rs_ag" and index >= len(self.steps):
+                group = n
+            else:
+                group = 1 << index
+            specs.append({"plan": plan, "pairs": n, "chunks": chunks, "group": group})
+        return specs
+
+    def predict(self, config: dict[str, Any]) -> dict[str, float]:
+        """Fast continuous estimate of Replay time (us) and response size (MB)."""
+
+        chunk_bytes = self.data_size / config["split"]
+        name = self._mean_name_length(config["split"])
+        total_us, size = 0.0, 0.0
+        for spec in self.round_specs(config):
+            plan = spec["plan"]
+            overhead = max(route.overhead_us for routes in plan.routes for route in routes)
+            total_us += overhead + plan.busy_per_byte_us * chunk_bytes * spec["chunks"]
+            used = float(np.minimum((plan.fractions > 1e-3).sum(axis=1), spec["chunks"]).mean())
+            entry = spec["group"] * (name + 1) + 2
+            size += spec["pairs"] * (spec["chunks"] * entry + used * 110)
+        size += 2 * self.rank_count * config["split"] * (name + 3)
+        return {"us": total_us, "mb": size / 1e6}
+
+    def normalize_config_safe(self, raw: Any) -> dict[str, Any] | None:
+        """normalize_config that returns None instead of raising."""
+
+        try:
+            if not isinstance(raw, dict):
+                return None
+            clean = {key: raw[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths") if key in raw}
+            return self.normalize_config(clean)
+        except (AgentCCError, TypeError, AttributeError):
+            return None
 
     def auto_order(self, config: dict[str, Any]) -> list[int]:
         """Rearrangement order from multipath profiles at the configured width."""
@@ -736,13 +816,13 @@ class Planner:
         return transfers
 
     def _build_allgather(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
-        split, width = config["split"], config["path_width"]
+        split = config["split"]
         names = self.chunk_names(split)
         members = [[index] for index in range(self.rank_count)]
         rounds = []
-        for step in config["order"]:
+        for index_round, step in enumerate(config["order"]):
             pairs = self.exchange_pairs(step)
-            plan = self.exchange_plan(step, width)
+            plan = self.exchange_plan(step, self.round_width(config, index_round))
             held = [[name for member in group for name in names[member]] for group in members]
             units = [held[src] for src, _ in pairs]
             rounds.append(self._emit(plan, pairs, units, "copy", lambda _src, piece: piece))
@@ -764,13 +844,13 @@ class Planner:
         return expression
 
     def _build_allreduce_doubling(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
-        split, width = config["split"], config["path_width"]
+        split = config["split"]
         expression = self._expression_cache(split)
         groups = [(index,) for index in range(self.rank_count)]
         rounds = []
-        for step in config["order"]:
+        for index_round, step in enumerate(config["order"]):
             pairs = self.exchange_pairs(step)
-            plan = self.exchange_plan(step, width)
+            plan = self.exchange_plan(step, self.round_width(config, index_round))
             units = [list(range(split)) for _ in pairs]
             current = groups
             rounds.append(self._emit(
@@ -781,7 +861,7 @@ class Planner:
         return rounds
 
     def _build_rs_ag(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
-        split, width, h = config["split"], config["path_width"], config["rs_dims"]
+        split, h = config["split"], config["rs_dims"]
         order = config["order"]
         expression = self._expression_cache(split)
         complete = tuple(range(self.rank_count))
@@ -790,7 +870,7 @@ class Planner:
         rounds = []
         for step in order[:h]:
             pairs = self.exchange_pairs(step)
-            plan = self.exchange_plan(step, width)
+            plan = self.exchange_plan(step, self.round_width(config, len(rounds)))
             keep, give = [], []
             for index in range(self.rank_count):
                 slots = owned[index]
@@ -811,7 +891,7 @@ class Planner:
             groups = [tuple(sorted(groups[index] + groups[index ^ step])) for index in range(self.rank_count)]
         for step in order[h:]:
             pairs = self.exchange_pairs(step)
-            plan = self.exchange_plan(step, width)
+            plan = self.exchange_plan(step, self.round_width(config, len(rounds)))
             current = groups
             rounds.append(self._emit(
                 plan, pairs, [list(owned[src]) for src, _ in pairs], "reduce",
@@ -822,7 +902,7 @@ class Planner:
             raise AgentCCError("reduce phase did not cover every contributor")
         for step in reversed(order[:h]):
             pairs = self.exchange_pairs(step)
-            plan = self.exchange_plan(step, width)
+            plan = self.exchange_plan(step, self.round_width(config, len(rounds)))
             rounds.append(self._emit(
                 plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
                 lambda _src, piece: [expression(complete, slot) for slot in piece],
@@ -833,31 +913,28 @@ class Planner:
     def _build_tree(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
         if not self.allow_copy:
             raise AgentCCError("tree AllReduce requires copy support")
-        split, width = config["split"], config["path_width"]
+        split = config["split"]
         expression = self._expression_cache(split)
         groups = {index: (index,) for index in range(self.rank_count)}
-        active = set(range(self.rank_count))
-        stages = []
-        rounds = []
-        for position, step in enumerate(config["order"]):
-            pairs = [(index ^ step, index) for index in sorted(active) if not index & step]
-            plan = self.round_plan(("tree-up", tuple(config["order"][:position + 1])), pairs, width)
-            current = dict(groups)
-            rounds.append(self._emit(
-                plan, pairs, [list(range(split)) for _ in pairs], "reduce",
-                lambda src, piece: [expression(current[src], slot) for slot in piece],
-            ))
-            for src, dst in pairs:
-                groups[dst] = tuple(sorted(groups[dst] + groups[src]))
-                active.discard(src)
-            stages.append((position, [(dst, src) for src, dst in pairs]))
         complete = tuple(range(self.rank_count))
-        for position, pairs in reversed(stages):
-            plan = self.round_plan(("tree-down", tuple(config["order"][:position + 1])), pairs, width)
-            rounds.append(self._emit(
-                plan, pairs, [list(range(split)) for _ in pairs], "copy",
-                lambda _src, piece: [expression(complete, slot) for slot in piece],
-            ))
+        rounds = []
+        for index_round, (key, pairs, action) in enumerate(self.tree_stages(config["order"])):
+            plan = self.round_plan(key, pairs, self.round_width(config, index_round))
+            if action == "reduce":
+                current = dict(groups)
+                rounds.append(self._emit(
+                    plan, pairs, [list(range(split)) for _ in pairs], "reduce",
+                    lambda src, piece, current=current: [expression(current[src], slot) for slot in piece],
+                ))
+                for src, dst in pairs:
+                    groups[dst] = tuple(sorted(groups[dst] + groups[src]))
+            else:
+                rounds.append(self._emit(
+                    plan, pairs, [list(range(split)) for _ in pairs], "copy",
+                    lambda _src, piece: [expression(complete, slot) for slot in piece],
+                ))
+        if groups[0] != complete:
+            raise AgentCCError("tree reduction did not reach rank 0 with every contributor")
         return rounds
 
 
@@ -1142,6 +1219,122 @@ def validate_request(
 # ---------------------------------------------------------------------------
 # Deterministic reference configuration and CLI
 # ---------------------------------------------------------------------------
+
+
+class StrategyAPI:
+    """The only object a model-written strategy can use.
+
+    Facts are copies of current-instance data.  ``predict`` is a fast
+    continuous model (no build); ``measure`` builds the schedule and applies
+    the published Replay formula.  Every call is logged for the audit, and
+    measured candidates are kept so the agent can choose among them.
+    """
+
+    def __init__(self, planner: Planner, profiles: list[dict[str, Any]], size_weight: float,
+                 deadline: float, max_measures: int = 6):
+        self._planner = planner
+        self._deadline = deadline
+        self._max_measures = max_measures
+        self.operator = planner.operator
+        self.ranks = planner.rank_count
+        self.splits = list(planner.splits)
+        self.max_rounds = planner.max_rounds
+        self.max_width = MAX_PATH_WIDTH
+        self.algorithms = list(ALGORITHMS[planner.operator]) if planner.allow_copy or planner.operator == "all-gather" \
+            else ["doubling"]
+        self.steps = list(planner.steps)
+        self.bytes_per_rank = planner.data_size
+        self.size_weight = size_weight
+        self.dims = [
+            {"step": row["step"], "us_per_MiB_w1": row["us_per_MiB_single_path"],
+             "us_per_MiB_w4": row["us_per_MiB_multipath"]}
+            for row in profiles
+        ]
+        self.calls: list[dict[str, Any]] = []
+        self.measured: list[dict[str, Any]] = []
+        self.notes: list[str] = []
+
+    def time_left(self) -> float:
+        return max(0.0, self._deadline - perf_counter())
+
+    def log(self, text: Any) -> None:
+        if len(self.notes) < 20:
+            self.notes.append(str(text)[:200])
+
+    def _config(self, raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise AgentCCError("config must be a dict")
+        clean = {key: raw[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths") if key in raw}
+        return self._planner.normalize_config(clean)
+
+    def predict(self, raw: Any) -> dict[str, Any] | None:
+        """{'us', 'mb', 'cost'} or None if the config is not allowed."""
+
+        try:
+            config = self._config(raw)
+            result = self._planner.predict(config)
+        except AgentCCError as exc:
+            self.calls.append({"tool": "predict", "config": raw, "error": str(exc)})
+            return None
+        cost = math.log(max(result["us"], 1e-9)) + self.size_weight * result["mb"]
+        out = {"us": round(result["us"], 3), "mb": round(result["mb"], 3), "cost": round(cost, 5)}
+        if len(self.calls) < 400:
+            self.calls.append({"tool": "predict", "config": raw, **out})
+        return out
+
+    def measure(self, raw: Any) -> dict[str, Any] | None:
+        """Build and Replay-estimate; at most ``max_measures`` per strategy run."""
+
+        if len(self.measured) >= self._max_measures or self.time_left() <= 0:
+            self.calls.append({"tool": "measure", "config": raw, "error": "measure budget exhausted"})
+            return None
+        try:
+            config = self._config(raw)
+            answer = self._planner.build(config)
+        except AgentCCError as exc:
+            self.calls.append({"tool": "measure", "config": raw, "error": str(exc)})
+            return None
+        estimate = replay_estimate(self._planner.task, self._planner.topology, answer, self._planner.network.raw)
+        mb = answer_size_estimate(answer) / 1e6
+        cost = math.log(max(estimate["total_us"], 1e-9)) + self.size_weight * mb
+        limiter = max(estimate["rounds"], key=lambda item: item["time_us"])["limiter"]
+        out = {"us": round(estimate["total_us"], 3), "mb": round(mb, 3), "cost": round(cost, 5), "slowest": limiter}
+        self.measured.append({"config": config, "answer": answer, "estimate": estimate, **out})
+        self.calls.append({"tool": "measure", "config": raw, **out})
+        return out
+
+    def best(self) -> dict[str, Any] | None:
+        if not self.measured:
+            return None
+        row = min(self.measured, key=lambda item: item["cost"])
+        return {"us": row["us"], "mb": row["mb"], "cost": row["cost"]}
+
+    def sweep(self, algorithms: Any = None, splits: Any = None, widths: Any = (2, 4, 8, 16),
+              rs_dims: Any = None, limit: int = 8) -> list[dict[str, Any]]:
+        """Predict the cross product the strategy asks for; return the cheapest first.
+
+        Each item is {"cfg": cfg, "us", "mb", "cost"}.  ``rs_dims=None`` tries
+        every legal value for rs_ag.
+        """
+
+        algorithms = list(algorithms) if algorithms else list(self.algorithms)
+        splits = list(splits) if splits else list(self.splits)
+        rows = []
+        for algorithm in algorithms:
+            for split in splits:
+                for width in widths:
+                    options = [None]
+                    if algorithm == "rs_ag":
+                        options = list(rs_dims) if rs_dims else list(range(1, int(split).bit_length()))
+                    for h in options:
+                        cfg = {"algorithm": algorithm, "split": split, "path_width": width}
+                        if h is not None:
+                            cfg["rs_dims"] = h
+                        result = self.predict(cfg)
+                        if result is not None:
+                            rows.append({"cfg": cfg, **result})
+        rows.sort(key=lambda item: item["cost"])
+        return rows[:max(1, int(limit))]
 
 
 def answer_size_estimate(answer: dict[str, Any]) -> int:

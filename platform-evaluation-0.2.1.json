@@ -1,0 +1,165 @@
+{
+  "submission": "team-001-agent-0.2.1.tar",
+  "archive_sha256": "84c0ecda4768dc06ce0e66f669a3defd0d63431fcff75bf60298c1805e69032a",
+  "source_commit": "ea93917",
+  "rules": "agentcc-256-20261103-v22-6m",
+  "completed_at": "2026-11-05 21:53",
+  "source": "platform report pasted by the user",
+  "summary": {
+    "feasible": "14/14",
+    "rounds": 144,
+    "model_calls": 14,
+    "total_tokens": 9812,
+    "correctness": 15.0,
+    "communication": 45.2,
+    "solve_time": 28.0,
+    "total": 88.2
+  },
+  "cases": [
+    {
+      "instance": "v22_256_uneven_pods_ag",
+      "score": 93.583,
+      "communication": 46.173,
+      "solve_time_score": 32.41,
+      "rounds": 8,
+      "replay_us": 25273.725,
+      "solve_s": 6.311,
+      "tokens": 702
+    },
+    {
+      "instance": "v22_256_uneven_pods_ar",
+      "score": 81.637,
+      "communication": 45.166,
+      "solve_time_score": 21.471,
+      "rounds": 13,
+      "replay_us": 458.169,
+      "solve_s": 29.492,
+      "tokens": 699
+    },
+    {
+      "instance": "v22_256_directed_ring_ag",
+      "score": 91.942,
+      "communication": 45.52,
+      "solve_time_score": 31.422,
+      "rounds": 8,
+      "replay_us": 40660.003,
+      "solve_s": 7.787,
+      "tokens": 652
+    },
+    {
+      "instance": "v22_256_directed_ring_ar",
+      "score": 81.341,
+      "communication": 45.169,
+      "solve_time_score": 21.172,
+      "rounds": 13,
+      "replay_us": 517.89,
+      "solve_s": 30.126,
+      "tokens": 658
+    },
+    {
+      "instance": "v22_256_sparse_fabric_ag",
+      "score": 93.884,
+      "communication": 47.79,
+      "solve_time_score": 31.093,
+      "rounds": 8,
+      "replay_us": 17648.884,
+      "solve_s": 8.601,
+      "tokens": 690
+    },
+    {
+      "instance": "v22_256_sparse_fabric_ar",
+      "score": 79.554,
+      "communication": 45.875,
+      "solve_time_score": 18.679,
+      "rounds": 13,
+      "replay_us": 355.801,
+      "solve_s": 36.987,
+      "tokens": 695
+    },
+    {
+      "instance": "v22_256_cloudmatrix_ag",
+      "score": 95.092,
+      "communication": 45.092,
+      "solve_time_score": 35.0,
+      "rounds": 8,
+      "replay_us": 12616.328,
+      "solve_s": 19.71,
+      "tokens": 693
+    },
+    {
+      "instance": "v22_256_cloudmatrix_ar",
+      "score": 85.413,
+      "communication": 44.766,
+      "solve_time_score": 25.647,
+      "rounds": 13,
+      "replay_us": 251.236,
+      "solve_s": 33.751,
+      "tokens": 692
+    },
+    {
+      "instance": "v22_256_fullmesh_clos_ag",
+      "score": 94.701,
+      "communication": 45.917,
+      "solve_time_score": 33.784,
+      "rounds": 8,
+      "replay_us": 6396.277,
+      "solve_s": 7.931,
+      "tokens": 729
+    },
+    {
+      "instance": "v22_256_fullmesh_clos_ar",
+      "score": 85.833,
+      "communication": 44.07,
+      "solve_time_score": 26.763,
+      "rounds": 12,
+      "replay_us": 280.054,
+      "solve_s": 21.052,
+      "tokens": 733
+    },
+    {
+      "instance": "v22_256_mesh2d_ag",
+      "score": 90.502,
+      "communication": 44.584,
+      "solve_time_score": 30.917,
+      "rounds": 8,
+      "replay_us": 15156.097,
+      "solve_s": 8.443,
+      "tokens": 795
+    },
+    {
+      "instance": "v22_256_mesh2d_ar",
+      "score": 84.479,
+      "communication": 43.029,
+      "solve_time_score": 26.449,
+      "rounds": 12,
+      "replay_us": 477.695,
+      "solve_s": 17.423,
+      "tokens": 787
+    },
+    {
+      "instance": "v22_256_nvlink_like_ag",
+      "score": 94.207,
+      "communication": 46.379,
+      "solve_time_score": 32.828,
+      "rounds": 8,
+      "replay_us": 3328.724,
+      "solve_s": 9.067,
+      "tokens": 642
+    },
+    {
+      "instance": "v22_256_nvlink_like_ar",
+      "score": 82.065,
+      "communication": 43.235,
+      "solve_time_score": 23.83,
+      "rounds": 12,
+      "replay_us": 185.374,
+      "solve_s": 25.858,
+      "tokens": 645
+    }
+  ],
+  "observations": [
+    "Excluding cloudmatrix (whose t_good is about 16 s), platform solve seconds fit 6.66 + 1.46 * response MB (r = 0.97, response MB measured locally for the same configurations on the public examples).",
+    "AllReduce answers of 9-18 MB cost 13-27 s; nearly all of that size is the complete 256-contributor expressions in the all-gather phase.",
+    "Near the current operating point the communication score moves about 2 points per factor e of Replay time and the solve-time score about 0.4-0.55 points per second."
+  ]
+}
