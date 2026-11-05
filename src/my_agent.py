@@ -1,146 +1,190 @@
+"""Model-in-the-loop AgentCC scheduling agent.
+
+Loop per request (every value comes from the current task and topology):
+
+1. Parse and validate the input; profile every XOR exchange dimension on
+   single-path and optimized multipath routes (per-MiB Replay cost and the
+   bottleneck edge or shared resource).
+2. Round 1: the model receives the constraints and profiles and proposes up
+   to four schedule configurations (algorithm, split, path width, rs_dims,
+   dimension order).
+3. Each proposal is run through the ``evaluate_schedule`` tool: built,
+   checked against every correctness constraint, and estimated with the
+   published Replay formula, including a per-round bottleneck report.
+4. Round 2: the model receives the measured results and proposes refinements,
+   which are evaluated the same way.
+5. The fastest validated candidate is returned.  If the model is unavailable
+   or every proposal is invalid, a validated agent-side reference is returned
+   and the reason is recorded.
+"""
+
 import asyncio
 import hashlib
 import json
 import logging
 import os
+import re
 from time import perf_counter
 from typing import Any
 
 import openai
-from agenthack import BaseAgent, state, turn
+from agenthack import BaseAgent, recovery, state, tool_call, turn
 
 from agentcc_solver import (
+    ALGORITHMS,
+    MAX_PATH_WIDTH,
     AgentCCError,
-    BALANCE_MAX_PATH_SEARCHES,
-    ROUTE_POLICIES,
-    SCHEDULE_ALGORITHMS,
-    _candidate_splits,
-    _routes,
-    _topology_network,
-    balance_schedule_routes,
-    build_solution,
-    doubling_round_profiles,
-    estimate_schedule_time_us,
-    optimal_doubling_order,
-    solve_input,
+    Planner,
+    attach_metrics,
+    reference_config,
+    replay_estimate,
     validate_answer,
 )
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_MODEL_BUDGET_SECONDS = 2.0
-DEFAULT_SOLVE_BUDGET_SECONDS = 25.0
-RETURN_RESERVE_SECONDS = 0.25
-ROUTE_BALANCE_BUDGET_SECONDS = 0.25
+# Solve time is scored by 35 * ((360 s - t) / (360 s - t_good))^6, so every 10 s
+# of model latency costs roughly 4 of 35 points; model time is capped in total.
+DEFAULT_MODEL_BUDGET_SECONDS = 15.0
+DEFAULT_MODEL_TOTAL_SECONDS = 25.0
+DEFAULT_SOLVE_BUDGET_SECONDS = 60.0
+DEFAULT_MODEL_ROUNDS = 2
+DEFAULT_MAX_OUTPUT_TOKENS = 1024
+MAX_PROPOSALS_PER_ROUND = 4
+RETURN_RESERVE_SECONDS = 3.0
+TOOL_NAME = "evaluate_schedule"
+TOOL_VERSION = "2.0"
+
+SYSTEM_PROMPT = (
+    "You are the planning component of a collective-communication scheduling agent. "
+    "You choose schedule parameters; a deterministic tool builds each choice on the "
+    "current topology, validates it, and reports its Replay time. "
+    "Replay cost per round = max(longest single transfer path time, max startup+switch "
+    "overhead + max over directed edges and shared resources of busy time); rounds add up. "
+    "Algorithms: AllGather 'doubling' (XOR recursive doubling, payload doubles each round). "
+    "AllReduce 'rs_ag' (reduce-scatter over the first rs_dims dimensions of the order, "
+    "full reduce exchange on the remaining dimensions, then all-gather in reverse; moves "
+    "about 2x the data instead of 8x but needs 2*rs_dims+remaining rounds and a split of "
+    "at least 2^rs_dims), 'doubling' (full-vector reduce exchange every round), 'tree' "
+    "(reduce to one rank then broadcast, 2x dimensions rounds). "
+    "path_width = how many alternative switch paths each pair may split its chunks over; "
+    "wider helps when one link or shared resource is the bottleneck but costs more chunks "
+    "per transfer granularity. split must divide the work into enough chunks to use the "
+    "width. order = 'auto' or a permutation of the XOR steps; for doubling AllGather the "
+    "first dimension carries the least data, for rs_ag the first dimensions carry the most. "
+    "Reply with JSON only."
+)
 
 
-def _configured_seconds(name: str, default: float) -> float:
+def _configured(name: str, default: float) -> float:
     value = os.environ.get(name)
-    return default if value is None else float(value)
+    return default if value is None or value == "" else float(value)
 
 
-def _plan_prompt(
-    task: dict[str, Any],
-    topology: dict[str, Any],
-    baseline: dict[str, Any],
-    baseline_time_us: float,
-    profiles: list[dict[str, Any]],
-    dimension_order: list[int] | None,
-    allowed_algorithms: list[str],
-    allowed_policies: list[str],
-    network: tuple[
-        dict[tuple[str, str], float],
-        dict[tuple[str, str], set[str]],
-        dict[str, float],
-        dict[str, list[str]],
-    ],
-) -> str:
-    edge_capacity, _, resource_capacity, _ = network
-    rank_count = len(task["ranks"])
-    data_size = int(task["data_size"]["per_rank_bytes"])
-    candidates = [{
-        "algorithm": "recursive_doubling",
-        "round_count": baseline["round_count"],
-        "estimate_us": round(baseline_time_us, 3),
-    }]
-    if "ordered_doubling" in allowed_algorithms:
-        by_step = {profile["step"]: profile for profile in profiles}
-        candidates.append({
-            "algorithm": "ordered_doubling",
-            "round_count": baseline["round_count"],
-            "dimension_order": dimension_order,
-            "estimate_us": round(sum(
-                by_step[step]["times_us"][position]
-                for position, step in enumerate(dimension_order)
-            ), 3),
-        })
-    if "tree" in allowed_algorithms:
-        candidates.append({
-            "algorithm": "tree",
-            "round_count": 2 * baseline["round_count"],
-            "total_rank_transfer_bytes": 2 * (rank_count - 1) * data_size,
-            "recursive_doubling_total_rank_transfer_bytes":
-                rank_count * baseline["round_count"] * data_size,
-        })
-    prompt_input = {
-        "task": {
-            "operator": task["operator"],
-            "ranks": task["ranks"],
-            "data_size": task["data_size"],
-            "split_policy": task["split_policy"],
-            "selected_split": baseline["split"],
-            "max_nonempty_rounds": task["max_nonempty_rounds"],
-            "allow_copy": task.get("allow_copy", True),
-            "allow_detour": task.get("allow_detour", True),
-            "communication_constraints": task.get("communication_constraints", {}),
+def _input_digest(task: dict[str, Any], topology: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(
+        {"task": task, "topology": topology}, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+
+
+def _round_floats(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, 3)
+    if isinstance(value, dict):
+        return {key: _round_floats(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_round_floats(item) for item in value]
+    return value
+
+
+def _context(planner: Planner) -> dict[str, Any]:
+    task, network = planner.task, planner.network
+    resources = sorted(
+        zip(network.resource_names, network.resource_capacity.tolist()), key=lambda item: item[1],
+    )
+    return {
+        "operator": planner.operator,
+        "rank_count": planner.rank_count,
+        "per_rank_bytes": planner.data_size,
+        "valid_splits": planner.splits,
+        "max_nonempty_rounds": planner.max_rounds,
+        "allow_copy": planner.allow_copy,
+        "allow_detour": network.allow_detour,
+        "xor_steps": planner.steps,
+        "algorithms": list(ALGORITHMS[planner.operator]) if planner.allow_copy or planner.operator == "all-gather"
+        else ["doubling"],
+        "max_path_width": MAX_PATH_WIDTH,
+        "communication_startup_time_us": network.startup_us,
+        "switch_processing_overhead_us": network.switch_us,
+        "topology_size": {
+            "ranks": planner.rank_count,
+            "switches": len(network.switch_names),
+            "directed_edges": network.edge_count,
+            "shared_resources": len(network.resource_names),
         },
-        "topology": {
-            "directed_edge_count": len(edge_capacity),
-            "communication_startup_time_us": topology.get("communication_startup_time_us", 0),
-            "switch_processing_overhead_us": topology.get("switch_processing_overhead_us", 0),
-            "resource_capacities_bytes_per_second": resource_capacity,
-        },
-        "candidates_on_baseline_routes": candidates,
-        "route_policy_resource_penalties": ROUTE_POLICIES,
-        "allowed_route_policies": allowed_policies,
-        "round_load_balancing": {
-            "policy": "load_balanced",
-            "seed_policy": "baseline",
-            "time_budget_ms": ROUTE_BALANCE_BUDGET_SECONDS * 1000,
-            "max_path_searches": BALANCE_MAX_PATH_SEARCHES,
-            "acceptance": "no round estimate increases; ties require lower squared utilization",
-        },
-        "current_dimension_evidence": [
-            {
-                **profile,
-                "times_us": [round(value, 3) for value in profile["times_us"]],
-            }
-            for profile in profiles
-        ],
+        "tightest_shared_resources_Bps": [[name, capacity] for name, capacity in resources[:6]],
+    }
+
+
+def _first_prompt(planner: Planner, profiles: list[dict[str, Any]]) -> str:
+    payload = {
+        "instance": _context(planner),
+        "dimension_profiles": profiles,
+        "profile_note": (
+            "us_per_MiB_* = round busy time if every rank sends 1 MiB to its XOR partner on "
+            "that dimension at path_width 1 versus 16; the bottleneck names the limiting "
+            "directed edge, shared resource, or path."
+        ),
     }
     return (
-        "Choose a scheduling algorithm and route policy for this actual AgentCC input. "
-        "Minimize communication time within the task constraints. The baseline is validated; "
-        "only your chosen extra candidate will be constructed and checked. "
-        "ordered_doubling optimizes the XOR dimension order using the shown round costs "
-        "(position k sends D*2^k bytes). tree performs reduction then broadcast, reducing "
-        "total traffic but adding rounds; it is useful when shared-resource congestion dominates. "
-        "Edge evidence is directed; resource member examples are actual used edges, "
-        "not an exhaustive graph. Route policies multiply the shared-resource path penalty; "
-        "bandwidth_first and resource_first recompute static paths. load_balanced starts "
-        "from baseline paths and reroutes selected transfers using actual concurrent edge "
-        "and shared-resource loads, subject to the shown time and search budgets. It checks "
-        "the full Replay estimate before accepting each move and never increases a round's "
-        "estimate; it can help when static paths concentrate concurrent traffic. "
-        "Return only JSON with exactly algorithm and policy, "
-        'for example {"algorithm":"ordered_doubling","policy":"baseline"}. '
-        "Choose an algorithm from candidates_on_baseline_routes and a policy from "
-        "allowed_route_policies.\n"
-        + json.dumps(prompt_input, ensure_ascii=False, separators=(",", ":"))
+        "Current instance and measured topology profiles:\n"
+        + json.dumps(_round_floats(payload), ensure_ascii=False, separators=(",", ":"))
+        + f"\nPropose up to {MAX_PROPOSALS_PER_ROUND} diverse configurations likely to minimize Replay "
+        'time. Reply exactly as {"analysis":"<=60 words","candidates":[{"algorithm":"...",'
+        '"split":N,"path_width":N,"rs_dims":N,"order":"auto"}]}. rs_dims only for rs_ag.'
     )
 
 
-async def _request_plan(prompt: str, timeout_seconds: float) -> str | None:
+def _feedback_prompt(results: list[dict[str, Any]], best: dict[str, Any] | None) -> str:
+    payload = {
+        "evaluated": [
+            {key: row[key] for key in ("config", "status", "estimate_us", "error", "slowest_rounds") if key in row}
+            for row in results
+        ],
+        "best_so_far": None if best is None else {"config": best["config"], "estimate_us": best["estimate_us"]},
+    }
+    return (
+        "Tool results for your candidates (validated builds on the current topology):\n"
+        + json.dumps(_round_floats(payload), ensure_ascii=False, separators=(",", ":"))
+        + f"\nUsing the bottlenecks above, propose up to {MAX_PROPOSALS_PER_ROUND} new configurations "
+        "that could beat the best (not already evaluated). Same JSON format. If nothing can "
+        'improve, reply {"analysis":"...","candidates":[]}.'
+    )
+
+
+_JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def parse_proposals(content: str | None) -> tuple[list[Any], str | None, str | None]:
+    """Extract the candidate list from a model reply (tolerates fences and reasoning text)."""
+
+    if content is None or not content.strip():
+        return [], None, "model_empty_response"
+    text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+    match = _JSON_BLOCK.search(text)
+    if not match:
+        return [], None, "model_json_error"
+    try:
+        decision = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return [], None, "model_json_error"
+    if not isinstance(decision, dict) or not isinstance(decision.get("candidates"), list):
+        return [], None, "model_plan_fields_error"
+    analysis = decision.get("analysis")
+    return decision["candidates"][:MAX_PROPOSALS_PER_ROUND], analysis if isinstance(analysis, str) else None, None
+
+
+async def _chat(messages: list[dict[str, str]], timeout_seconds: float, max_tokens: int):
     async with openai.AsyncOpenAI(
         base_url=os.environ["PLATFORM_LLM_URL"],
         api_key=os.environ["PLATFORM_API_KEY"],
@@ -149,196 +193,195 @@ async def _request_plan(prompt: str, timeout_seconds: float) -> str | None:
     ) as client:
         response = await client.chat.completions.create(
             model=os.environ["AGENT_MODEL_NAME"],
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=64,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.2,
         )
-    return response.choices[0].message.content
+    choice = response.choices[0]
+    usage = response.usage
+    metadata = {
+        "finish_reason": choice.finish_reason,
+        "usage": None if usage is None else {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        },
+    }
+    return choice.message.content, metadata, getattr(response, "_agenthack_llm_call_id", None)
 
 
-async def suggest_plan_with_deadline(
-    prompt: str,
-    timeout_seconds: float,
-    allowed_algorithms: list[str],
-    allowed_policies: list[str],
-) -> tuple[dict[str, str] | None, str | None, str | None]:
-    """Validate the external model decision before it controls construction."""
+async def ask_model(messages: list[dict[str, str]], timeout_seconds: float, max_tokens: int):
+    """Return (content, metadata, llm_call_id, error_reason); never raises for model faults."""
 
     try:
-        content = await asyncio.wait_for(
-            _request_plan(prompt, timeout_seconds),
-            timeout=timeout_seconds,
+        content, metadata, call_id = await asyncio.wait_for(
+            _chat(messages, timeout_seconds, max_tokens), timeout=timeout_seconds,
         )
     except asyncio.TimeoutError:
-        return None, "model_timeout", None
+        return None, None, None, "model_timeout"
     except openai.OpenAIError as exc:
-        return None, f"model_api_error:{type(exc).__name__}", None
-
-    if content is None or not content.strip():
-        return None, "model_empty_response", content
-    try:
-        decision = json.loads(content)
-    except json.JSONDecodeError:
-        return None, "model_json_error", content
-    if not isinstance(decision, dict) or set(decision) != {"algorithm", "policy"}:
-        return None, "model_plan_fields_error", content
-    if not isinstance(decision["algorithm"], str) or decision["algorithm"] not in allowed_algorithms:
-        return None, "model_unknown_algorithm", content
-    if not isinstance(decision["policy"], str) or decision["policy"] not in allowed_policies:
-        return None, "model_unknown_policy", content
-    return decision, None, content
+        return None, None, None, f"model_api_error:{type(exc).__name__}"
+    return content, metadata, call_id, None
 
 
-def _metrics_log(task_id: str, metrics: dict[str, Any]) -> None:
-    LOGGER.info(
-        "agentcc.solve_metrics task_id=%s %s",
-        task_id,
-        json.dumps(metrics, ensure_ascii=False, separators=(",", ":")),
+def _config_key(config: dict[str, Any]) -> tuple:
+    return (
+        config["algorithm"], config["split"], config["path_width"],
+        config.get("rs_dims"), tuple(config["order"]),
     )
+
+
+def _public_config(config: dict[str, Any]) -> dict[str, Any]:
+    return {key: config[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "order_source")
+            if key in config}
+
+
+def evaluate_candidate(planner: Planner, raw: Any, seen: set[tuple]) -> dict[str, Any]:
+    """Tool body: normalize, build, validate and estimate one proposed configuration."""
+
+    started = perf_counter()
+    row: dict[str, Any] = {"proposal": raw}
+    try:
+        config = planner.normalize_config(raw)
+    except (AgentCCError, AttributeError, TypeError) as exc:
+        row.update(status="rejected", error=str(exc))
+        return row
+    row["config"] = _public_config(config)
+    key = _config_key(config)
+    if key in seen:
+        row.update(status="duplicate")
+        return row
+    seen.add(key)
+    try:
+        answer = planner.build(config)
+        validate_answer(planner.task, planner.topology, answer, planner.network.raw)
+    except AgentCCError as exc:
+        row.update(status="invalid", error=str(exc))
+        return row
+    estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
+    slowest = sorted(enumerate(estimate["rounds"], 1), key=lambda item: -item[1]["time_us"])[:3]
+    row.update(
+        status="valid",
+        estimate_us=estimate["total_us"],
+        round_count=answer["round_count"],
+        transfers=sum(len(item["transfers"]) for item in answer["rounds"]),
+        slowest_rounds=[
+            {"round": number, "time_us": data["time_us"], "limiter": data["limiter"]}
+            for number, data in slowest
+        ],
+        elapsed_ms=round((perf_counter() - started) * 1000, 3),
+    )
+    row["_answer"] = answer
+    row["_estimate"] = estimate
+    return row
 
 
 class AgentCCAgent(BaseAgent):
     async def solve(self, task_input: dict) -> dict:
-        request_started = perf_counter()
+        started = perf_counter()
         task = task_input["task"]
         topology = task_input["topology"]
-        task_id = str(task["task_id"])
-        solve_deadline = request_started + _configured_seconds(
-            "AGENT_SOLVE_BUDGET_SECONDS", DEFAULT_SOLVE_BUDGET_SECONDS
-        )
-        with turn(trigger="user"):
-            with state("reasoning"):
-                baseline_started = perf_counter()
-                network = _topology_network(topology)
-                split = min(_candidate_splits(task))
-                routes = _routes(task, topology, split, network=network)
-                baseline = solve_input(task_input, network=network, routes=routes)
-                baseline_answer = baseline["answer"]
-                baseline_time_us = estimate_schedule_time_us(
-                    task, topology, baseline_answer, network
-                )
-                baseline_ms = (perf_counter() - baseline_started) * 1000
-                best = baseline
-                selected_policy = "baseline"
-                selected_algorithm = "recursive_doubling"
-                model_plan = None
-                model_content = None
-                fallback_reason = None
-                candidate_time_us = None
-                candidate_validation = "not_built"
-                candidate_ms = 0.0
-                llm_ms = 0.0
-                route_balancing = None
+        task_id = str(task.get("task_id"))
+        deadline = started + _configured("AGENT_SOLVE_BUDGET_SECONDS", DEFAULT_SOLVE_BUDGET_SECONDS)
+        model_budget = _configured("AGENT_LLM_BUDGET_SECONDS", DEFAULT_MODEL_BUDGET_SECONDS)
+        model_total = _configured("AGENT_LLM_TOTAL_SECONDS", DEFAULT_MODEL_TOTAL_SECONDS)
+        model_spent = 0.0
+        model_rounds = int(_configured("AGENT_MODEL_ROUNDS", DEFAULT_MODEL_ROUNDS))
+        max_tokens = int(_configured("AGENT_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS))
+        digest = _input_digest(task, topology)
+        audit: dict[str, Any] = {"task_id": task_id, "input_sha256": digest, "model_rounds": []}
 
+        with turn(trigger="user") as root_turn:
+            with state("planning"):
                 planning_started = perf_counter()
-                profiles = doubling_round_profiles(task, topology, routes, network)
-                dimension_order = (
-                    optimal_doubling_order(profiles)
-                    if task["operator"] == "all-gather" else None
-                )
-                allowed_algorithms = list(SCHEDULE_ALGORITHMS[task["operator"]])
-                allowed_policies = list(ROUTE_POLICIES)
-                if task.get("allow_detour", topology.get("allow_detour", True)):
-                    allowed_policies.append("load_balanced")
-                if "tree" in allowed_algorithms and (
-                    not task.get("allow_copy", True)
-                    or 2 * baseline_answer["round_count"] > int(task["max_nonempty_rounds"])
-                ):
-                    allowed_algorithms.remove("tree")
-                prompt = _plan_prompt(
-                    task, topology, baseline_answer, baseline_time_us,
-                    profiles, dimension_order, allowed_algorithms, allowed_policies, network,
-                )
-                input_sha256 = hashlib.sha256(json.dumps(
-                    {"task": task, "topology": topology},
-                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-                ).encode()).hexdigest()
-                LOGGER.info("agentcc.model_input %s", json.dumps({
-                    "task_id": task_id, "input_sha256": input_sha256, "prompt": prompt,
-                }, ensure_ascii=False, separators=(",", ":")))
-                planning_ms = (perf_counter() - planning_started) * 1000
-                remaining = solve_deadline - perf_counter() - RETURN_RESERVE_SECONDS
-                if remaining <= 0:
-                    llm_reason = "solve_budget_exhausted"
-                else:
-                    llm_started = perf_counter()
-                    model_budget = _configured_seconds(
-                        "AGENT_LLM_BUDGET_SECONDS", DEFAULT_MODEL_BUDGET_SECONDS
-                    )
-                    model_plan, llm_reason, model_content = await suggest_plan_with_deadline(
-                        prompt, min(model_budget, remaining), allowed_algorithms, allowed_policies,
-                    )
-                    llm_ms = (perf_counter() - llm_started) * 1000
-                LOGGER.info("agentcc.model_output %s", json.dumps({
-                    "task_id": task_id, "input_sha256": input_sha256,
-                    "content": model_content, "plan": model_plan, "error": llm_reason,
-                }, ensure_ascii=False, separators=(",", ":")))
+                planner = await asyncio.to_thread(Planner, task, topology)
+                profiles = await asyncio.to_thread(planner.dimension_profiles)
+                audit["planning_ms"] = round((perf_counter() - planning_started) * 1000, 3)
 
-                if llm_reason is not None:
-                    fallback_reason = llm_reason
-                elif model_plan != {"algorithm": "recursive_doubling", "policy": "baseline"}:
-                    remaining = solve_deadline - perf_counter() - RETURN_RESERVE_SECONDS
-                    if remaining <= 0:
-                        fallback_reason = "candidate_budget_exhausted"
-                    else:
-                        candidate_started = perf_counter()
-                        try:
-                            reuse_routes = model_plan["policy"] in ("baseline", "load_balanced")
-                            candidate = {"answer": build_solution(
-                                task, topology,
-                                route_policy="baseline" if reuse_routes else model_plan["policy"],
-                                network=network,
-                                algorithm=model_plan["algorithm"],
-                                routes=routes if reuse_routes else None,
-                                dimension_order=(
-                                    dimension_order if reuse_routes else None
-                                ),
-                            )}
-                            if model_plan["policy"] == "load_balanced":
-                                route_balancing = balance_schedule_routes(
-                                    task, topology, candidate["answer"], network,
-                                    deadline=min(
-                                        perf_counter() + ROUTE_BALANCE_BUDGET_SECONDS,
-                                        solve_deadline - RETURN_RESERVE_SECONDS,
-                                    ),
-                                )
-                            validate_answer(task, topology, candidate["answer"], network)
-                            candidate_validation = "passed"
-                            candidate_time_us = estimate_schedule_time_us(
-                                task,
-                                topology,
-                                candidate["answer"],
-                                network,
-                            )
-                            if candidate_time_us < baseline_time_us:
-                                best = candidate
-                                selected_policy = model_plan["policy"]
-                                selected_algorithm = model_plan["algorithm"]
-                            else:
-                                fallback_reason = "candidate_rejected_estimate_not_lower"
-                        except AgentCCError as exc:
-                            candidate_validation = f"failed:{exc}"
-                            fallback_reason = f"candidate_error:{type(exc).__name__}"
-                        candidate_ms = (perf_counter() - candidate_started) * 1000
+            seen: set[tuple] = set()
+            evaluated: list[dict[str, Any]] = []
+            best: dict[str, Any] | None = None
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": _first_prompt(planner, profiles)},
+            ]
+            parent_turn = getattr(root_turn, "attrs", {}).get("turn_id")
+            for round_index in range(max(0, model_rounds)):
+                remaining = min(
+                    deadline - perf_counter() - RETURN_RESERVE_SECONDS,
+                    model_total - model_spent,
+                )
+                if remaining <= 1.0:
+                    audit["model_rounds"].append({"round": round_index + 1, "skipped": "model_or_solve_budget_exhausted"})
+                    break
+                record: dict[str, Any] = {"round": round_index + 1, "prompt_bytes": len(messages[-1]["content"].encode())}
+                with turn(trigger="tool_result" if round_index else "user", parent_turn_id=parent_turn):
+                    with state("reasoning"):
+                        llm_started = perf_counter()
+                        content, metadata, call_id, error = await ask_model(
+                            messages, min(model_budget, remaining), max_tokens,
+                        )
+                        model_spent += perf_counter() - llm_started
+                        record["llm_ms"] = round((perf_counter() - llm_started) * 1000, 3)
+                        record["response_metadata"] = metadata
+                        record["content"] = content
+                    proposals, analysis, parse_error = ([], None, error) if error else parse_proposals(content)
+                    record["analysis"] = analysis
+                    record["error"] = parse_error
+                    if parse_error:
+                        if metadata and metadata.get("finish_reason") == "length":
+                            record["error"] = "model_token_limit"
+                        audit["model_rounds"].append(record)
+                        recovery("fallback_to_agent_reference" if round_index == 0 else "keep_best_candidate", count=0)
+                        break
+                    messages.append({"role": "assistant", "content": content})
+                    rows = []
+                    with state("tool_execution"):
+                        for proposal in proposals:
+                            if perf_counter() > deadline - RETURN_RESERVE_SECONDS:
+                                rows.append({"proposal": proposal, "status": "skipped_deadline"})
+                                continue
+                            with tool_call(
+                                TOOL_NAME, "function", arguments={"proposal": proposal},
+                                tool_version=TOOL_VERSION, parent_llm_call_id=call_id,
+                            ) as call:
+                                row = await asyncio.to_thread(evaluate_candidate, planner, proposal, seen)
+                                call.result({k: v for k, v in row.items() if not k.startswith("_")})
+                            rows.append(row)
+                            if row["status"] == "valid" and (best is None or row["estimate_us"] < best["estimate_us"]):
+                                best = row
+                    public_rows = [{k: v for k, v in row.items() if not k.startswith("_")} for row in rows]
+                    record["tool_results"] = public_rows
+                    evaluated.extend(public_rows)
+                    audit["model_rounds"].append(record)
+                    if not proposals:
+                        break
+                    messages.append({"role": "user", "content": _feedback_prompt(public_rows, best)})
+
+            with state("reflection"):
+                selection = "model_candidate"
+                if best is None:
+                    selection = "agent_reference"
+                    recovery("fallback_to_agent_reference", count=0)
+                    row = await asyncio.to_thread(evaluate_candidate, planner, reference_config(planner), set())
+                    if row["status"] != "valid":
+                        raise AgentCCError(f"reference configuration failed: {row.get('error')}")
+                    best = row
+                audit["selection"] = selection
+                audit["selected_config"] = best["config"]
+                audit["selected_estimate_us"] = best["estimate_us"]
+                audit["evaluated_valid"] = sum(1 for row in evaluated if row["status"] == "valid")
+                audit["evaluated_total"] = len(evaluated)
 
             with state("final_answer"):
-                metrics = {
-                    "baseline_ms": round(baseline_ms, 3),
-                    "planning_ms": round(planning_ms, 3),
-                    "llm_ms": round(llm_ms, 3),
-                    "candidate_ms": round(candidate_ms, 3),
-                    "solve_ms": round((perf_counter() - request_started) * 1000, 3),
-                    "response_bytes": len(
-                        json.dumps(best, ensure_ascii=False, separators=(",", ":")).encode()
-                    ),
-                    "selected_policy": selected_policy,
-                    "selected_algorithm": selected_algorithm,
-                    "model_plan": model_plan,
-                    "baseline_estimate_us": baseline_time_us,
-                    "candidate_estimate_us": candidate_time_us,
-                    "candidate_validation": candidate_validation,
-                    "route_balancing": route_balancing,
-                    "input_sha256": input_sha256,
-                    "fallback_reason": fallback_reason,
-                }
-                _metrics_log(task_id, metrics)
-                return best
+                answer = best["_answer"]
+                attach_metrics(answer, best["_estimate"])
+                answer["strategy"] = (
+                    f"{best['config']['algorithm']} split={best['config']['split']} "
+                    f"path_width={best['config']['path_width']}"
+                    + (f" rs_dims={best['config']['rs_dims']}" if "rs_dims" in best["config"] else "")
+                    + f" order={best['config']['order']} selected by {selection}"
+                )
+                audit["solve_ms"] = round((perf_counter() - started) * 1000, 3)
+                LOGGER.info("agentcc.audit %s", json.dumps(_round_floats(audit), ensure_ascii=False, separators=(",", ":")))
+                return {"answer": answer}

@@ -1,162 +1,92 @@
-# AgentCC scheduling agent
+# AgentCC scheduling agent (0.2.0)
 
-This repository contains a model-guided AgentCC scheduling agent with
-deterministic schedule construction and constraint validation.
+The agent searches AgentCC AllGather/AllReduce schedules with the model in
+the loop. Every request is planned from its own `task` and `topology`. The
+agent loads no fixed instance data and never selects by instance name.
 
-For each request, the agent first builds and validates the `baseline` plan.
-It then calls the configured OpenAI-compatible model once to select a scheduling
-algorithm and route policy. Only the selected extra candidate is constructed,
-validated, and accepted when its local communication estimate is strictly lower
-than the baseline. Model API failures, timeouts, invalid decisions, exhausted
-budgets, and rejected candidates retain the validated baseline; unexpected
-programming and configuration errors propagate.
+## Decision loop
 
-The agent reads the request's `task` and
-`topology`, including directed edge bandwidth and shared resources, builds
-resource-aware switch-only-intermediate routes, and selects from:
+1. **Parse and validate.** The agent rejects invalid inputs with a reason:
+   undeclared edge endpoints, rank/switch overlap, duplicate or undefined
+   resources, resource references to missing edges, mismatched ranks, a
+   non-power-of-two rank count, or no split that satisfies alignment.
+2. **Profile.** For every XOR exchange dimension, the agent optimizes the round
+   on 1 path and on up to 16 switch-only paths per pair. It reports the cost
+   per MiB and the bottleneck, which is a directed edge, a shared resource, or
+   path time.
+3. **Model round 1.** The model receives the constraints, the valid splits,
+   the tightest shared resources and the profiles. It proposes up to 4
+   configurations: `algorithm`, `split`, `path_width`, `rs_dims` and `order`.
+4. **Tool `evaluate_schedule`.** Each proposal is normalized, built, checked
+   against every correctness constraint, and estimated with the published
+   Replay formula. Each evaluation is recorded as an SDK `tool_call` linked to
+   the model call that produced it.
+5. **Model round 2.** The model receives the measured times and the slowest
+   rounds' limiters, then proposes refinements, which are evaluated the same
+   way.
+6. **Select.** The fastest validated candidate is returned with
+   `metrics.total_time`/`round_times` in seconds and a `strategy` string. If
+   the model fails or times out, or every proposal is invalid, a validated
+   agent-side reference is returned and recorded as `agent_reference`.
 
-- `recursive_doubling`: the original baseline for either operator.
-- `ordered_doubling`: AllGather with a topology-derived XOR dimension order.
-  Dynamic programming minimizes the published round-cost model for fixed
-  routes and dimensions; 256 ranks still require eight rounds.
-- `tree`: AllReduce reduction followed by broadcast, using sixteen rounds for
-  256 ranks. The tree sends fewer total logical bytes but is retained only when
-  its estimated communication time improves on the baseline.
+Algorithms:
+- AllGather `doubling`.
+- AllReduce `rs_ag`: reduce-scatter, then a reduce exchange, then all-gather.
+  It moves about 2x the data instead of 8x.
+- AllReduce `doubling` and `tree`.
 
-The minimum legal split is used for all candidates. The agent does not load
-fixed public topology data or select schedules by instance names.
-Path weights are precomputed once per static route policy. Only XOR exchange
-pairs used by the supported schedules are materialized: 2,048 paths for 256
-ranks, rather than 65,280 paths. Other ranks remain forbidden as path interiors.
-Baseline routes and the AllGather cost table are reused for `baseline` and
-`load_balanced`.
+Each pair's chunks are split over several paths by a Frank-Wolfe optimizer
+that works on edge, resource and path-time loads.
 
-The local estimator includes directed edge loads, overlapping shared resources,
-path transmission, startup, and switch overhead. The official platform Replay
-remains the scoring authority.
+## Evidence
 
-The public examples are local fixtures only. Official evaluation data arrives
-inside each `/solve` request.
+Each solve logs one `agentcc.audit` JSON line. It contains:
+- the input SHA-256;
+- per model round: the model content, analysis, finish reason and usage;
+- every tool result (status, estimate, slowest rounds and limiters);
+- the selection, selected config and timings.
 
-## Build and run
+API credentials are not logged.
 
-The Dockerfile uses the downloaded platform base image `agenthack/base:1.1.1`.
-At runtime the platform must provide `PLATFORM_LLM_URL`, `PLATFORM_API_KEY`,
-and `AGENT_MODEL_NAME`; these values are never stored in the repository or
-image.
+## Configuration
 
-```powershell
-docker build --platform linux/amd64 -t team-001-agent:0.1.5 .
-docker run --rm -p 127.0.0.1:18080:8080 `
-  -e PLATFORM_LLM_URL -e PLATFORM_API_KEY -e AGENT_MODEL_NAME `
-  team-001-agent:0.1.5
-```
+The platform injects `PLATFORM_LLM_URL`, `PLATFORM_API_KEY` and
+`AGENT_MODEL_NAME`; none are stored in the image. Optional settings:
 
-The runtime exposes `GET /health` and `POST /solve` on port 8080. The request
-body follows the AgentRuntime contract: `task_id` plus an `input` object with
-the current AgentCC `task` and `topology`.
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `AGENT_LLM_BUDGET_SECONDS` | 15 | per model call |
+| `AGENT_LLM_TOTAL_SECONDS` | 25 | all model calls in one solve |
+| `AGENT_SOLVE_BUDGET_SECONDS` | 60 | soft solve deadline (3 s return reserve) |
+| `AGENT_MODEL_ROUNDS` | 2 | propose/feedback rounds |
+| `AGENT_MAX_OUTPUT_TOKENS` | 1024 | model `max_tokens` |
 
-The model request uses `AGENT_LLM_BUDGET_SECONDS` (default `2`) as an outer
-wall-clock deadline and sets the OpenAI client retry count to zero. The solve
-soft deadline is `AGENT_SOLVE_BUDGET_SECONDS` (default `25`); a 250 ms return
-reserve is kept before building an extra candidate.
-
-The model receives actual task constraints, per-dimension timing estimates,
-directed bottleneck edges and bandwidths, shared-resource capacities and used
-member examples, and representative current paths. This is a bounded view of
-the current graph; it does not contain the full edge list. The prompt states
-that resource member examples are partial.
-
-The model returns exactly an `algorithm` and `policy`, for example:
-
-```json
-{"algorithm":"ordered_doubling","policy":"load_balanced"}
-```
-
-Available algorithms are restricted by operator, copy support, and round limit.
-Route policies `baseline`, `bandwidth_first`, and `resource_first` apply shared
-resource penalties of 1.0, 0.25, and 2.0 respectively during path construction.
-The additional `load_balanced` policy starts from baseline paths and refines
-individual transfers using concurrent directed-edge and shared-resource loads.
-It searches at most 64 paths, at most 16 transfers per round, with a 250 ms
-search budget bounded by the remaining solve deadline. Higher-cost rounds are
-visited first. Squared utilization guides path proposals; the complete local
-Replay formula decides acceptance. No round estimate may increase. Equal-time
-moves require lower squared utilization, allowing progress across tied
-bottlenecks. Repeated traversals and overlapping resource memberships are
-counted during acceptance. The final candidate is validated before comparison
-with the baseline. This policy is unavailable when detours are disallowed.
-
-Each solve logs the exact model prompt and response, linked to a SHA-256 hash
-of the current task and topology. The metrics record includes `baseline_ms`,
-`planning_ms`, `llm_ms`, `candidate_ms`, `solve_ms`, `response_bytes`,
-`selected_algorithm`, `selected_policy`, `model_plan`, both communication
-estimates, `candidate_validation`, `route_balancing`, and `fallback_reason`. The
-balancing record includes attempted and changed paths, initial and final
-estimates, elapsed time, and the stop reason. API credentials are
-not included in these records.
-
-`response_bytes` measures the compact business answer inside the agent. For
-the complete `/solve` path, record `http_total_ms` and the exact response length
-in a local client; SDK wrapping, telemetry flushing, and HTTP transmission are
-outside the agent's `solve_ms`.
-
-## Local verification
+## Build, run, test
 
 ```powershell
+docker build --platform linux/amd64 -t team-001-agent:0.2.0 .
+docker run --rm -p 127.0.0.1:18080:8080 -e PLATFORM_LLM_URL -e PLATFORM_API_KEY -e AGENT_MODEL_NAME team-001-agent:0.2.0
 python -m unittest -v test_agentcc.py
 ```
 
-The suite covers both operators on all fourteen public 256-rank examples,
-exhaustive dimension-order comparisons, overlapping resources and directional
-bandwidths, input-capacity changes, alignment, tree contribution correctness,
-model-driven adoption and rejection using real estimates, and request
-cancellation, needed-pair routing, route balancing under repeated/overlapping
-resources, rejection of slower detours, and exhausted search deadlines.
-Public examples and local estimates do not establish an official
-Replay score.
+The entry point is `AgentRuntime(AgentCCAgent()).run()` ([src/__main__.py](src/__main__.py)).
+It exposes only the SDK's `/health` and `/solve`.
 
-Version 0.1.5 passes 21 unit tests. A paired container run compared the preserved
-0.1.4 image with 0.1.5 through the actual SDK HTTP interface, using a local mock
-model, 1 CPU, 1024 MiB, and 256 pids. All 28 evaluated requests were locally
-valid and recorded one model API call each. All 28 input/output/metrics audit
-chains were checked. The mock selects `load_balanced` for 0.1.5 and `baseline`
-for 0.1.4, with the same scheduling algorithm for each operator.
+## Local results (public examples, mock model, not official Replay)
 
-Relative to 0.1.4 on these public fixtures, nine communication estimates
-improved and five were unchanged. AllGather improvements were 0.79–5.66%;
-Uneven Pods and Mesh2D AllReduce improved by 36.27% and 30.04%. Other AllReduce
-estimates were unchanged. In this single paired run after one warmup per image,
-mean HTTP duration changed from 897.581 to 680.501 ms; 0.1.5 requests took
-417.560–1650.020 ms. Planning plus candidate work took 147.137–459.591 ms,
-including 9.973–250.027 ms for load balancing. See
-[the 0.1.5 validation report](optimization-validation-0.1.5.json) for per-case
-data and artifact checksums. These timings exclude real model latency, and
-the communication values are local estimates rather than official scores.
+All 14 public 256-rank cases were run through the real SDK HTTP runtime with a
+local mock model. Every case returned a validated answer and made 2 model
+calls. HTTP time was 3.5–7.6 s, including about 1.2 s of mock latency per call.
 
-Version 0.1.4 previously passed all fourteen public examples through the actual
-AgentRuntime HTTP interface with a local mock model service, using 1 CPU,
-1024 MiB, and 256 pids. Each request recorded one model API call, accepted
-the selected optimization, and produced a locally valid answer. The additional
-planning and candidate work measured 226–436 ms in this single run.
-The model prompt, response, input hash, and acceptance records were verified
-for every request. See [the validation report](optimization-validation-0.1.4.json)
-for timings, image identity, source hashes, and the exported archive checksum.
-This run does not measure real-model latency or official Replay performance.
+| Case | 0.1.6 estimate (us) | 0.2.0 estimate (us) |
+| --- | ---: | ---: |
+| uneven_pods AG / AR | 37525 / 5483 | 26192 / 592 |
+| directed_ring AG / AR | 29270 / 2039 | 29270 / 630 |
+| sparse_fabric AG / AR | 20803 / 1669 | 12871 / 299 |
+| cloudmatrix AG / AR | 29385 / 1506 | 8877 / 182 |
+| fullmesh_clos AG / AR | 8278 / 1045 | 3415 / 208 |
+| mesh2d AG / AR | 58851 / 1265 | 7004 / 312 |
+| nvlink_like AG / AR | 10736 / 1193 | 2036 / 140 |
 
-## Platform evaluation reported by the user
-
-The platform report completed at 2026-11-05 13:08 records 14/14 feasible
-instances, 128 rounds, and accepted execution evidence. Means calculated from
-the displayed case scores are 15.000 for correctness, 38.840 for communication,
-34.484 for solve time, and 88.324 overall. The earlier user-provided report
-averaged 81.583 overall. Seven Replay times improved and seven were unchanged;
-the displayed report does not expose the model decisions or fallback reasons.
-See [the platform evaluation summary](PLATFORM_EVALUATION.md) and
-[per-instance data](platform-evaluation-0.1.5.json). The measurements above in
-Local verification remain separate mock-model results.
-
-## Container entry point
-
-The image starts `AgentRuntime(AgentCCAgent()).run()` and exposes the SDK's
-`/health` and `/solve` endpoints.
+The real model's latency, its proposals, and the official Replay result are
+not yet measured. The platform's hidden instances use different bandwidths.
