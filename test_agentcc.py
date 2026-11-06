@@ -190,6 +190,37 @@ class SolverTests(unittest.TestCase):
             estimate_schedule_time_us(data["task"], data["topology"], rd),
         )
 
+    def test_sum_notation_copies_are_valid_and_smaller(self):
+        data = two_plane_input("all-reduce")
+        task, topology = data["task"], data["topology"]
+        sizes = {}
+        for notation in (False, True):
+            planner = Planner(task, topology, sum_notation=notation)
+            for raw in ({"algorithm": "rs_ag", "split": 8, "path_width": 2}, {"algorithm": "tree", "split": 2, "path_width": 2}):
+                answer = planner.build(planner.normalize_config(raw))
+                validate_answer(task, topology, answer)
+                copies = [item for r in answer["rounds"] for t in r["transfers"] if t["action"] == "copy"
+                          for item in t["chunk_ranges"]]
+                reduces = [item for r in answer["rounds"] for t in r["transfers"] if t["action"] == "reduce"
+                           for item in t["chunk_ranges"]]
+                self.assertEqual(all(item.endswith("_sum") for item in copies), notation)
+                self.assertFalse(any(item.endswith("_sum") for item in reduces))
+                sizes[(notation, raw["algorithm"])] = len(json.dumps(answer))
+                same = Planner(task, topology, sum_notation=not notation).build(planner.normalize_config(raw))
+                self.assertAlmostEqual(estimate_schedule_time_us(task, topology, answer),
+                                       estimate_schedule_time_us(task, topology, same))
+        self.assertLess(sizes[(True, "rs_ag")], sizes[(False, "rs_ag")])
+        # A copy of an incomplete slot written as c{slot}_sum is still rejected.
+        planner = Planner(task, topology, sum_notation=True)
+        answer = planner.build(planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 1}))
+        answer["rounds"][0]["transfers"][0]["action"] = "copy"
+        answer["rounds"][0]["transfers"][0]["chunk_ranges"] = [
+            f"c{item.split('_c')[-1]}_sum" if "+" not in item else item
+            for item in answer["rounds"][0]["transfers"][0]["chunk_ranges"]
+        ]
+        with self.assertRaises(AgentCCError):
+            validate_answer(task, topology, answer)
+
     def test_validator_catches_semantic_violations(self):
         data = two_plane_input("all-reduce")
         task, topology = data["task"], data["topology"]
@@ -480,6 +511,16 @@ class AgentLoopTests(unittest.TestCase):
             evaluator.select()
         emergency = evaluator.emergency()
         validate_answer(data["task"], data["topology"], emergency["_answer"])
+
+    def test_sum_notation_switch(self):
+        data = two_plane_input("all-reduce")
+        _, audit_on, _ = self._run(['{"c":[]}'], task_input=data)
+        self.assertTrue(audit_on["sum_notation"])
+        result, audit_off, _ = self._run(['{"c":[]}'], task_input=data, environment={"AGENTCC_SUM_NOTATION": "0"})
+        self.assertFalse(audit_off["sum_notation"])
+        copies = [item for r in result["answer"]["rounds"] for t in r["transfers"] if t["action"] == "copy"
+                  for item in t["chunk_ranges"]]
+        self.assertTrue(copies and not any(item.endswith("_sum") for item in copies))
 
     def test_reply_parsing(self):
         module = self._load_agent_module({"tools": [], "recovery": []})

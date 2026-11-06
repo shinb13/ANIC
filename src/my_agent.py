@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.2).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.3).
 
 Per request, every value comes from the current task and topology:
 
@@ -54,7 +54,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.2"
+TOOL_VERSION = "2.3"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -77,6 +77,12 @@ def _configured(name: str, default: float) -> float:
         return default if value is None or value == "" else float(value)
     except ValueError:
         return default
+
+
+def sum_notation_enabled() -> bool:
+    """Write copies of complete AllReduce slots as c{slot}_sum (default on in 0.2.3)."""
+
+    return os.environ.get("AGENTCC_SUM_NOTATION", "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def _input_digest(task: dict[str, Any], topology: dict[str, Any]) -> str:
@@ -358,12 +364,14 @@ class AgentCCAgent(BaseAgent):
         topology = task_input["topology"]
         model_budget = _configured("AGENT_LLM_BUDGET_SECONDS", DEFAULT_MODEL_BUDGET_SECONDS)
         max_tokens = int(_configured("AGENT_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS))
-        audit: dict[str, Any] = {"task_id": str(task.get("task_id")), "input_sha256": _input_digest(task, topology)}
+        audit: dict[str, Any] = {"task_id": str(task.get("task_id")), "input_sha256": _input_digest(task, topology),
+                                 "sum_notation": sum_notation_enabled()}
 
         with turn(trigger="user"):
             with state("planning"):
                 # Input errors are real task errors and are reported as such.
-                planner = await asyncio.to_thread(Planner, task, topology)
+                planner = await asyncio.to_thread(
+                    lambda: Planner(task, topology, sum_notation=sum_notation_enabled()))
                 profiles = await asyncio.to_thread(planner.dimension_profiles, 1)
                 ranked = await asyncio.to_thread(rank_portfolio, planner)
                 prompt = build_prompt(planner, profiles, ranked)

@@ -539,8 +539,12 @@ def _discretize(fractions: np.ndarray, units: int) -> np.ndarray:
 class Planner:
     """Per-request state: current network, cached round plans and chunk names."""
 
-    def __init__(self, task: dict[str, Any], topology: dict[str, Any]):
+    def __init__(self, task: dict[str, Any], topology: dict[str, Any], *, sum_notation: bool = False):
         validate_task_input(task, topology)
+        # When true, copies of a completely reduced slot are written as
+        # ``c{slot}_sum`` (the notation the output format defines for complete
+        # slots) instead of listing all contributors.
+        self.sum_notation = bool(sum_notation)
         self.task = task
         self.topology = topology
         self.network = Network(task, topology)
@@ -679,7 +683,8 @@ class Planner:
             for index, (key, pairs, action) in enumerate(self.tree_stages(order)):
                 plan = self.round_plan(key, pairs, self.round_width(config, index))
                 group = n if action == "copy" else 1 << index
-                specs.append({"plan": plan, "pairs": len(pairs), "chunks": split, "group": group})
+                specs.append({"plan": plan, "pairs": len(pairs), "chunks": split, "group": group,
+                              "complete": action == "copy"})
             return specs
         for index, (step, chunks) in enumerate(self.round_payloads(config)):
             plan = self.exchange_plan(step, self.round_width(config, index))
@@ -689,7 +694,8 @@ class Planner:
                 group = n
             else:
                 group = 1 << index
-            specs.append({"plan": plan, "pairs": n, "chunks": chunks, "group": group})
+            complete = self.operator == "all-reduce" and config["algorithm"] == "rs_ag" and index >= len(self.steps)
+            specs.append({"plan": plan, "pairs": n, "chunks": chunks, "group": group, "complete": complete})
         return specs
 
     def predict(self, config: dict[str, Any]) -> dict[str, float]:
@@ -703,7 +709,10 @@ class Planner:
             overhead = max(route.overhead_us for routes in plan.routes for route in routes)
             total_us += overhead + plan.busy_per_byte_us * chunk_bytes * spec["chunks"]
             used = float(np.minimum((plan.fractions > 1e-3).sum(axis=1), spec["chunks"]).mean())
-            entry = spec["group"] * (name + 1) + 2
+            if spec.get("complete") and self.sum_notation:
+                entry = len(f"c{config['split']}_sum") + 3
+            else:
+                entry = spec["group"] * (name + 1) + 2
             size += spec["pairs"] * (spec["chunks"] * entry + used * 110)
         size += 2 * self.rank_count * config["split"] * (name + 3)
         return {"us": total_us, "mb": size / 1e6}
@@ -829,6 +838,9 @@ class Planner:
             members = [sorted(members[index] + members[index ^ step]) for index in range(self.rank_count)]
         return rounds
 
+    def _complete(self, expression, complete: tuple[int, ...], slot: int) -> str:
+        return f"c{slot}_sum" if self.sum_notation else expression(complete, slot)
+
     def _expression_cache(self, split: int):
         names = self.chunk_names(split)
         cache: dict[tuple[tuple[int, ...], int], str] = {}
@@ -905,7 +917,7 @@ class Planner:
             plan = self.exchange_plan(step, self.round_width(config, len(rounds)))
             rounds.append(self._emit(
                 plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
-                lambda _src, piece: [expression(complete, slot) for slot in piece],
+                lambda _src, piece: [self._complete(expression, complete, slot) for slot in piece],
             ))
             owned = [sorted(owned[index] + owned[index ^ step]) for index in range(self.rank_count)]
         return rounds
@@ -931,7 +943,7 @@ class Planner:
             else:
                 rounds.append(self._emit(
                     plan, pairs, [list(range(split)) for _ in pairs], "copy",
-                    lambda _src, piece: [expression(complete, slot) for slot in piece],
+                    lambda _src, piece: [self._complete(expression, complete, slot) for slot in piece],
                 ))
         if groups[0] != complete:
             raise AgentCCError("tree reduction did not reach rank 0 with every contributor")

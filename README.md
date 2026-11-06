@@ -1,4 +1,4 @@
-# AgentCC scheduling agent (0.2.2)
+# AgentCC scheduling agent (0.2.3)
 
 0.2.2 is built on 0.2.1, the best-scoring version so far (88.2 under the old
 rules). It keeps 0.2.1's communication quality and aims at solve time and
@@ -22,7 +22,20 @@ agent loads no fixed instance data and never selects by instance name.
    The first one that passes full validation is returned. The audit records
    whether the model's pick won outright.
 
-## Changes from 0.2.1
+## Changes in 0.2.3: `c{slot}_sum` in copies
+
+In the AllReduce all-gather phase, each copy of a completely reduced slot
+is written as `c{slot}_sum`. The output format defines this notation for
+complete slots. Before 0.2.3, every copy listed all 256 contributors. With
+the short form, AllReduce responses fell from 9–18 MB to 1.0–1.8 MB. Replay
+estimates did not change, and the best-communication `rs_ag` configurations
+are selected again.
+
+Whether the official Replay accepts this notation inside transfers has not
+been confirmed. Set `AGENTCC_SUM_NOTATION=0` to restore full contributor
+expressions; 0.2.2 is the same code with that behaviour.
+
+## Changes from 0.2.1 (0.2.2)
 
 - **Always returns an answer.** Model, parse, candidate and selection errors
   are all contained. A last-resort reference configuration is built and
@@ -62,11 +75,12 @@ The platform injects `PLATFORM_LLM_URL`, `PLATFORM_API_KEY` and
 | --- | ---: | --- |
 | `AGENT_LLM_BUDGET_SECONDS` | 6 | model call cap |
 | `AGENT_MAX_OUTPUT_TOKENS` | 120 | model `max_tokens` |
+| `AGENTCC_SUM_NOTATION` | 1 | write complete-slot copies as `c{slot}_sum` |
 
 ## Build, run, test
 
 ```powershell
-docker build --platform linux/amd64 -t team-001-agent:0.2.2 .
+docker build --platform linux/amd64 -t team-001-agent:0.2.3 .
 python -m unittest -v test_agentcc.py
 ```
 
@@ -75,13 +89,13 @@ python -m unittest -v test_agentcc.py
 Use your own development API, never the platform credentials. In PowerShell:
 
 ```powershell
-docker load -i team-001-agent-0.2.2.tar        # only if the image is not loaded yet
+docker load -i team-001-agent-0.2.3.tar        # only if the image is not loaded yet
 $env:PLATFORM_LLM_URL = "https://your-dev-gateway/v1"
 $env:AGENT_MODEL_NAME = "your-model"
 $env:PLATFORM_API_KEY = Read-Host "dev API key" -MaskInput
 docker run --rm --name agentcc-test --cpus 1 --memory 1024m --pids-limit 256 `
   -p 127.0.0.1:18080:8080 -e PLATFORM_LLM_URL -e PLATFORM_API_KEY -e AGENT_MODEL_NAME `
-  -e AGENTHACK_TELEMETRY_REQUIRED=false team-001-agent:0.2.2
+  -e AGENTHACK_TELEMETRY_REQUIRED=false team-001-agent:0.2.3
 ```
 
 In a second terminal, run `python local_test.py`. The code the model wrote is
@@ -92,14 +106,13 @@ The entry point is `AgentRuntime(AgentCCAgent()).run()` ([src/__main__.py](src/_
 
 ## Local results (public examples, mock model, not official Replay)
 
-These runs used the 0.2.2 container under 1 CPU / 1024 MiB / 256 pids, with
+These runs used the 0.2.3 container under 1 CPU / 1024 MiB / 256 pids, with
 a mock model answering in 1 s:
-- All 14 cases were valid.
-- Each case took 1.2–2.2 s over HTTP.
-- AllReduce responses were 0.6–9.3 MB.
-- Memory peaked at 134 MiB.
-- The model's pick was selected in 4 cases (2 outright).
+- All 14 cases were valid, each taking 1.3–2.0 s over HTTP.
+- AllReduce responses were 1.0–1.8 MB with the same Replay estimates as
+  0.2.1.
+- Memory peaked at 140 MiB.
 
-With a 10 s mock latency, the 6 s cap applied and each case returned in
-about 6.8 s. Malformed model replies, invalid configurations and an HTTP 500
-all fell back to the validated portfolio answer.
+The local validator accepts `c{slot}_sum` only as the complete set of
+contributors for that slot. A copy of an incomplete slot written this way is
+rejected.
