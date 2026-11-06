@@ -1,0 +1,180 @@
+{
+  "submission": "team-001-agent-0.2.2.tar",
+  "archive_sha256": "e707900f1ebf7e56755356fa9e9e266f4fa869e9d30a559dedd0ebb7b5729e81",
+  "source_commit": "3fbe7f3",
+  "rules": "agentcc-256-20261105-v22-6m-2525",
+  "scoring": "correctness 25, communication 50, solve time 25",
+  "completed_at": "2026-11-06 16:11",
+  "source": "platform report pasted by the user",
+  "summary": {
+    "feasible": "14/14",
+    "rounds": 143,
+    "model_calls": 14,
+    "total_tokens": 8687,
+    "correctness": 25.0,
+    "communication": 44.8,
+    "solve_time": 20.9,
+    "total": 90.7
+  },
+  "cases": [
+    {
+      "instance": "v22_256_uneven_pods_ag",
+      "score": 93.107,
+      "communication": 46.173,
+      "solve_time_score": 21.933,
+      "rounds": 8,
+      "replay_us": 25273.725,
+      "solve_s": 9.479,
+      "tokens": 614,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_uneven_pods_ar",
+      "score": 86.448,
+      "communication": 44.429,
+      "solve_time_score": 17.019,
+      "rounds": 12,
+      "replay_us": 655.207,
+      "solve_s": 23.708,
+      "tokens": 610,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_directed_ring_ag",
+      "score": 92.251,
+      "communication": 45.52,
+      "solve_time_score": 21.731,
+      "rounds": 8,
+      "replay_us": 40660.003,
+      "solve_s": 9.678,
+      "tokens": 593,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_directed_ring_ar",
+      "score": 86.809,
+      "communication": 44.452,
+      "solve_time_score": 17.356,
+      "rounds": 12,
+      "replay_us": 751.319,
+      "solve_s": 22.466,
+      "tokens": 607,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_sparse_fabric_ag",
+      "score": 94.415,
+      "communication": 47.79,
+      "solve_time_score": 21.625,
+      "rounds": 8,
+      "replay_us": 17648.884,
+      "solve_s": 10.16,
+      "tokens": 610,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_sparse_fabric_ar",
+      "score": 87.951,
+      "communication": 44.991,
+      "solve_time_score": 17.96,
+      "rounds": 12,
+      "replay_us": 544.807,
+      "solve_s": 20.584,
+      "tokens": 608,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_cloudmatrix_ag",
+      "score": 94.884,
+      "communication": 44.884,
+      "solve_time_score": 25.0,
+      "rounds": 8,
+      "replay_us": 13645.337,
+      "solve_s": 11.945,
+      "tokens": 616,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_cloudmatrix_ar",
+      "score": 89.971,
+      "communication": 43.92,
+      "solve_time_score": 21.051,
+      "rounds": 12,
+      "replay_us": 374.674,
+      "solve_s": 26.106,
+      "tokens": 615,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_fullmesh_clos_ag",
+      "score": 94.628,
+      "communication": 45.917,
+      "solve_time_score": 23.711,
+      "rounds": 8,
+      "replay_us": 6396.277,
+      "solve_s": 8.961,
+      "tokens": 644,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_fullmesh_clos_ar",
+      "score": 90.125,
+      "communication": 42.407,
+      "solve_time_score": 22.718,
+      "rounds": 16,
+      "replay_us": 787.053,
+      "solve_s": 11.16,
+      "tokens": 667,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_mesh2d_ag",
+      "score": 91.73,
+      "communication": 44.834,
+      "solve_time_score": 21.896,
+      "rounds": 8,
+      "replay_us": 12982.564,
+      "solve_s": 8.943,
+      "tokens": 667,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_mesh2d_ar",
+      "score": 87.084,
+      "communication": 42.426,
+      "solve_time_score": 19.658,
+      "rounds": 11,
+      "replay_us": 712.157,
+      "solve_s": 15.148,
+      "tokens": 656,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_nvlink_like_ag",
+      "score": 94.204,
+      "communication": 46.379,
+      "solve_time_score": 22.825,
+      "rounds": 8,
+      "replay_us": 3328.724,
+      "solve_s": 10.639,
+      "tokens": 590,
+      "correctness": 25.0
+    },
+    {
+      "instance": "v22_256_nvlink_like_ar",
+      "score": 85.8,
+      "communication": 43.012,
+      "solve_time_score": 17.788,
+      "rounds": 12,
+      "replay_us": 208.966,
+      "solve_s": 23.395,
+      "tokens": 590,
+      "correctness": 25.0
+    }
+  ],
+  "observations": [
+    "Best score so far under the 25/50/25 rules; all 14 feasible.",
+    "AllGather solves took 8.9-11.9 s; AllReduce 11.2-26.1 s, still dominated by response size (rs_ag split 16 answers of about 9 MB).",
+    "AllReduce communication fell 0.2-1.7 points per case versus 0.2.1 because the size weight chose smaller splits."
+  ]
+}
