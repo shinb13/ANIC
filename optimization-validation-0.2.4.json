@@ -1,0 +1,1022 @@
+{
+ "note": "Local runs on public examples with a stub SDK and mock model, in python:3.11-slim under 1 CPU / 1024 MiB / 256 pids. Not official Replay, not platform solve time, not real model latency.",
+ "baseline_commit": "38600e0b230f8e2a87d3b1070152106e611b246c",
+ "runs": {
+  "0.2.3_mock_delay_1s": [
+   {
+    "case": "uneven_pods/ag",
+    "verdict": "valid",
+    "replay_us": 26192.38,
+    "solve_s": 1.187,
+    "solve_s_samples": [
+     1.193,
+     1.185,
+     1.187
+    ],
+    "response_mb": 0.968,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent+model",
+    "planning_s": 0.159,
+    "llm_s": 1.001,
+    "model_error": null,
+    "peak_rss_mb": 86.41
+   },
+   {
+    "case": "uneven_pods/ar",
+    "verdict": "valid",
+    "replay_us": 592.36,
+    "solve_s": 1.297,
+    "solve_s_samples": [
+     1.299,
+     1.297,
+     1.284
+    ],
+    "response_mb": 1.364,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent+model",
+    "planning_s": 0.201,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 93.879
+   },
+   {
+    "case": "directed_ring/ag",
+    "verdict": "valid",
+    "replay_us": 29269.751,
+    "solve_s": 1.083,
+    "solve_s_samples": [
+     1.081,
+     1.084,
+     1.083
+    ],
+    "response_mb": 0.835,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent+model",
+    "planning_s": 0.044,
+    "llm_s": 1.003,
+    "model_error": null,
+    "peak_rss_mb": 78.316
+   },
+   {
+    "case": "directed_ring/ar",
+    "verdict": "valid",
+    "replay_us": 630.323,
+    "solve_s": 1.125,
+    "solve_s_samples": [
+     1.125,
+     1.13,
+     1.122
+    ],
+    "response_mb": 1.23,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent+model",
+    "planning_s": 0.055,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 86.867
+   },
+   {
+    "case": "sparse_fabric/ag",
+    "verdict": "valid",
+    "replay_us": 12871.366,
+    "solve_s": 1.189,
+    "solve_s_samples": [
+     1.19,
+     1.189,
+     1.188
+    ],
+    "response_mb": 0.987,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent+model",
+    "planning_s": 0.164,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 87.672
+   },
+   {
+    "case": "sparse_fabric/ar",
+    "verdict": "valid",
+    "replay_us": 299.204,
+    "solve_s": 1.29,
+    "solve_s_samples": [
+     1.29,
+     1.299,
+     1.29
+    ],
+    "response_mb": 1.412,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent+model",
+    "planning_s": 0.2,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 94.926
+   },
+   {
+    "case": "cloudmatrix/ag",
+    "verdict": "valid",
+    "replay_us": 9014.967,
+    "solve_s": 1.505,
+    "solve_s_samples": [
+     1.512,
+     1.505,
+     1.502
+    ],
+    "response_mb": 1.352,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=4 from agent+model",
+    "planning_s": 0.442,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 115.973
+   },
+   {
+    "case": "cloudmatrix/ar",
+    "verdict": "valid",
+    "replay_us": 182.488,
+    "solve_s": 1.613,
+    "solve_s_samples": [
+     1.613,
+     1.604,
+     1.621
+    ],
+    "response_mb": 1.753,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=4 rs_dims=5 from agent+model",
+    "planning_s": 0.533,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 119.227
+   },
+   {
+    "case": "fullmesh_clos/ag",
+    "verdict": "valid",
+    "replay_us": 3968.904,
+    "solve_s": 1.458,
+    "solve_s_samples": [
+     1.459,
+     1.458,
+     1.452
+    ],
+    "response_mb": 1.42,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=16 from agent+model",
+    "planning_s": 0.425,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 107.469
+   },
+   {
+    "case": "fullmesh_clos/ar",
+    "verdict": "valid",
+    "replay_us": 207.583,
+    "solve_s": 1.524,
+    "solve_s_samples": [
+     1.531,
+     1.524,
+     1.518
+    ],
+    "response_mb": 1.291,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=4 rs_dims=4 from agent+model",
+    "planning_s": 0.463,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 98.355
+   },
+   {
+    "case": "mesh2d/ag",
+    "verdict": "valid",
+    "replay_us": 7004.191,
+    "solve_s": 1.328,
+    "solve_s_samples": [
+     1.33,
+     1.327,
+     1.328
+    ],
+    "response_mb": 1.172,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=16 from agent+model",
+    "planning_s": 0.298,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 101.703
+   },
+   {
+    "case": "mesh2d/ar",
+    "verdict": "valid",
+    "replay_us": 315.37,
+    "solve_s": 1.42,
+    "solve_s_samples": [
+     1.42,
+     1.417,
+     1.422
+    ],
+    "response_mb": 0.995,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=8 rs_dims=4 from agent+model",
+    "planning_s": 0.378,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 95.199
+   },
+   {
+    "case": "nvlink_like/ag",
+    "verdict": "valid",
+    "replay_us": 2036.171,
+    "solve_s": 1.385,
+    "solve_s_samples": [
+     1.387,
+     1.376,
+     1.385
+    ],
+    "response_mb": 1.782,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=8 from agent+model",
+    "planning_s": 0.342,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 118.164
+   },
+   {
+    "case": "nvlink_like/ar",
+    "verdict": "valid",
+    "replay_us": 127.487,
+    "solve_s": 1.472,
+    "solve_s_samples": [
+     1.472,
+     1.474,
+     1.465
+    ],
+    "response_mb": 1.521,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=8 rs_dims=4 from agent+model",
+    "planning_s": 0.421,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 100.809
+   }
+  ],
+  "0.2.4_mock_delay_1s": [
+   {
+    "case": "uneven_pods/ag",
+    "verdict": "valid",
+    "replay_us": 26192.38,
+    "solve_s": 1.189,
+    "solve_s_samples": [
+     1.185,
+     1.19,
+     1.189
+    ],
+    "response_mb": 0.968,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.163,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 84.578
+   },
+   {
+    "case": "uneven_pods/ar",
+    "verdict": "valid",
+    "replay_us": 592.36,
+    "solve_s": 1.221,
+    "solve_s_samples": [
+     1.217,
+     1.221,
+     1.227
+    ],
+    "response_mb": 1.364,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.149,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 91.469
+   },
+   {
+    "case": "directed_ring/ag",
+    "verdict": "valid",
+    "replay_us": 29269.751,
+    "solve_s": 1.077,
+    "solve_s_samples": [
+     1.076,
+     1.08,
+     1.077
+    ],
+    "response_mb": 0.835,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.043,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 77.82
+   },
+   {
+    "case": "directed_ring/ar",
+    "verdict": "valid",
+    "replay_us": 630.323,
+    "solve_s": 1.118,
+    "solve_s_samples": [
+     1.117,
+     1.119,
+     1.118
+    ],
+    "response_mb": 1.23,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.05,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 84.445
+   },
+   {
+    "case": "sparse_fabric/ag",
+    "verdict": "valid",
+    "replay_us": 12871.366,
+    "solve_s": 1.189,
+    "solve_s_samples": [
+     1.189,
+     1.188,
+     1.204
+    ],
+    "response_mb": 0.987,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.161,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 84.957
+   },
+   {
+    "case": "sparse_fabric/ar",
+    "verdict": "valid",
+    "replay_us": 299.204,
+    "solve_s": 1.229,
+    "solve_s_samples": [
+     1.229,
+     1.231,
+     1.222
+    ],
+    "response_mb": 1.412,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.152,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 91.848
+   },
+   {
+    "case": "cloudmatrix/ag",
+    "verdict": "valid",
+    "replay_us": 9014.967,
+    "solve_s": 1.518,
+    "solve_s_samples": [
+     1.503,
+     1.531,
+     1.518
+    ],
+    "response_mb": 1.352,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=4 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.462,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 112.07
+   },
+   {
+    "case": "cloudmatrix/ar",
+    "verdict": "valid",
+    "replay_us": 182.488,
+    "solve_s": 1.522,
+    "solve_s_samples": [
+     1.523,
+     1.522,
+     1.518
+    ],
+    "response_mb": 1.753,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=4 rs_dims=5 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.419,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 115.738
+   },
+   {
+    "case": "fullmesh_clos/ag",
+    "verdict": "valid",
+    "replay_us": 3968.904,
+    "solve_s": 1.484,
+    "solve_s_samples": [
+     1.484,
+     1.486,
+     1.481
+    ],
+    "response_mb": 1.42,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=16 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.45,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 103.07
+   },
+   {
+    "case": "fullmesh_clos/ar",
+    "verdict": "valid",
+    "replay_us": 207.583,
+    "solve_s": 1.436,
+    "solve_s_samples": [
+     1.436,
+     1.432,
+     1.437
+    ],
+    "response_mb": 1.291,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=4 rs_dims=4 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.387,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 99.543
+   },
+   {
+    "case": "mesh2d/ag",
+    "verdict": "valid",
+    "replay_us": 7004.191,
+    "solve_s": 1.355,
+    "solve_s_samples": [
+     1.369,
+     1.343,
+     1.355
+    ],
+    "response_mb": 1.172,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=16 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.307,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 101.598
+   },
+   {
+    "case": "mesh2d/ar",
+    "verdict": "valid",
+    "replay_us": 315.37,
+    "solve_s": 1.307,
+    "solve_s_samples": [
+     1.307,
+     1.311,
+     1.303
+    ],
+    "response_mb": 0.995,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=8 rs_dims=4 from agent+model llm_ms=1003 model=ok",
+    "planning_s": 0.261,
+    "llm_s": 1.003,
+    "model_error": null,
+    "peak_rss_mb": 92.047
+   },
+   {
+    "case": "nvlink_like/ag",
+    "verdict": "valid",
+    "replay_us": 2036.171,
+    "solve_s": 1.389,
+    "solve_s_samples": [
+     1.389,
+     1.389,
+     1.392
+    ],
+    "response_mb": 1.782,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=8 from agent+model llm_ms=1002 model=ok",
+    "planning_s": 0.354,
+    "llm_s": 1.002,
+    "model_error": null,
+    "peak_rss_mb": 112.383
+   },
+   {
+    "case": "nvlink_like/ar",
+    "verdict": "valid",
+    "replay_us": 127.487,
+    "solve_s": 1.349,
+    "solve_s_samples": [
+     1.349,
+     1.342,
+     1.359
+    ],
+    "response_mb": 1.521,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=8 rs_dims=4 from agent+model llm_ms=1003 model=ok",
+    "planning_s": 0.299,
+    "llm_s": 1.003,
+    "model_error": null,
+    "peak_rss_mb": 98.703
+   }
+  ],
+  "0.2.3_mock_delay_5.5s": [
+   {
+    "case": "uneven_pods/ag",
+    "verdict": "valid",
+    "replay_us": 26192.38,
+    "solve_s": 5.697,
+    "solve_s_samples": [
+     5.697,
+     5.701,
+     5.691
+    ],
+    "response_mb": 0.968,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent+model",
+    "planning_s": 0.165,
+    "llm_s": 5.506,
+    "model_error": null,
+    "peak_rss_mb": 87.043
+   },
+   {
+    "case": "uneven_pods/ar",
+    "verdict": "valid",
+    "replay_us": 592.36,
+    "solve_s": 5.805,
+    "solve_s_samples": [
+     5.806,
+     5.79,
+     5.805
+    ],
+    "response_mb": 1.364,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent+model",
+    "planning_s": 0.209,
+    "llm_s": 5.506,
+    "model_error": null,
+    "peak_rss_mb": 93.574
+   },
+   {
+    "case": "directed_ring/ag",
+    "verdict": "valid",
+    "replay_us": 29269.751,
+    "solve_s": 5.584,
+    "solve_s_samples": [
+     5.585,
+     5.582,
+     5.584
+    ],
+    "response_mb": 0.835,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent+model",
+    "planning_s": 0.043,
+    "llm_s": 5.507,
+    "model_error": null,
+    "peak_rss_mb": 79.18
+   },
+   {
+    "case": "directed_ring/ar",
+    "verdict": "valid",
+    "replay_us": 630.323,
+    "solve_s": 5.628,
+    "solve_s_samples": [
+     5.625,
+     5.634,
+     5.628
+    ],
+    "response_mb": 1.23,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent+model",
+    "planning_s": 0.054,
+    "llm_s": 5.506,
+    "model_error": null,
+    "peak_rss_mb": 87.227
+   },
+   {
+    "case": "sparse_fabric/ag",
+    "verdict": "valid",
+    "replay_us": 12871.366,
+    "solve_s": 5.694,
+    "solve_s_samples": [
+     5.694,
+     5.694,
+     5.689
+    ],
+    "response_mb": 0.987,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent+model",
+    "planning_s": 0.162,
+    "llm_s": 5.507,
+    "model_error": null,
+    "peak_rss_mb": 87.703
+   },
+   {
+    "case": "sparse_fabric/ar",
+    "verdict": "valid",
+    "replay_us": 299.204,
+    "solve_s": 5.791,
+    "solve_s_samples": [
+     5.791,
+     5.793,
+     5.79
+    ],
+    "response_mb": 1.412,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent+model",
+    "planning_s": 0.197,
+    "llm_s": 5.506,
+    "model_error": null,
+    "peak_rss_mb": 93.75
+   },
+   {
+    "case": "cloudmatrix/ag",
+    "verdict": "valid",
+    "replay_us": 9014.967,
+    "solve_s": 6.013,
+    "solve_s_samples": [
+     6.006,
+     6.06,
+     6.013
+    ],
+    "response_mb": 1.352,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=4 from agent+model",
+    "planning_s": 0.45,
+    "llm_s": 5.506,
+    "model_error": null,
+    "peak_rss_mb": 115.188
+   },
+   {
+    "case": "cloudmatrix/ar",
+    "verdict": "valid",
+    "replay_us": 182.488,
+    "solve_s": 6.113,
+    "solve_s_samples": [
+     6.113,
+     6.111,
+     6.122
+    ],
+    "response_mb": 1.753,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=4 rs_dims=5 from agent+model",
+    "planning_s": 0.527,
+    "llm_s": 5.506,
+    "model_error": null,
+    "peak_rss_mb": 118.469
+   },
+   {
+    "case": "fullmesh_clos/ag",
+    "verdict": "valid",
+    "replay_us": 3968.904,
+    "solve_s": 5.958,
+    "solve_s_samples": [
+     5.958,
+     5.963,
+     5.952
+    ],
+    "response_mb": 1.42,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=16 from agent+model",
+    "planning_s": 0.415,
+    "llm_s": 5.507,
+    "model_error": null,
+    "peak_rss_mb": 106.762
+   },
+   {
+    "case": "fullmesh_clos/ar",
+    "verdict": "valid",
+    "replay_us": 207.583,
+    "solve_s": 6.028,
+    "solve_s_samples": [
+     6.028,
+     6.018,
+     6.03
+    ],
+    "response_mb": 1.291,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=4 rs_dims=4 from agent+model",
+    "planning_s": 0.459,
+    "llm_s": 5.507,
+    "model_error": null,
+    "peak_rss_mb": 97.246
+   },
+   {
+    "case": "mesh2d/ag",
+    "verdict": "valid",
+    "replay_us": 7004.191,
+    "solve_s": 5.829,
+    "solve_s_samples": [
+     5.824,
+     5.839,
+     5.829
+    ],
+    "response_mb": 1.172,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=16 from agent+model",
+    "planning_s": 0.294,
+    "llm_s": 5.506,
+    "model_error": null,
+    "peak_rss_mb": 104.09
+   },
+   {
+    "case": "mesh2d/ar",
+    "verdict": "valid",
+    "replay_us": 315.37,
+    "solve_s": 5.926,
+    "solve_s_samples": [
+     5.933,
+     5.926,
+     5.916
+    ],
+    "response_mb": 0.995,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=8 rs_dims=4 from agent+model",
+    "planning_s": 0.378,
+    "llm_s": 5.508,
+    "model_error": null,
+    "peak_rss_mb": 93.555
+   },
+   {
+    "case": "nvlink_like/ag",
+    "verdict": "valid",
+    "replay_us": 2036.171,
+    "solve_s": 5.879,
+    "solve_s_samples": [
+     5.879,
+     5.877,
+     5.879
+    ],
+    "response_mb": 1.782,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=8 from agent+model",
+    "planning_s": 0.336,
+    "llm_s": 5.507,
+    "model_error": null,
+    "peak_rss_mb": 116.68
+   },
+   {
+    "case": "nvlink_like/ar",
+    "verdict": "valid",
+    "replay_us": 127.487,
+    "solve_s": 5.98,
+    "solve_s_samples": [
+     5.998,
+     5.972,
+     5.98
+    ],
+    "response_mb": 1.521,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=8 rs_dims=4 from agent+model",
+    "planning_s": 0.427,
+    "llm_s": 5.506,
+    "model_error": null,
+    "peak_rss_mb": 99.809
+   }
+  ],
+  "0.2.4_mock_delay_5.5s": [
+   {
+    "case": "uneven_pods/ag",
+    "verdict": "valid",
+    "replay_us": 26192.38,
+    "solve_s": 3.188,
+    "solve_s_samples": [
+     3.194,
+     3.188,
+     3.186
+    ],
+    "response_mb": 0.968,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent llm_ms=3004 model=model_timeout",
+    "planning_s": 0.162,
+    "llm_s": 3.004,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 83.414
+   },
+   {
+    "case": "uneven_pods/ar",
+    "verdict": "valid",
+    "replay_us": 592.36,
+    "solve_s": 3.22,
+    "solve_s_samples": [
+     3.22,
+     3.218,
+     3.226
+    ],
+    "response_mb": 1.364,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent llm_ms=3004 model=model_timeout",
+    "planning_s": 0.149,
+    "llm_s": 3.004,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 89.988
+   },
+   {
+    "case": "directed_ring/ag",
+    "verdict": "valid",
+    "replay_us": 29269.751,
+    "solve_s": 3.084,
+    "solve_s_samples": [
+     3.084,
+     3.088,
+     3.084
+    ],
+    "response_mb": 0.835,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent llm_ms=3004 model=model_timeout",
+    "planning_s": 0.044,
+    "llm_s": 3.004,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 77.051
+   },
+   {
+    "case": "directed_ring/ar",
+    "verdict": "valid",
+    "replay_us": 630.323,
+    "solve_s": 3.128,
+    "solve_s_samples": [
+     3.126,
+     3.128,
+     3.133
+    ],
+    "response_mb": 1.23,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent llm_ms=3004 model=model_timeout",
+    "planning_s": 0.054,
+    "llm_s": 3.004,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 83.898
+   },
+   {
+    "case": "sparse_fabric/ag",
+    "verdict": "valid",
+    "replay_us": 12871.366,
+    "solve_s": 3.196,
+    "solve_s_samples": [
+     3.196,
+     3.188,
+     3.2
+    ],
+    "response_mb": 0.987,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=2 from agent llm_ms=3003 model=model_timeout",
+    "planning_s": 0.168,
+    "llm_s": 3.003,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 84.41
+   },
+   {
+    "case": "sparse_fabric/ar",
+    "verdict": "valid",
+    "replay_us": 299.204,
+    "solve_s": 3.24,
+    "solve_s_samples": [
+     3.233,
+     3.24,
+     3.241
+    ],
+    "response_mb": 1.412,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=2 rs_dims=5 from agent llm_ms=3004 model=model_timeout",
+    "planning_s": 0.16,
+    "llm_s": 3.004,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 91.07
+   },
+   {
+    "case": "cloudmatrix/ag",
+    "verdict": "valid",
+    "replay_us": 9014.967,
+    "solve_s": 3.51,
+    "solve_s_samples": [
+     3.51,
+     3.506,
+     3.522
+    ],
+    "response_mb": 1.352,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=4 from agent llm_ms=3004 model=model_timeout",
+    "planning_s": 0.451,
+    "llm_s": 3.004,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 111.645
+   },
+   {
+    "case": "cloudmatrix/ar",
+    "verdict": "valid",
+    "replay_us": 182.488,
+    "solve_s": 3.492,
+    "solve_s_samples": [
+     3.49,
+     3.492,
+     3.502
+    ],
+    "response_mb": 1.753,
+    "rounds": 13,
+    "strategy": "rs_ag split=32 path_width=4 rs_dims=5 from agent llm_ms=3004 model=model_timeout",
+    "planning_s": 0.386,
+    "llm_s": 3.004,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 114.754
+   },
+   {
+    "case": "fullmesh_clos/ag",
+    "verdict": "valid",
+    "replay_us": 3968.904,
+    "solve_s": 3.454,
+    "solve_s_samples": [
+     3.454,
+     3.458,
+     3.451
+    ],
+    "response_mb": 1.42,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=16 from agent llm_ms=3003 model=model_timeout",
+    "planning_s": 0.417,
+    "llm_s": 3.003,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 101.941
+   },
+   {
+    "case": "fullmesh_clos/ar",
+    "verdict": "valid",
+    "replay_us": 207.583,
+    "solve_s": 3.407,
+    "solve_s_samples": [
+     3.412,
+     3.407,
+     3.405
+    ],
+    "response_mb": 1.291,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=4 rs_dims=4 from agent llm_ms=3004 model=model_timeout",
+    "planning_s": 0.354,
+    "llm_s": 3.004,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 98.445
+   },
+   {
+    "case": "mesh2d/ag",
+    "verdict": "valid",
+    "replay_us": 7004.191,
+    "solve_s": 3.335,
+    "solve_s_samples": [
+     3.335,
+     3.346,
+     3.334
+    ],
+    "response_mb": 1.172,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=16 from agent llm_ms=3005 model=model_timeout",
+    "planning_s": 0.291,
+    "llm_s": 3.005,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 97.145
+   },
+   {
+    "case": "mesh2d/ar",
+    "verdict": "valid",
+    "replay_us": 315.37,
+    "solve_s": 3.296,
+    "solve_s_samples": [
+     3.3,
+     3.289,
+     3.296
+    ],
+    "response_mb": 0.995,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=8 rs_dims=4 from agent llm_ms=3004 model=model_timeout",
+    "planning_s": 0.252,
+    "llm_s": 3.004,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 91.961
+   },
+   {
+    "case": "nvlink_like/ag",
+    "verdict": "valid",
+    "replay_us": 2036.171,
+    "solve_s": 3.371,
+    "solve_s_samples": [
+     3.37,
+     3.371,
+     3.374
+    ],
+    "response_mb": 1.782,
+    "rounds": 8,
+    "strategy": "doubling split=1 path_width=8 from agent llm_ms=3004 model=model_timeout",
+    "planning_s": 0.334,
+    "llm_s": 3.004,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 110.719
+   },
+   {
+    "case": "nvlink_like/ar",
+    "verdict": "valid",
+    "replay_us": 127.487,
+    "solve_s": 3.343,
+    "solve_s_samples": [
+     3.343,
+     3.333,
+     3.345
+    ],
+    "response_mb": 1.521,
+    "rounds": 12,
+    "strategy": "rs_ag split=16 path_width=8 rs_dims=4 from agent llm_ms=3003 model=model_timeout",
+    "planning_s": 0.295,
+    "llm_s": 3.003,
+    "model_error": "model_timeout",
+    "peak_rss_mb": 97.793
+   }
+  ]
+ }
+}
