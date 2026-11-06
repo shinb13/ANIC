@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.3).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.4).
 
 Per request, every value comes from the current task and topology:
 
@@ -12,7 +12,8 @@ Per request, every value comes from the current task and topology:
    worker thread.
 3. Every proposal and portfolio entry goes through the ``evaluate_schedule``
    tool: built on the current topology and estimated with the published
-   Replay formula.
+   Replay formula.  A model proposal whose optimistic prediction already
+   loses to a built candidate is answered from the prediction, without a build.
 4. The candidate with the best ln(Replay us) + SIZE_WEIGHT * response MB is
    fully validated and returned; if validation fails the next one is tried.
    Any failure of the model, of parsing or of a single candidate falls back
@@ -49,12 +50,17 @@ from agentcc_solver import (
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_MODEL_BUDGET_SECONDS = 6.0
+# Each second of solve time costs about as much as an 18% slower schedule, and on
+# the public examples the agent's portfolio already matches the best configuration
+# the model can name, so a late reply is not worth waiting for.
+DEFAULT_MODEL_BUDGET_SECONDS = 3.0
 DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
-PORTFOLIO_BUILDS = 4
+PORTFOLIO_BUILDS = 3
+# Slack on the prediction filter, in cost units (0.02 is about 2% of Replay time).
+PRUNE_MARGIN = 0.02
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.3"
+TOOL_VERSION = "2.4"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -131,12 +137,15 @@ def portfolio_raw(planner: Planner) -> list[dict[str, Any]]:
                 raws.append({"algorithm": "doubling", "split": split, "path_width": width})
         return raws
     algorithms = ALGORITHMS[planner.operator] if planner.allow_copy else ("doubling",)
+    # Tree plans are costly to rank and rs_ag beat them on every public example, so
+    # the agent ranks tree only without rs_ag.  The model can still propose tree.
+    rank_tree = "tree" in algorithms and not ("rs_ag" in algorithms and planner.splits[-1] >= 2)
     for split in planner.splits:
         for width in (2, 4, 8):
             if "rs_ag" in algorithms and split >= 2:
                 for rs_dims in sorted({split.bit_length() - 1, max(1, split.bit_length() - 2)}):
                     raws.append({"algorithm": "rs_ag", "split": split, "path_width": width, "rs_dims": rs_dims})
-            if "tree" in algorithms and split <= 8:
+            if rank_tree and split <= 8:
                 raws.append({"algorithm": "tree", "split": split, "path_width": width})
     if "doubling" in algorithms:
         raws.append({"algorithm": "doubling", "split": planner.splits[0], "path_width": 4})
@@ -266,6 +275,7 @@ class Evaluator:
     def __init__(self, planner: Planner):
         self.planner = planner
         self.results: dict[tuple, dict[str, Any]] = {}
+        self.portfolio_ms: float | None = None
 
     def evaluate(self, raw: Any, source: str, parent_llm_call_id: str | None = None) -> dict[str, Any]:
         try:
@@ -294,6 +304,14 @@ class Evaluator:
             previous["sources"].add(source)
             row.update(status="duplicate", estimate_us=previous.get("estimate_us"))
             return row
+        if source == "model":
+            predicted = self.planner.predict(config)
+            cost = math.log(max(predicted["us"], 1e-9)) + SIZE_WEIGHT * predicted["mb"]
+            best = min((item["score"] for item in self.results.values()), default=math.inf)
+            if cost > best + PRUNE_MARGIN:
+                row.update(status="pruned", predicted_us=round(predicted["us"], 3),
+                           predicted_mb=round(predicted["mb"], 3))
+                return row
         try:
             answer = self.planner.build(config)
         except AgentCCError as exc:
@@ -323,10 +341,12 @@ class Evaluator:
         return result
 
     def run_portfolio(self) -> tuple[list[dict[str, Any]], list]:
+        started = perf_counter()
         ranked = rank_portfolio(self.planner)
         rows = [self.evaluate(config, "agent") for _, config, _ in ranked[:PORTFOLIO_BUILDS]]
         if not any(row.get("status") == "built" for row in rows):
             rows.append(self.evaluate(reference_config(self.planner), "agent"))
+        self.portfolio_ms = round((perf_counter() - started) * 1000, 3)
         return rows, ranked
 
     def run_proposals(self, proposals: list[Any], call_id: str | None) -> list[dict[str, Any]]:
@@ -398,21 +418,26 @@ class AgentCCAgent(BaseAgent):
                 except Exception as exc:  # noqa: BLE001
                     portfolio_rows = []
                     audit["portfolio_error"] = f"{type(exc).__name__}: {exc}"
+                audit["portfolio_ms"] = evaluator.portfolio_ms
                 model_rows = []
                 if proposals:
+                    proposals_started = perf_counter()
                     try:
                         model_rows = await asyncio.to_thread(evaluator.run_proposals, proposals, call_id)
                     except Exception as exc:  # noqa: BLE001
                         audit["model_eval_error"] = f"{type(exc).__name__}: {exc}"
+                    audit["model_eval_ms"] = round((perf_counter() - proposals_started) * 1000, 3)
             with state("reflection"):
                 if parse_error:
                     recovery("use_agent_portfolio", count=0)
+                select_started = perf_counter()
                 try:
                     best = await asyncio.to_thread(evaluator.select)
                 except Exception as exc:  # noqa: BLE001
                     audit["select_error"] = f"{type(exc).__name__}: {exc}"
                     recovery("agent_emergency_reference", count=0)
                     best = await asyncio.to_thread(evaluator.emergency)
+                audit["select_ms"] = round((perf_counter() - select_started) * 1000, 3)
                 audit["agent_candidates"] = [Evaluator.public(row) for row in portfolio_rows]
                 audit["model_candidates"] = [Evaluator.public(row) for row in model_rows]
                 audit["selected"] = {
@@ -435,6 +460,8 @@ class AgentCCAgent(BaseAgent):
                     f"{config['algorithm']} split={config['split']} path_width={config['path_width']}"
                     + (f" rs_dims={config['rs_dims']}" if "rs_dims" in config else "")
                     + f" from {'+'.join(sorted(best['sources']))}"
+                    # The platform returns no logs, so the answer itself carries the evidence.
+                    + f" llm_ms={round(audit['llm_ms'])} model={parse_error or 'ok'}"
                 )
                 audit["solve_ms"] = round((perf_counter() - started) * 1000, 3)
                 LOGGER.info("agentcc.audit %s", _safe_json(audit))

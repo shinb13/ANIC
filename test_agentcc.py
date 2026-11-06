@@ -512,6 +512,65 @@ class AgentLoopTests(unittest.TestCase):
         emergency = evaluator.emergency()
         validate_answer(data["task"], data["topology"], emergency["_answer"])
 
+    def test_default_model_budget_is_three_seconds(self):
+        module = self._load_agent_module({"tools": [], "recovery": []})
+        self.assertEqual(module.DEFAULT_MODEL_BUDGET_SECONDS, 3.0)
+
+    def test_answer_records_model_outcome(self):
+        data = two_plane_input("all-reduce")
+        result, _, _ = self._run(['{"c":[["rs_ag",8,2,3]]}'], task_input=data)
+        self.assertIn("model=ok", result["answer"]["strategy"])
+        self.assertIn("llm_ms=", result["answer"]["strategy"])
+        late, audit, events = self._run(
+            [], task_input=data, delay=0.5, environment={"AGENT_LLM_BUDGET_SECONDS": "0.2"})
+        self.assertIn("model=model_timeout", late["answer"]["strategy"])
+        self.assertEqual(audit["model_error"], "model_timeout")
+        self.assertEqual(len(events["requests"]), 1)
+        self.assertIn("portfolio_ms", audit)
+        self.assertIn("select_ms", audit)
+
+    def test_portfolio_ranks_tree_only_without_rs_ag(self):
+        module = self._load_agent_module({"tools": [], "recovery": []})
+        data = two_plane_input("all-reduce")
+        planner = module.Planner(data["task"], data["topology"])
+        self.assertNotIn("tree", {raw["algorithm"] for raw in module.portfolio_raw(planner)})
+        single = two_plane_input("all-reduce", candidates=(1,))
+        planner = module.Planner(single["task"], single["topology"])
+        self.assertIn("tree", {raw["algorithm"] for raw in module.portfolio_raw(planner)})
+
+    def test_model_can_still_propose_tree(self):
+        data = two_plane_input("all-reduce")
+        _, audit, events = self._run(['{"c":[["tree",1,1,0]]}'], task_input=data)
+        self.assertEqual(audit["model_candidates"][0]["proposal"]["algorithm"], "tree")
+        self.assertIn("model", {tool["arguments"]["source"] for tool in events["tools"]})
+
+    def test_losing_model_pick_is_pruned_without_a_build(self):
+        events = {"requests": [], "tools": [], "recovery": []}
+        module = self._load_agent_module(events)
+        data = two_plane_input("all-reduce")
+        planner = module.Planner(data["task"], data["topology"])
+        evaluator = module.Evaluator(planner)
+        evaluator.run_portfolio()
+        builds = []
+        real_build = planner.build
+        with patch.object(planner, "build", side_effect=lambda config: builds.append(config) or real_build(config)):
+            row = evaluator.evaluate({"algorithm": "doubling", "split": 1, "path_width": 1}, "model")
+        self.assertEqual(row["status"], "pruned")
+        self.assertEqual(builds, [])
+        self.assertIn("predicted_us", row)
+        self.assertEqual(events["tools"][-1]["result"]["status"], "pruned")
+        self.assertEqual(evaluator.select()["status"], "valid")
+
+    def test_pruning_never_applies_to_agent_candidates_or_an_empty_pool(self):
+        module = self._load_agent_module({"tools": [], "recovery": []})
+        data = two_plane_input("all-reduce")
+        planner = module.Planner(data["task"], data["topology"])
+        losing = {"algorithm": "doubling", "split": 1, "path_width": 1}
+        self.assertEqual(module.Evaluator(planner).evaluate(losing, "model")["status"], "built")
+        evaluator = module.Evaluator(planner)
+        evaluator.run_portfolio()
+        self.assertEqual(evaluator.evaluate(losing, "agent")["status"], "built")
+
     def test_sum_notation_switch(self):
         data = two_plane_input("all-reduce")
         _, audit_on, _ = self._run(['{"c":[]}'], task_input=data)

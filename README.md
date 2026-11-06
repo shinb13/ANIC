@@ -1,9 +1,9 @@
-# AgentCC scheduling agent (0.2.3)
+# AgentCC scheduling agent (0.2.4)
 
-0.2.2 is built on 0.2.1, the best-scoring version so far (88.2 under the old
-rules). It keeps 0.2.1's communication quality and aims at solve time and
-reliability. Every request is planned from its own `task` and `topology`. The
-agent loads no fixed instance data and never selects by instance name.
+0.2.4 is 0.2.3 with a shorter model wait and less planning work. Schedules are
+unchanged on the public examples. Every request is planned from its own `task`
+and `topology`. The agent loads no fixed instance data and never selects by
+instance name.
 
 ## Loop
 
@@ -11,16 +11,53 @@ agent loads no fixed instance data and never selects by instance name.
    rejected with a reason). It profiles every XOR dimension at path width 1,
    then ranks a portfolio of configurations with the fast predictor.
 2. **Model call.** One short call (about 1.3 KB prompt, 120 output tokens,
-   6 s cap). The model receives the bottlenecks and the agent's own
+   3 s cap). The model receives the bottlenecks and the agent's own
    predicted time/size trade-offs, and proposes up to 3 configurations. It
-   may add picks the agent did not list. The agent builds its top 4 in
+   may add picks the agent did not list. The agent builds its top 3 in
    parallel while the model is thinking.
-3. **Tool `evaluate_schedule`.** Every candidate is built on the current
-   topology and Replay-estimated. Each evaluation is an SDK `tool_call`,
-   linked to the model call for model picks.
+3. **Tool `evaluate_schedule`.** Candidates are built on the current topology
+   and Replay-estimated. A model pick whose prediction already loses to a built
+   candidate is answered from the prediction instead. Each evaluation is an SDK
+   `tool_call`, linked to the model call for model picks.
 4. **Select.** Candidates are ranked by `ln(Replay us) + 0.10 × response MB`.
    The first one that passes full validation is returned. The audit records
    whether the model's pick won outright.
+
+## Changes in 0.2.4: solve time
+
+- **Model cap 3 s instead of 6 s.** A reply after the cap is dropped, the agent's
+  portfolio is used, and the fallback is recorded as a recovery. Set
+  `AGENT_LLM_BUDGET_SECONDS` to change the cap.
+- **Less planning work.** The agent ranks `tree` only when `rs_ag` is not
+  available, and builds its top 3 instead of 4. The model can still propose
+  `tree`.
+- **Prediction filter for model picks.** A pick is not built when its predicted
+  cost is more than 0.02 above the best built candidate. Across 989
+  configurations on the public examples this never rejected a winner.
+- **Evidence in the answer.** `answer.strategy` now ends with `llm_ms` and the
+  model outcome, because the platform report does not return logs.
+
+Why these changes: on the public examples, a full sweep of the configurations
+the model can name found nothing worth more than an estimated 0.02 points over
+the agent's own pick. Local computation takes 0.1–0.7 s, so the model wait is
+the largest part of the solve time that the agent controls.
+
+The real model's latency on the platform is unknown. If it often exceeds 3 s, the
+model's picks will rarely be used; `model=model_timeout` in `answer.strategy`
+shows this.
+
+### Tried and not adopted
+
+All on the public examples with the local Replay estimate. The estimated value
+of one second of solve time is about an 18% change in Replay time.
+
+| Idea | Result |
+| --- | --- |
+| One-way shift schedules for AllGather | 77–628% slower than XOR |
+| Local search over dimension order | no change |
+| Topology-aware rank relabelling | helps `uneven_pods` only (AG −14%, AR −24%); `mesh2d` gets much slower; about +0.06 points overall |
+| Load-aware rounding of chunks to routes | mean −2.5%; the extra build time costs more than it gains |
+| Larger response size weight | selection almost unchanged |
 
 ## Changes in 0.2.3: `c{slot}_sum` in copies
 
@@ -31,9 +68,9 @@ the short form, AllReduce responses fell from 9–18 MB to 1.0–1.8 MB. Replay
 estimates did not change, and the best-communication `rs_ag` configurations
 are selected again.
 
-Whether the official Replay accepts this notation inside transfers has not
-been confirmed. Set `AGENTCC_SUM_NOTATION=0` to restore full contributor
-expressions; 0.2.2 is the same code with that behaviour.
+0.2.3 scored 92.7 on the platform according to a team screenshot (no report is
+archived here), so the official Replay accepted this notation inside transfers.
+Set `AGENTCC_SUM_NOTATION=0` to restore full contributor expressions.
 
 ## Changes from 0.2.1 (0.2.2)
 
@@ -73,14 +110,14 @@ The platform injects `PLATFORM_LLM_URL`, `PLATFORM_API_KEY` and
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `AGENT_LLM_BUDGET_SECONDS` | 6 | model call cap |
+| `AGENT_LLM_BUDGET_SECONDS` | 3 | model call cap |
 | `AGENT_MAX_OUTPUT_TOKENS` | 120 | model `max_tokens` |
 | `AGENTCC_SUM_NOTATION` | 1 | write complete-slot copies as `c{slot}_sum` |
 
 ## Build, run, test
 
 ```powershell
-docker build --platform linux/amd64 -t team-001-agent:0.2.3 .
+docker build --platform linux/amd64 -t team-001-agent:0.2.4 .
 python -m unittest -v test_agentcc.py
 ```
 
@@ -89,13 +126,13 @@ python -m unittest -v test_agentcc.py
 Use your own development API, never the platform credentials. In PowerShell:
 
 ```powershell
-docker load -i team-001-agent-0.2.3.tar        # only if the image is not loaded yet
+docker load -i team-001-agent-0.2.4.tar        # only if the image is not loaded yet
 $env:PLATFORM_LLM_URL = "https://your-dev-gateway/v1"
 $env:AGENT_MODEL_NAME = "your-model"
 $env:PLATFORM_API_KEY = Read-Host "dev API key" -MaskInput
 docker run --rm --name agentcc-test --cpus 1 --memory 1024m --pids-limit 256 `
   -p 127.0.0.1:18080:8080 -e PLATFORM_LLM_URL -e PLATFORM_API_KEY -e AGENT_MODEL_NAME `
-  -e AGENTHACK_TELEMETRY_REQUIRED=false team-001-agent:0.2.3
+  -e AGENTHACK_TELEMETRY_REQUIRED=false team-001-agent:0.2.4
 ```
 
 In a second terminal, run `python local_test.py`. The code the model wrote is
@@ -106,12 +143,23 @@ The entry point is `AgentRuntime(AgentCCAgent()).run()` ([src/__main__.py](src/_
 
 ## Local results (public examples, mock model, not official Replay)
 
-These runs used the 0.2.3 container under 1 CPU / 1024 MiB / 256 pids, with
-a mock model answering in 1 s:
-- All 14 cases were valid, each taking 1.3–2.0 s over HTTP.
-- AllReduce responses were 1.0–1.8 MB with the same Replay estimates as
-  0.2.1.
-- Memory peaked at 140 MiB.
+0.2.3 and 0.2.4 ran with `bench_local.py` under 1 CPU / 1024 MiB / 256 pids. This
+used a `python:3.11-slim` test image and a stub SDK, not the competition base
+image, and called `solve` directly rather than over HTTP. Figures are medians of
+3 runs per case; the data is in
+[optimization-validation-0.2.4.json](optimization-validation-0.2.4.json).
+
+| Mock model delay | Mean solve, 0.2.3 | Mean solve, 0.2.4 | Model reply used by 0.2.4 |
+| ---: | ---: | ---: | --- |
+| 1 s | 1.35 s | 1.31 s | yes |
+| 5.5 s | 5.85 s | 3.30 s | no, timed out at 3 s |
+
+- All 14 cases were valid in every run.
+- Replay estimates and response sizes were identical in 0.2.3 and 0.2.4.
+- Responses were 0.84–1.78 MB, and memory peaked at 119 MiB.
+
+These figures do not include the real model, the real SDK or platform transfer
+time. To repeat them, run `python bench_local.py --help`.
 
 The local validator accepts `c{slot}_sum` only as the complete set of
 contributors for that slot. A copy of an incomplete slot written this way is
