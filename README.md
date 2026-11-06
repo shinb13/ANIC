@@ -1,45 +1,43 @@
-# AgentCC scheduling agent (0.3.0)
+# AgentCC scheduling agent (0.2.2)
 
-The model writes and revises the search code that drives the solver. Every
-request is planned from its own `task` and `topology`. The agent loads no
-fixed instance data and never selects by instance name.
+0.2.2 is built on 0.2.1, the best-scoring version so far (88.2 under the old
+rules). It keeps 0.2.1's communication quality and aims at solve time and
+reliability. Every request is planned from its own `task` and `topology`. The
+agent loads no fixed instance data and never selects by instance name.
 
-## Loop: analyse → generate code → execute → iterate
+## Loop
 
-1. **Analyse.** The agent parses and validates the input and rejects invalid
-   inputs with a reason. It then measures every XOR exchange dimension at
-   path width 1 and 4: Replay cost per MiB and the limiting edge, shared
-   resource or path.
-2. **Generate.** The model receives four things:
-   - the measurements;
-   - the tool API ([API_DOC in src/my_agent.py](src/my_agent.py));
-   - a working baseline strategy;
-   - an instruction to revise that baseline for this instance.
+1. **Analyse.** The agent parses and validates the input (invalid inputs are
+   rejected with a reason). It profiles every XOR dimension at path width 1,
+   then ranks a portfolio of configurations with the fast predictor.
+2. **Model call.** One short call (about 1.3 KB prompt, 120 output tokens,
+   6 s cap). The model receives the bottlenecks and the agent's own
+   predicted time/size trade-offs, and proposes up to 3 configurations. It
+   may add picks the agent did not list. The agent builds its top 4 in
+   parallel while the model is thinking.
+3. **Tool `evaluate_schedule`.** Every candidate is built on the current
+   topology and Replay-estimated. Each evaluation is an SDK `tool_call`,
+   linked to the model call for model picks.
+4. **Select.** Candidates are ranked by `ln(Replay us) + 0.10 × response MB`.
+   The first one that passes full validation is returned. The audit records
+   whether the model's pick won outright.
 
-   It writes a Python function `strategy(api)` that decides which
-   algorithms, splits, `rs_dims`, per-round path widths and orders to
-   explore. The function ranks them with `api.predict` / `api.sweep` and
-   builds the most promising with `api.measure`.
-3. **Execute.** [strategy_sandbox.py](strategy_sandbox.py) checks the code
-   statically and runs it under a step and time limit. The checks reject
-   imports, dunder or private access, file, network or process access,
-   `while`, `try` and non-whitelisted names and attributes. The strategy
-   receives whitelisted builtins only. Each `measure` builds a full schedule
-   on the current topology and applies the published Replay formula; at
-   most 5 measures run per strategy run.
-4. **Iterate.** The measured candidates, slowest-round limiters, the model's
-   log lines and any error or traceback line go back to the model. The model
-   revises its code, and the revision runs the same way. The default is 2
-   model rounds.
-5. **Select.** Candidates are ranked by `ln(Replay us) + 0.15 × response MB`.
-   The first one that passes full validation is returned with `metrics` and a
-   `strategy` string naming the producing round. If the model or its code
-   fails in every round, the baseline strategy runs (`agent_fallback`).
+## Changes from 0.2.1
 
-The size term comes from the 0.2.1 platform run. There, solve time grew about
-1.46 s per response MB (r = 0.97), and the 9–18 MB AllReduce answers cost 7–9
-solve-time points each
-([platform-evaluation-0.2.1.json](platform-evaluation-0.2.1.json)).
+- **Always returns an answer.** Model, parse, candidate and selection errors
+  are all contained. A last-resort reference configuration is built and
+  validated if nothing else survives. In 0.3.0, fullmesh_clos AR returned no
+  result.
+- **Response size counts.** AllReduce responses fell from 9–18 MB toward
+  2–9 MB. On the platform, solve time grew about 1.46 s per MB. The weight
+  0.10 was chosen by sweeping slope assumptions from 0.7 to 2.0 s/MB under
+  the new 25/50/25 scoring; it kept rs_ag wherever its communication margin
+  was large.
+- **Lower fixed cost.** The agent profiles at width 1 only (width-4 plans are
+  built later, only when used). The model cap is 6 s instead of 8 s, and
+  the model output limit is 120 tokens instead of 160.
+- 0.3.0's code-generation sandbox (`strategy_sandbox.py`, `StrategyAPI`)
+  stays in the repository but is not on the default path.
 
 ## Evidence
 
@@ -62,14 +60,13 @@ The platform injects `PLATFORM_LLM_URL`, `PLATFORM_API_KEY` and
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `AGENT_MODEL_ROUNDS` | 2 | generate + revise rounds |
-| `AGENT_LLM_BUDGET_SECONDS` | 25 | per model call |
-| `AGENT_MAX_OUTPUT_TOKENS` | 900 | model `max_tokens` |
+| `AGENT_LLM_BUDGET_SECONDS` | 6 | model call cap |
+| `AGENT_MAX_OUTPUT_TOKENS` | 120 | model `max_tokens` |
 
 ## Build, run, test
 
 ```powershell
-docker build --platform linux/amd64 -t team-001-agent:0.3.0 .
+docker build --platform linux/amd64 -t team-001-agent:0.2.2 .
 python -m unittest -v test_agentcc.py
 ```
 
@@ -78,13 +75,13 @@ python -m unittest -v test_agentcc.py
 Use your own development API, never the platform credentials. In PowerShell:
 
 ```powershell
-docker load -i team-001-agent-0.3.0.tar        # only if the image is not loaded yet
+docker load -i team-001-agent-0.2.2.tar        # only if the image is not loaded yet
 $env:PLATFORM_LLM_URL = "https://your-dev-gateway/v1"
 $env:AGENT_MODEL_NAME = "your-model"
 $env:PLATFORM_API_KEY = Read-Host "dev API key" -MaskInput
 docker run --rm --name agentcc-test --cpus 1 --memory 1024m --pids-limit 256 `
   -p 127.0.0.1:18080:8080 -e PLATFORM_LLM_URL -e PLATFORM_API_KEY -e AGENT_MODEL_NAME `
-  -e AGENTHACK_TELEMETRY_REQUIRED=false team-001-agent:0.3.0
+  -e AGENTHACK_TELEMETRY_REQUIRED=false team-001-agent:0.2.2
 ```
 
 In a second terminal, run `python local_test.py`. The code the model wrote is
@@ -95,21 +92,12 @@ The entry point is `AgentRuntime(AgentCCAgent()).run()` ([src/__main__.py](src/_
 
 ## Local results (public examples, mock model, not official Replay)
 
-The run used the 0.3.0 container under 1 CPU / 1024 MiB / 256 pids. The mock
-model answered in 2 s and wrote real strategy code for both rounds:
-- All 14 cases were valid, with 2 model calls each.
-- Each case took 4.5–6.3 s over HTTP and used about 1.65k tokens.
-- Memory peaked at 147 MiB.
-- AllReduce responses were 0.6–4.5 MB, down from 9–18 MB in 0.2.1.
+These runs were in-process with a mock model answering in 1 s:
+- All 14 cases were valid.
+- Solve times were 1.1–1.9 s.
+- AllReduce responses were 0.6–9.3 MB.
+- The model's pick was selected in 4 cases (2 outright).
 
-On these public examples the AllReduce Replay estimates are higher than in
-0.2.1, because larger responses are now penalized. An estimate from the
-0.2.1 platform scoring curves puts the net change near +2.9 total points.
-That figure is not verified.
-
-A deliberately broken first-round strategy (`api.secret()`) was rejected.
-Its error was sent back to the model, and the second-round code produced the
-answer.
-
-Real deepseek_v4 code quality and latency are not measured locally. Two
-25-second calls could take most of the solve-time score.
+With a 20 s mock latency, the 6 s cap applied and each case returned in
+about 6.5 s. The container run under 1 CPU / 1024 MiB / 256 pids was not
+repeated for 0.2.2, because Docker Desktop was not running.

@@ -402,70 +402,97 @@ class AgentLoopTests(unittest.TestCase):
         audit = json.loads(line[line.index("{"):])
         return result, audit, events
 
-    def test_model_code_drives_search_and_is_revised_from_feedback(self):
+    def test_model_pick_competes_with_agent_portfolio(self):
         data = two_plane_input("all-reduce")
-        result, audit, events = self._run([STRATEGY_REPLY, REVISION_REPLY], task_input=data)
+        result, audit, events = self._run(['{"c":[["rs_ag",8,2,3],["doubling",1,1,0]]}'], task_input=data)
         validate_answer(data["task"], data["topology"], result["answer"])
-        self.assertEqual(len(events["requests"]), 2)
-        self.assertEqual([r.get("error") for r in audit["rounds"]], [None, None])
-        self.assertIn("def strategy", audit["rounds"][0]["code"])
-        self.assertNotEqual(audit["rounds"][0]["code"], audit["rounds"][1]["code"])
-        feedback = events["requests"][1]["messages"][-1]["content"]
-        self.assertIn("measured", feedback)
-        self.assertIn("best_so_far", feedback)
-        self.assertTrue(audit["selected"]["origin"].startswith("model_round_"))
-        runs = [tool for tool in events["tools"] if tool["name"] == "run_strategy"]
-        self.assertEqual(len(runs), 2)
+        self.assertEqual(len(events["requests"]), 1)
+        self.assertEqual(len(audit["model_candidates"]), 2)
+        sources = {tool["arguments"]["source"] for tool in events["tools"]}
+        self.assertEqual(sources, {"agent", "model"})
         self.assertIn("metrics", result["answer"])
-        self.assertIn("origin=model_round_", result["answer"]["strategy"])
+        self.assertIn("strategy", result["answer"])
+        self.assertIn("model_improved_selection", audit)
 
-    def test_prompt_carries_current_measurements_and_baseline_code(self):
+    def test_prompt_carries_measurements_and_agent_predictions(self):
         data = two_plane_input("all-gather")
-        _, _, events = self._run([STRATEGY_REPLY, REVISION_REPLY], task_input=data)
-        prompt = events["requests"][0]["messages"][-1]["content"]
+        _, _, events = self._run(['{"c":[]}'], task_input=data)
+        request = events["requests"][0]
+        prompt = request["messages"][-1]["content"]
         self.assertIn("plane-A-ingress", prompt)
-        self.assertIn("def strategy(api)", prompt)
+        self.assertIn("agent_predicted", prompt)
+        self.assertLess(len(prompt), 2000)
+        self.assertEqual(request["max_tokens"], 120)
         changed = deepcopy(data)
         changed["topology"]["resources"][0]["capacity"] = "1GB/s"
-        _, _, events_changed = self._run([STRATEGY_REPLY, REVISION_REPLY], task_input=changed)
+        _, _, events_changed = self._run(['{"c":[]}'], task_input=changed)
         self.assertNotEqual(prompt, events_changed["requests"][0]["messages"][-1]["content"])
 
-    def test_broken_code_error_is_fed_back_and_fixed(self):
-        broken = "```python\ndef strategy(api):\n    return api.secret()\n```"
-        result, audit, events = self._run([broken, STRATEGY_REPLY])
-        self.assertIn("api.secret does not exist", audit["rounds"][0]["error"])
-        self.assertIn("api.secret does not exist", events["requests"][1]["messages"][-1]["content"])
-        self.assertIsNone(audit["rounds"][1].get("error"))
-        self.assertEqual(audit["selected"]["origin"], "model_round_2")
-        self.assertIn("retry_with_error_feedback", events["recovery"])
+    def test_size_weight_prefers_smaller_response_when_time_is_close(self):
+        module = self._load_agent_module({"tools": [], "recovery": []})
         data = two_plane_input("all-reduce")
-        validate_answer(data["task"], data["topology"], result["answer"])
+        planner = module.Planner(data["task"], data["topology"])
+        ranked = module.rank_portfolio(planner)
+        self.assertTrue(ranked)
+        costs = [cost for cost, _, _ in ranked]
+        self.assertEqual(costs, sorted(costs))
 
-    def test_model_failures_fall_back_to_agent_strategy(self):
+    def test_bad_model_output_never_fails_the_request(self):
+        data = two_plane_input("all-reduce")
+        for reply in [
+            '{"c":[["tree",3,1,0],["nonsense",1,1,0]]}',
+            '{"c":[["rs_ag",8,99,3]]}',
+            "not json at all",
+            "",
+            '{"c":[["rs_ag",8,2,30]]}',
+        ]:
+            result, audit, _ = self._run([reply], task_input=data)
+            with self.subTest(reply=reply):
+                validate_answer(data["task"], data["topology"], result["answer"])
+                self.assertIn("agent", audit["selected"]["sources"])
+
+    def test_model_failure_and_timeout_return_valid_answer(self):
         error = openai.APIConnectionError(request=httpx.Request("POST", "http://model.test/v1/chat/completions"))
         for kwargs, reason in [
             ({"error": error}, "model_api_error:APIConnectionError"),
+            ({"error": RuntimeError("gateway returned junk")}, "model_error:RuntimeError"),
             ({"delay": 0.5, "environment": {"AGENT_LLM_BUDGET_SECONDS": "0.2"}}, "model_timeout"),
-            ({"replies": ["I would use a tree."]}, "model_no_code"),
         ]:
-            replies = kwargs.pop("replies", [])
-            result, audit, events = self._run(replies, **kwargs)
+            result, audit, events = self._run([], **kwargs)
             with self.subTest(reason=reason):
-                self.assertEqual(audit["rounds"][0]["error"], reason)
-                self.assertEqual(audit["selected"]["origin"], "agent_fallback")
-                self.assertIn("agent_strategy_fallback", events["recovery"])
+                self.assertEqual(audit["model_error"], reason)
+                self.assertEqual(audit["selected"]["sources"], ["agent"])
+                self.assertIn("use_agent_portfolio", events["recovery"])
                 data = two_plane_input("all-reduce")
                 validate_answer(data["task"], data["topology"], result["answer"])
 
-    def test_code_extraction(self):
+    def test_candidate_crash_is_contained(self):
+        events = {"requests": [], "tools": [], "recovery": []}
+        module = self._load_agent_module(events)
+        data = two_plane_input("all-reduce")
+        planner = module.Planner(data["task"], data["topology"])
+        evaluator = module.Evaluator(planner)
+        with patch.object(planner, "build", side_effect=TypeError("'<' not supported")):
+            row = evaluator.evaluate({"algorithm": "rs_ag", "split": 8, "path_width": 2}, "model")
+        self.assertEqual(row["status"], "error")
+        self.assertIn("TypeError", row["error"])
+        with self.assertRaises(AgentCCError):
+            evaluator.select()
+        emergency = evaluator.emergency()
+        validate_answer(data["task"], data["topology"], emergency["_answer"])
+
+    def test_reply_parsing(self):
         module = self._load_agent_module({"tools": [], "recovery": []})
-        code, error = module.extract_code("<think>x</think>\n```python\ndef strategy(api):\n    return []\n```")
+        proposals, error = module.parse_proposals(
+            '<think>["x",1,1]</think>```json\n{"c":[["rs_ag",32,4,5],["doubling",1,8,0]]}\n```')
         self.assertIsNone(error)
-        self.assertTrue(code.startswith("def strategy"))
-        truncated, error = module.extract_code("reason\n```python\ndef strategy(api):\n    return []")
-        self.assertIsNone(error)
-        self.assertIn("def strategy", truncated)
-        self.assertEqual(module.extract_code("no code here")[1], "model_no_code")
+        self.assertEqual(proposals, [
+            {"algorithm": "rs_ag", "split": 32, "path_width": 4, "rs_dims": 5},
+            {"algorithm": "doubling", "split": 1, "path_width": 8},
+        ])
+        self.assertEqual(module.parse_proposals(None)[1], "model_empty_response")
+        self.assertEqual(module.parse_proposals(123)[1], "model_empty_response")
+        self.assertEqual(len(module.parse_proposals('{"c":[["rs_ag",16,4,4],["dou')[0]), 1)
 
 
 if __name__ == "__main__":
