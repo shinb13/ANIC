@@ -92,12 +92,14 @@ The entry point is `AgentRuntime(AgentCCAgent()).run()` ([src/__main__.py](src/_
 
 ## Local results (public examples, mock model, not official Replay)
 
-These runs were in-process with a mock model answering in 1 s:
+These runs used the 0.2.2 container under 1 CPU / 1024 MiB / 256 pids, with
+a mock model answering in 1 s:
 - All 14 cases were valid.
-- Solve times were 1.1–1.9 s.
+- Each case took 1.2–2.2 s over HTTP.
 - AllReduce responses were 0.6–9.3 MB.
+- Memory peaked at 134 MiB.
 - The model's pick was selected in 4 cases (2 outright).
 
-With a 20 s mock latency, the 6 s cap applied and each case returned in
-about 6.5 s. The container run under 1 CPU / 1024 MiB / 256 pids was not
-repeated for 0.2.2, because Docker Desktop was not running.
+With a 10 s mock latency, the 6 s cap applied and each case returned in
+about 6.8 s. Malformed model replies, invalid configurations and an HTTP 500
+all fell back to the validated portfolio answer.
