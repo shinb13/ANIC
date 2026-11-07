@@ -12,6 +12,7 @@ import json
 import math
 import re
 from collections import Counter
+from copy import copy
 from dataclasses import dataclass
 from math import inf
 from pathlib import Path
@@ -410,6 +411,69 @@ class Network:
         name = self.resource_names[element - self.edge_count]
         return {"type": "resource", "id": name, "capacity_Bps": float(self.resource_capacity[element - self.edge_count])}
 
+    def rank_costs(self, weights: np.ndarray) -> np.ndarray:
+        """Directed rank-pair prices with switches as the only intermediates."""
+
+        n, switches = len(self.ranks), len(self.switch_names)
+        lookup = {rank: index for index, rank in enumerate(self.ranks)}
+        out = np.full((n, switches), inf)
+        incoming = np.full((switches, n), inf)
+        distance = np.full((switches, switches), inf)
+        costs = np.full((n, n), inf)
+        np.fill_diagonal(distance, 0.0)
+        for (src, dst), weight in zip(self.edges, weights):
+            if src in lookup and dst in lookup:
+                costs[lookup[src], lookup[dst]] = weight
+            elif src in lookup:
+                out[lookup[src], self.switch_index[dst]] = weight
+            elif dst in lookup:
+                incoming[self.switch_index[src], lookup[dst]] = weight
+            else:
+                distance[self.switch_index[src], self.switch_index[dst]] = weight
+        for switch in range(switches):
+            np.minimum(distance, distance[:, switch:switch + 1] + distance[switch:switch + 1, :], out=distance)
+        reach = np.full((n, switches), inf)
+        for switch in range(switches):
+            np.minimum(reach, out[:, switch:switch + 1] + distance[switch:switch + 1, :], out=reach)
+        for switch in range(switches):
+            np.minimum(costs, reach[:, switch:switch + 1] + incoming[switch:switch + 1, :], out=costs)
+        return costs
+
+    def rank_orders(self) -> dict[str, dict[str, Any]]:
+        """Binary groupings from bidirectional path costs, with/without resource prices."""
+
+        n = len(self.ranks)
+        result = {}
+        for name, weights in (("locality", 1e6 / self.edge_capacity), ("resource", self.static_cost)):
+            directed = self.rank_costs(weights)
+            costs = np.maximum(directed, directed.T)
+            groups = [[index] for index in range(n)]
+            while len(groups) > 1:
+                merged = []
+                remaining = list(groups)
+                while remaining:
+                    first = remaining.pop(0)
+                    options = np.array(remaining)
+                    forward = costs[np.array(first)[None, :], options].sum(axis=1)
+                    reverse = costs[np.array(first)[None, :], options[:, ::-1]].sum(axis=1)
+                    selected = int(np.argmin(np.minimum(forward, reverse)))
+                    second = remaining.pop(selected)
+                    if reverse[selected] < forward[selected]:
+                        second = second[::-1]
+                    merged.append(first + second)
+                groups = merged
+            order = np.array(groups[0])
+            steps = [1 << bit for bit in range(n.bit_length() - 1)]
+            original = np.array([costs[np.arange(n), np.arange(n) ^ step] for step in steps])
+            mapped = np.array([costs[order, order[np.arange(n) ^ step]] for step in steps])
+            result[name] = {
+                "directed_costs": directed,
+                "rank_order": order.tolist(),
+                "mapped_max": mapped.max(axis=1).tolist(),
+                "original_mean": original.mean(axis=1).tolist(), "mapped_mean": mapped.mean(axis=1).tolist(),
+            }
+        return result
+
 
 # ---------------------------------------------------------------------------
 # Round optimizer
@@ -423,6 +487,10 @@ class RoundPlan:
     busy_per_byte_us: float
     bottleneck: dict[str, Any]
     elapsed_ms: float
+    entry_element: np.ndarray
+    entry_path: np.ndarray
+    path_per_byte_us: np.ndarray
+    path_overhead_us: np.ndarray
 
 
 def optimize_round(
@@ -506,6 +574,10 @@ def optimize_round(
         busy_per_byte_us=best_value,
         bottleneck=bottleneck,
         elapsed_ms=(perf_counter() - started) * 1000,
+        entry_element=entry_element,
+        entry_path=entry_path,
+        path_per_byte_us=per_byte,
+        path_overhead_us=np.array([route.overhead_us for route in flat_routes]),
     )
 
 
@@ -550,6 +622,7 @@ class Planner:
         self.network = Network(task, topology)
         self.operator = task["operator"]
         self.ranks = list(task["ranks"])
+        self.rank_order = tuple(range(len(self.ranks)))
         self.rank_count = len(self.ranks)
         self.steps = [1 << bit for bit in range(self.rank_count.bit_length() - 1)]
         self.splits = valid_splits(task)
@@ -558,6 +631,38 @@ class Planner:
         self.allow_copy = bool(task.get("allow_copy", True))
         self._plans: dict[tuple, RoundPlan] = {}
         self._names: dict[int, list[list[str]]] = {}
+        self._allocations: dict[tuple[int, int], np.ndarray] = {}
+        self._allocation_keys: dict[tuple[int, int], tuple] = {}
+        self._integer_times: dict[tuple[int, int, int], float] = {}
+        self._rank_orders: dict[str, dict[str, Any]] | None = None
+
+    def with_rank_order(self, order: list[int]) -> "Planner":
+        """Use logical ranks internally, sharing only the physical network/route cache."""
+
+        mapped = copy(self)
+        mapped.rank_order = tuple(order)
+        mapped.ranks = [self.network.ranks[index] for index in order]
+        mapped._plans, mapped._names = {}, {}
+        mapped._allocations, mapped._allocation_keys, mapped._integer_times = {}, {}, {}
+        return mapped
+
+    def mapping_candidates(self, config: dict[str, Any]) -> list[dict[str, Any]]:
+        """Cheap path-work screening; these scores are not Replay predictions."""
+
+        if self._rank_orders is None:
+            self._rank_orders = self.network.rank_orders()
+        split, h = config["split"], config["rs_dims"]
+        weights = [split >> position for position in range(h)] + [split >> h] * (len(self.steps) - h)
+        candidates = []
+        for name, info in self._rank_orders.items():
+            original = sorted(info["original_mean"])
+            mapped = sorted(info["mapped_mean"])
+            reachable = all(math.isfinite(value) for value in info["mapped_max"])
+            before = sum(cost * weight for cost, weight in zip(original, weights))
+            after = sum(cost * weight for cost, weight in zip(mapped, weights))
+            candidates.append({"mapping": name, "rank_order": info["rank_order"], "reachable": reachable,
+                               "proxy_gain": 1.0 - after / before if reachable else None})
+        return candidates
 
     # -- round plans -------------------------------------------------------
     def exchange_pairs(self, step: int) -> list[tuple[int, int]]:
@@ -567,12 +672,40 @@ class Planner:
         cache_key = key + (width,)
         plan = self._plans.get(cache_key)
         if plan is None:
-            plan = optimize_round(self.network, pairs, width)
+            physical_pairs = [(self.rank_order[src], self.rank_order[dst]) for src, dst in pairs]
+            plan = optimize_round(self.network, physical_pairs, width)
             self._plans[cache_key] = plan
         return plan
 
     def exchange_plan(self, step: int, width: int) -> RoundPlan:
         return self.round_plan(("xor", step), self.exchange_pairs(step), width)
+
+    def integer_allocation(self, plan: RoundPlan, units: int) -> np.ndarray:
+        """The same integer route counts are used for prediction and emission."""
+
+        key = (id(plan), units)
+        counts = self._allocations.get(key)
+        if counts is None:
+            counts = _discretize(plan.fractions, units)
+            self._allocations[key] = counts
+        return counts
+
+    def integer_round_time_us(self, plan: RoundPlan, units: int, chunk_bytes: int) -> float:
+        """Replay cost of the emitted integer allocation, without chunk expressions."""
+
+        key = (id(plan), units, chunk_bytes)
+        if key not in self._integer_times:
+            counts = self.integer_allocation(plan, units)
+            sizes = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]) * chunk_bytes
+            active = sizes > 0
+            loads = np.bincount(
+                plan.entry_element, weights=sizes[plan.entry_path], minlength=len(self.network.element_inv),
+            )
+            overhead = float(plan.path_overhead_us[active].max(initial=0.0))
+            path_time = (plan.path_overhead_us[active] + sizes[active] * plan.path_per_byte_us[active]).max(initial=0.0)
+            contention = overhead + float((loads * self.network.element_inv).max(initial=0.0))
+            self._integer_times[key] = float(max(path_time, contention))
+        return self._integer_times[key]
 
     def dimension_profiles(self, width: int = MAX_PATH_WIDTH) -> list[dict[str, Any]]:
         """Per-XOR-dimension Replay cost per MiB on single and optimized multipath routes."""
@@ -699,16 +832,16 @@ class Planner:
         return specs
 
     def predict(self, config: dict[str, Any]) -> dict[str, float]:
-        """Fast continuous estimate of Replay time (us) and response size (MB)."""
+        """Integer Replay cost (us) and approximate response size (MB), without a build."""
 
-        chunk_bytes = self.data_size / config["split"]
+        chunk_bytes = self.data_size // config["split"]
         name = self._mean_name_length(config["split"])
         total_us, size = 0.0, 0.0
         for spec in self.round_specs(config):
             plan = spec["plan"]
-            overhead = max(route.overhead_us for routes in plan.routes for route in routes)
-            total_us += overhead + plan.busy_per_byte_us * chunk_bytes * spec["chunks"]
-            used = float(np.minimum((plan.fractions > 1e-3).sum(axis=1), spec["chunks"]).mean())
+            total_us += self.integer_round_time_us(plan, spec["chunks"], chunk_bytes)
+            counts = self.integer_allocation(plan, spec["chunks"])
+            used = float((counts > 0).sum(axis=1).mean())
             if spec.get("complete") and self.sum_notation:
                 entry = len(f"c{config['split']}_sum") + 3
             else:
@@ -716,6 +849,25 @@ class Planner:
             size += spec["pairs"] * (spec["chunks"] * entry + used * 110)
         size += 2 * self.rank_count * config["split"] * (name + 3)
         return {"us": total_us, "mb": size / 1e6}
+
+    def schedule_key(self, config: dict[str, Any]) -> tuple:
+        """Merge only identical integer allocations of the same communication structure."""
+
+        rounds = []
+        for spec in self.round_specs(config):
+            plan = spec["plan"]
+            key = (id(plan), spec["chunks"])
+            allocation_key = self._allocation_keys.get(key)
+            if allocation_key is None:
+                counts = self.integer_allocation(plan, spec["chunks"])
+                allocation_key = tuple(
+                    tuple((route.nodes, int(count)) for route, count in zip(routes, row) if count > 0)
+                    for routes, row in zip(plan.routes, counts)
+                )
+                self._allocation_keys[key] = allocation_key
+            rounds.append(allocation_key)
+        return (self.operator, config["algorithm"], config["split"], config.get("rs_dims"),
+                self.rank_order, tuple(config["order"]), tuple(rounds))
 
     def normalize_config_safe(self, raw: Any) -> dict[str, Any] | None:
         """normalize_config that returns None instead of raising."""
@@ -785,12 +937,13 @@ class Planner:
             rounds = self._build_allreduce_doubling(config)
         split = config["split"]
         names = self.chunk_names(split)
-        chunks = [name for rank_names in names for name in rank_names]
+        by_rank = dict(zip(self.ranks, names))
+        chunks = [name for rank in self.task["ranks"] for name in by_rank[rank]]
         answer = {
             "operator": self.operator,
             "split": split,
             "chunks": chunks,
-            "initial_possession": {rank: list(names[index]) for index, rank in enumerate(self.ranks)},
+            "initial_possession": {rank: list(by_rank[rank]) for rank in self.task["ranks"]},
             "final_chunks": chunks if self.operator == "all-gather" else [f"c{slot}_sum" for slot in range(split)],
             "round_count": len(rounds),
             "rounds": [{"round": number, "transfers": transfers} for number, transfers in enumerate(rounds, 1)],
@@ -804,7 +957,7 @@ class Planner:
 
         transfers = []
         sizes = {len(item) for item in units}
-        counts_by_size = {size: _discretize(plan.fractions, size) for size in sizes}
+        counts_by_size = {size: self.integer_allocation(plan, size) for size in sizes}
         for demand, ((src, dst), items) in enumerate(zip(pairs, units)):
             if not items:
                 continue
@@ -950,9 +1103,301 @@ class Planner:
         return rounds
 
 
+def prepare_dual_tree(planner: Planner) -> dict[str, Any]:
+    """Two four-way reduction trees, jointly routed and priced at integer slot counts."""
+
+    started = perf_counter()
+    depth = (len(planner.steps) + 1) // 2
+    if (planner.operator != "all-reduce" or not planner.allow_copy or planner.splits[-1] < 4
+            or 2 * depth > planner.max_rounds):
+        return {"reason": "ineligible"}
+    network, n, split = planner.network, planner.rank_count, planner.splits[-1]
+    if planner._rank_orders is None:
+        planner._rank_orders = network.rank_orders()
+    grouping = planner._rank_orders["resource"]
+    inverse = {physical: logical for logical, physical in enumerate(planner.rank_order)}
+    order = [inverse[index] for index in grouping["rank_order"]]
+    index = np.ix_(planner.rank_order, planner.rank_order)
+    original_costs = grouping["directed_costs"][index]
+    trees = []
+    for tree in range(2):
+        active, levels = list(order), []
+        for level in range(depth):
+            costs = original_costs
+            if tree:
+                load = np.zeros(len(network.element_inv))
+                for src, dst in trees[0][level]:
+                    for a, b in ((src, dst), (dst, src)):
+                        routes = network.routes(planner.rank_order[a], planner.rank_order[b])[:4]
+                        route = min(routes, key=lambda item: float(network.element_inv[item.elements].sum()))
+                        np.add.at(load, route.elements, 1)
+                busy = load * network.element_inv
+                prices = network.element_inv * (1 + 8 * (busy / busy.max()) ** 3)
+                edge_prices = np.array([
+                    prices[eid] + sum(prices[network.edge_count + rid] for rid in members)
+                    for eid, members in enumerate(network.edge_resource_ids)
+                ])
+                costs = network.rank_costs(edge_prices)[index]
+            pairs, next_active = [], []
+            for start in range(0, len(active), 4):
+                group = active[start:start + 4]
+                matrix = costs[np.ix_(group, group)].copy()
+                np.fill_diagonal(matrix, 0)
+                scores = matrix.sum(axis=0) + matrix.sum(axis=1)
+                parent_index = int(np.argmin(scores))
+                if not math.isfinite(float(scores[parent_index])):
+                    raise AgentCCError("dual tree group has no bidirectionally reachable parent")
+                parent = group[parent_index]
+                next_active.append(parent)
+                pairs.extend((child, parent) for child in group if child != parent)
+            levels.append(pairs)
+            active = next_active
+        trees.append(levels)
+    tree_finished = perf_counter()
+    stages = []
+    sizes = np.ones((2, n), dtype=np.int64)
+    for action in ("reduce", "copy"):
+        for level in (range(depth) if action == "reduce" else reversed(range(depth))):
+            pairs, ids, contributors = [], [], []
+            state = sizes.copy()
+            for tree in range(2):
+                for src, dst in trees[tree][level]:
+                    pairs.append((src, dst) if action == "reduce" else (dst, src))
+                    ids.append(tree)
+                    contributors.append(int(state[tree, src]) if action == "reduce" else n)
+                    if action == "reduce":
+                        sizes[tree, dst] += state[tree, src]
+            plan = planner.round_plan(("dual-tree", action, tuple(pairs)), pairs, 4)
+            stages.append({"pairs": pairs, "ids": np.array(ids), "action": action,
+                           "contributors": np.array(contributors), "plan": plan})
+    routes_finished = perf_counter()
+    options, allocations = [], {}
+    chunk_bytes = planner.data_size // split
+    name = planner._mean_name_length(split)
+    for choice, first in ((1, split // 2), (2, split // 4), (3, 3 * split // 4)):
+        total_us, size = 0.0, 2 * n * split * (name + 3)
+        counts_by_round = []
+        for stage in stages:
+            plan = stage["plan"]
+            counts = np.where(stage["ids"][:, None] == 0,
+                              planner.integer_allocation(plan, first),
+                              planner.integer_allocation(plan, split - first))
+            counts_by_round.append(counts)
+            amounts = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]) * chunk_bytes
+            active = amounts > 0
+            load = np.bincount(plan.entry_element, weights=amounts[plan.entry_path],
+                               minlength=len(network.element_inv))
+            path_us = np.where(active, plan.path_overhead_us + amounts * plan.path_per_byte_us, 0)
+            total_us += max(float(path_us.max(initial=0)),
+                            float(plan.path_overhead_us[active].max(initial=0)
+                                  + (load * network.element_inv).max(initial=0)))
+            entries = stage["contributors"] * (name + 1) + 2
+            if stage["action"] == "copy" and planner.sum_notation:
+                entries = np.full(len(stage["pairs"]), len(f"c{split}_sum") + 3)
+            size += float((counts.sum(axis=1) * entries + (counts > 0).sum(axis=1) * 110).sum())
+        options.append({"choice": choice, "first_slots": first, "us": total_us, "mb": size / 1e6})
+        allocations[choice] = counts_by_round
+    return {
+        "split": split, "path_width": 4, "round_count": 2 * depth, "options": options,
+        "trees": [{"reduce_levels": [[[planner.ranks[src], planner.ranks[dst]] for src, dst in level]
+                                      for level in tree]} for tree in trees],
+        "timings_ms": {"trees": (tree_finished - started) * 1000,
+                       "routes": (routes_finished - tree_finished) * 1000,
+                       "predictions": (perf_counter() - routes_finished) * 1000},
+        "_stages": stages, "_allocations": allocations,
+    }
+
+
+def build_dual_tree(planner: Planner, prepared: dict[str, Any], choice: int) -> dict[str, Any]:
+    """Emit the chosen slot partition; tree contributions remain independent."""
+
+    split = prepared["split"]
+    first = next(option["first_slots"] for option in prepared["options"] if option["choice"] == choice)
+    groups = [[(rank,) for rank in range(planner.rank_count)] for _ in range(2)]
+    complete = tuple(range(planner.rank_count))
+    expression = planner._expression_cache(split)
+    rounds = []
+    for stage, counts in zip(prepared["_stages"], prepared["_allocations"][choice]):
+        state, transfers = [list(row) for row in groups], []
+        for demand, ((src, dst), tree) in enumerate(zip(stage["pairs"], stage["ids"])):
+            slots = list(range(first)) if tree == 0 else list(range(first, split))
+            offset = 0
+            for route, amount in zip(stage["plan"].routes[demand], counts[demand]):
+                if amount == 0:
+                    continue
+                piece = slots[offset:offset + int(amount)]
+                offset += int(amount)
+                values = [expression(state[tree][src], slot) if stage["action"] == "reduce"
+                          else planner._complete(expression, complete, slot) for slot in piece]
+                transfers.append({"action": stage["action"], "src": planner.ranks[src], "dst": planner.ranks[dst],
+                                  "chunk_ranges": values, "path": route.path})
+            if stage["action"] == "reduce":
+                groups[tree][dst] = tuple(sorted(groups[tree][dst] + state[tree][src]))
+        rounds.append({"round": len(rounds) + 1, "transfers": transfers})
+    by_rank = dict(zip(planner.ranks, planner.chunk_names(split)))
+    return {
+        "operator": "all-reduce", "split": split,
+        "chunks": [name for rank in planner.task["ranks"] for name in by_rank[rank]],
+        "initial_possession": {rank: list(by_rank[rank]) for rank in planner.task["ranks"]},
+        "final_chunks": [f"c{slot}_sum" for slot in range(split)], "round_count": len(rounds), "rounds": rounds,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Replay estimate (independent of the optimizer's internal arrays)
 # ---------------------------------------------------------------------------
+
+
+def repair_round_routes(
+    network: Network, plan: RoundPlan, round_data: dict[str, Any], chunk_bytes: int,
+    deadline: float, max_pairs: int = 16,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Move whole chunks between a pair's existing routes on private round state."""
+
+    by_pair: dict[tuple[str, str], dict[tuple[str, ...], dict[str, Any]]] = {}
+    for transfer in round_data["transfers"]:
+        by_pair.setdefault((transfer["src"], transfer["dst"]), {})[tuple(transfer["path"])] = transfer
+    flat_routes = [route for routes in plan.routes for route in routes]
+    pair_index = np.repeat(np.arange(len(plan.routes)), [len(routes) for routes in plan.routes])
+    counts = np.array([
+        len(by_pair[(route.nodes[0], route.nodes[-1])][route.nodes]["chunk_ranges"])
+        if route.nodes in by_pair[(route.nodes[0], route.nodes[-1])] else 0
+        for route in flat_routes
+    ], dtype=np.int64)
+    loads = np.bincount(plan.entry_element, weights=counts[plan.entry_path], minlength=len(network.element_inv))
+    offsets = np.cumsum([0] + [len(routes) for routes in plan.routes])
+
+    def evaluate() -> tuple[float, np.ndarray, np.ndarray]:
+        active = counts > 0
+        path_times = np.where(active, plan.path_overhead_us + counts * chunk_bytes * plan.path_per_byte_us, 0.0)
+        busy = loads * chunk_bytes * network.element_inv
+        overhead = plan.path_overhead_us[active].max(initial=0.0)
+        return float(max(path_times.max(initial=0.0), overhead + busy.max(initial=0.0))), path_times, busy
+
+    before, path_times, busy = evaluate()
+    current = before
+    moves = []
+    dirty_pairs = set()
+    checked = 0
+    while perf_counter() < deadline:
+        active_overhead = plan.path_overhead_us[counts > 0].max(initial=0.0)
+        if path_times.max(initial=0.0) >= active_overhead + busy.max(initial=0.0):
+            sources = np.flatnonzero(path_times >= current - max(1e-9, current * 1e-10)).tolist()
+        else:
+            element = int(np.argmax(busy))
+            multiplicity = np.bincount(plan.entry_path[plan.entry_element == element], minlength=len(counts))
+            sources = np.flatnonzero((counts > 0) & (multiplicity > 0)).tolist()
+            sources.sort(key=lambda index: (-counts[index] * multiplicity[index], index))
+        pairs = set()
+        best_move = None
+        best_time = current
+        tolerance = max(1e-9, current * 1e-10)
+        for source in sources:
+            pair = int(pair_index[source])
+            if offsets[pair + 1] - offsets[pair] < 2:
+                continue
+            if pair not in pairs and len(pairs) == max_pairs:
+                continue
+            pairs.add(pair)
+            for destination in range(offsets[pair], offsets[pair + 1]):
+                if perf_counter() >= deadline:
+                    break
+                if destination == source:
+                    continue
+                counts[source] -= 1
+                counts[destination] += 1
+                np.add.at(loads, flat_routes[source].elements, -1)
+                np.add.at(loads, flat_routes[destination].elements, 1)
+                candidate_time, _, _ = evaluate()
+                checked += 1
+                if candidate_time < best_time - tolerance:
+                    best_time = candidate_time
+                    best_move = (source, destination)
+                counts[source] += 1
+                counts[destination] -= 1
+                np.add.at(loads, flat_routes[source].elements, 1)
+                np.add.at(loads, flat_routes[destination].elements, -1)
+            if perf_counter() >= deadline:
+                break
+        if best_move is None:
+            break
+        source, destination = best_move
+        counts[source] -= 1
+        counts[destination] += 1
+        np.add.at(loads, flat_routes[source].elements, -1)
+        np.add.at(loads, flat_routes[destination].elements, 1)
+        moves.append({"src": flat_routes[source].nodes[0], "dst": flat_routes[source].nodes[-1],
+                      "from_path": list(flat_routes[source].nodes), "to_path": list(flat_routes[destination].nodes),
+                      "before_us": current, "after_us": best_time})
+        dirty_pairs.add(int(pair_index[source]))
+        current, path_times, busy = evaluate()
+
+    info = {"before_us": before, "after_us": current, "checked_moves": checked,
+            "accepted_moves": len(moves), "moves": moves}
+    if not moves:
+        return round_data, info
+    changed = {(plan.routes[pair][0].nodes[0], plan.routes[pair][0].nodes[-1]) for pair in dirty_pairs}
+    transfers = [transfer for transfer in round_data["transfers"] if (transfer["src"], transfer["dst"]) not in changed]
+    for pair in sorted(dirty_pairs):
+        routes = plan.routes[pair]
+        original = by_pair[(routes[0].nodes[0], routes[0].nodes[-1])]
+        template = next(iter(original.values()))
+        chunks = [chunk for transfer in original.values() for chunk in transfer["chunk_ranges"]]
+        offset = 0
+        for route, count in zip(routes, counts[offsets[pair]:offsets[pair + 1]]):
+            if count > 0:
+                transfers.append({**template, "path": route.path, "chunk_ranges": chunks[offset:offset + int(count)]})
+                offset += int(count)
+    return {**round_data, "transfers": transfers}, info
+
+
+def refine_schedule_routes(
+    planner: Planner, config: dict[str, Any], answer: dict[str, Any], estimate: dict[str, Any],
+    *, size_weight: float = 0.10, budget_seconds: float = 0.1,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Repair up to three slow rounds; validate and adopt only a better complete schedule."""
+
+    started = perf_counter()
+    deadline = started + budget_seconds
+    rounds = list(answer["rounds"])
+    info: dict[str, Any] = {"budget_ms": budget_seconds * 1000, "before_us": estimate["total_us"],
+                            "adopted": False, "rounds": []}
+    specs = planner.round_specs(config)
+    search_started = perf_counter()
+    for index in sorted(range(len(rounds)), key=lambda i: -estimate["rounds"][i]["time_us"]):
+        if len(info["rounds"]) == 3:
+            break
+        if perf_counter() >= deadline:
+            break
+        if all(len(routes) == 1 for routes in specs[index]["plan"].routes):
+            continue
+        rounds[index], detail = repair_round_routes(
+            planner.network, specs[index]["plan"], rounds[index], planner.data_size // config["split"], deadline,
+        )
+        info["rounds"].append({"round": index + 1, **detail})
+    info["search_ms"] = (perf_counter() - search_started) * 1000
+    info["accepted_moves"] = sum(row["accepted_moves"] for row in info["rounds"])
+    info["checked_moves"] = sum(row["checked_moves"] for row in info["rounds"])
+    info["before_response_mb"] = answer_size_estimate(answer) / 1e6
+    result, result_estimate = answer, estimate
+    if info["accepted_moves"]:
+        candidate = {**answer, "rounds": rounds}
+        measured = replay_estimate(planner.task, planner.topology, candidate, planner.network.raw)
+        validate_answer(planner.task, planner.topology, candidate, planner.network.raw)
+        candidate_mb = answer_size_estimate(candidate) / 1e6
+        before_cost = math.log(estimate["total_us"]) + size_weight * info["before_response_mb"]
+        candidate_cost = math.log(measured["total_us"]) + size_weight * candidate_mb
+        info.update(candidate_us=measured["total_us"], candidate_response_mb=candidate_mb,
+                    before_cost=before_cost, candidate_cost=candidate_cost)
+        if measured["total_us"] < estimate["total_us"] and candidate_cost <= before_cost:
+            result, result_estimate = candidate, measured
+            info["adopted"] = True
+        else:
+            info["rejection"] = "complete_schedule_cost"
+    info["after_us"] = result_estimate["total_us"]
+    info["after_response_mb"] = answer_size_estimate(result) / 1e6
+    info["elapsed_ms"] = (perf_counter() - started) * 1000
+    return result, result_estimate, info
 
 
 def replay_estimate(
@@ -1237,7 +1682,7 @@ class StrategyAPI:
     """The only object a model-written strategy can use.
 
     Facts are copies of current-instance data.  ``predict`` is a fast
-    continuous model (no build); ``measure`` builds the schedule and applies
+    integer cost model (no build); ``measure`` builds the schedule and applies
     the published Replay formula.  Every call is logged for the audit, and
     measured candidates are kept so the agent can choose among them.
     """
