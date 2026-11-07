@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.13y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.14y).
 
 Per request, every value comes from the current task and topology:
 
@@ -61,15 +61,17 @@ DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.13y"
+TOOL_VERSION = "2.14y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
 SIZE_WEIGHT = 0.10
 # 0.2.12y: wall-clock budget for the AllGather block search (dynamic programme per width).
-BLOCK_SEARCH_BUDGET_SECONDS = 1.5
+# 0.2.14y: the platform ran the 0.2.12y search about 5x slower than local tests,
+# so the budget is a hard deadline checked between block plans.
+BLOCK_SEARCH_BUDGET_SECONDS = 0.8
 BLOCK_WIDTHS = (16, 8)
-BLOCK_EXTRA_WIDTHS = 1
+BLOCK_EXTRA_WIDTHS = 0
 
 SYSTEM_PROMPT = (
     "You pick collective-communication schedule parameters. A tool builds each pick on the "
@@ -463,11 +465,11 @@ class Evaluator:
                 if config["algorithm"] == "rs_ag":
                     raw["rs_dims"] = config["rs_dims"]
                     base = planner.normalize_config(raw)
-                    rs_blocks, mid_blocks, predicted, singles = planner.allreduce_blocks(base)
+                    rs_blocks, mid_blocks, predicted, singles = planner.allreduce_blocks(base, deadline=deadline)
                     fields = {"rs_blocks": rs_blocks, "mid_blocks": mid_blocks}
                 else:
                     base = planner.normalize_config(raw)
-                    blocks, predicted, singles = planner.allgather_blocks(base)
+                    blocks, predicted, singles = planner.allgather_blocks(base, deadline=deadline)
                     fields = {"blocks": blocks}
                 self.prepared_blocks[key] = {"width": width, **fields, "predicted_us": predicted,
                                              "single_dims_us": singles,

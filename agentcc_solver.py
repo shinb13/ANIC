@@ -35,6 +35,9 @@ MAX_BLOCK_DIMS = 3
 # Block rounds carry 3-7x more pairs than an XOR round; fewer Frank-Wolfe steps keep the
 # search inside the model wait.  Predictions stay exact: they price the plan actually emitted.
 BLOCK_OPTIMIZER_ITERATIONS = 24
+# A block round already spreads a rank's traffic over several partners; four routes per
+# pair kept most of the gain on the public examples at about 40% of the search time.
+BLOCK_WIDTH_CAP = 4
 OPTIMIZER_ITERATIONS = 48
 PROFILE_BYTES = 1 << 20
 
@@ -261,6 +264,7 @@ class Network:
         self._route_cache: dict[tuple[int, int], list[Route]] = {}
         self._segment_cache: dict[tuple[int, int], list[tuple[tuple[str, ...], float]]] = {}
         self._route_objects: dict[tuple[str, ...], Route] = {}
+        self._quick_cache: dict[tuple[int, int, int], list[Route]] = {}
         self._prepare_switch_graph()
 
     def _prepare_switch_graph(self) -> None:
@@ -341,6 +345,45 @@ class Network:
         )
         self._route_objects[nodes] = route
         return route
+
+    def quick_routes(self, source: int, destination: int, width: int) -> list[Route]:
+        """Up to ``width`` cheapest switch routes, without the diversity pass of ``routes``.
+
+        Used for the extra XOR combinations of dimension blocks, where the
+        full candidate generation dominated the search time.
+        """
+
+        key = (source, destination, width)
+        cached = self._quick_cache.get(key)
+        if cached is not None:
+            return cached
+        src, dst = self.ranks[source], self.ranks[destination]
+        candidates: dict[tuple[str, ...], float] = {}
+        if (src, dst) in self.edge_index:
+            candidates[(src, dst)] = float(self.static_cost[self.edge_index[(src, dst)]])
+        out_list, in_list = self.rank_out[src], self.rank_in[dst]
+        if out_list and in_list:
+            ui = np.array([u for u, _ in out_list])
+            vi = np.array([v for v, _ in in_list])
+            total = (np.array([c for _, c in out_list])[:, None] + self.switch_distance[np.ix_(ui, vi)]
+                     + np.array([c for _, c in in_list])[None, :]).ravel()
+            limit = min(width, total.size)
+            head = np.argpartition(total, limit - 1)[:limit] if limit < total.size else np.arange(total.size)
+            for flat in head[np.argsort(total[head], kind="stable")].tolist():
+                if not np.isfinite(total[flat]):
+                    continue
+                u, v = int(ui[flat // len(vi)]), int(vi[flat % len(vi)])
+                nodes = (src, self.switch_names[u], dst) if u == v else (src,) + self._switch_path(u, v) + (dst,)
+                candidates.setdefault(nodes, float(total[flat]))
+        if not candidates:
+            raise AgentCCError(f"no legal route from {src} to {dst}")
+        ordered = sorted(candidates.items(), key=lambda item: (item[1], len(item[0])))
+        if not self.allow_detour:
+            fewest = min(len(nodes) for nodes, _ in ordered)
+            ordered = [item for item in ordered if len(item[0]) == fewest]
+        result = [self._route(nodes) for nodes, _ in ordered[:max(1, width)]]
+        self._quick_cache[key] = result
+        return result
 
     def routes(self, source: int, destination: int) -> list[Route]:
         """Diverse switch-only candidate routes, ordered for use as the width grows."""
@@ -502,6 +545,7 @@ def optimize_round(
     pairs: list[tuple[int, int]],
     width: int,
     iterations: int = OPTIMIZER_ITERATIONS,
+    quick: bool = False,
 ) -> RoundPlan:
     """Split equal demands over candidate routes to minimize the Replay round time.
 
@@ -513,7 +557,10 @@ def optimize_round(
     """
 
     started = perf_counter()
-    route_lists = [network.routes(src, dst)[:max(1, width)] for src, dst in pairs]
+    if quick:
+        route_lists = [network.quick_routes(src, dst, max(1, width)) for src, dst in pairs]
+    else:
+        route_lists = [network.routes(src, dst)[:max(1, width)] for src, dst in pairs]
     demand_count = len(route_lists)
     width_max = max(len(routes) for routes in route_lists)
     index = np.full((demand_count, width_max), -1, dtype=np.int64)
@@ -678,12 +725,12 @@ class Planner:
         return [(index, index ^ step) for index in range(self.rank_count)]
 
     def round_plan(self, key: tuple, pairs: list[tuple[int, int]], width: int,
-                   iterations: int = OPTIMIZER_ITERATIONS) -> RoundPlan:
+                   iterations: int = OPTIMIZER_ITERATIONS, quick: bool = False) -> RoundPlan:
         cache_key = key + (width,)
         plan = self._plans.get(cache_key)
         if plan is None:
             physical_pairs = [(self.rank_order[src], self.rank_order[dst]) for src, dst in pairs]
-            plan = optimize_round(self.network, physical_pairs, width, iterations)
+            plan = optimize_round(self.network, physical_pairs, width, iterations, quick)
             self._plans[cache_key] = plan
         return plan
 
@@ -1093,7 +1140,21 @@ class Planner:
             return self.exchange_plan(block[0], width)
         masks = block_masks(block)
         pairs = [(index, index ^ mask) for mask in masks for index in range(self.rank_count)]
-        return self.round_plan(("block", tuple(sorted(block))), pairs, width, BLOCK_OPTIMIZER_ITERATIONS)
+        return self.round_plan(("block", tuple(sorted(block))), pairs, min(width, BLOCK_WIDTH_CAP),
+                               BLOCK_OPTIMIZER_ITERATIONS, quick=True)
+
+    def has_plan(self, block: list[int], width: int) -> bool:
+        if len(block) == 1:
+            return ("xor", block[0], width) in self._plans
+        return ("block", tuple(sorted(block)), min(width, BLOCK_WIDTH_CAP)) in self._plans
+
+    def warm_blocks(self, spans: list[tuple[int, int]], order: list[int], width: int, deadline: float | None) -> None:
+        """Compute multi-dimension block plans in the given priority order until the deadline."""
+
+        for start, end in spans:
+            if deadline is not None and perf_counter() >= deadline:
+                return
+            self.block_plan(order[start:end], width)
 
     def split_aware_round_us(self, plan: RoundPlan, units: int, chunk_bytes: int) -> float:
         """Integer round cost once path-bound transfers are split (see split_path_bound_transfers)."""
@@ -1106,8 +1167,8 @@ class Planner:
         single = (plan.path_overhead_us[active] + chunk_bytes * plan.path_per_byte_us[active]).max(initial=0.0)
         return float(max(single, overhead + float((loads * self.network.element_inv).max(initial=0.0))))
 
-    def allgather_blocks(self, config: dict[str, Any], max_block: int = MAX_BLOCK_DIMS
-                         ) -> tuple[list[list[int]], float, float]:
+    def allgather_blocks(self, config: dict[str, Any], max_block: int = MAX_BLOCK_DIMS,
+                         deadline: float | None = None) -> tuple[list[list[int]], float, float]:
         """Best partition of the AllGather order into consecutive blocks (dynamic programme).
 
         Keeps the configured dimension order (costliest first, smallest payload)
@@ -1119,6 +1180,11 @@ class Planner:
         order, width = config["order"], config["path_width"]
         chunk_bytes = self.data_size // config["split"]
         count = len(order)
+        # The last rounds carry the largest payloads, so their blocks are worth the most.
+        spans = sorted(((start, end) for start in range(count)
+                        for end in range(start + 2, min(count, start + max_block) + 1)),
+                       key=lambda span: (-span[0], span[1]))
+        self.warm_blocks(spans, order, width, deadline)
         best = [math.inf] * (count + 1)
         choice = [0] * (count + 1)
         best[0] = 0.0
@@ -1126,6 +1192,8 @@ class Planner:
         for start in range(count):
             units = config["split"] << start
             for end in range(start + 1, min(count, start + max_block) + 1):
+                if end > start + 1 and not self.has_plan(order[start:end], width):
+                    continue
                 cost = self.split_aware_round_us(self.block_plan(order[start:end], width), units, chunk_bytes)
                 if end == start + 1:
                     singles += cost
@@ -1227,8 +1295,8 @@ class Planner:
             owned = [sorted(set(owned[index]).union(*(owned[index ^ mask] for mask in masks))) for index in range(n)]
         return rounds
 
-    def allreduce_blocks(self, config: dict[str, Any], max_block: int = MAX_BLOCK_DIMS
-                         ) -> tuple[list[list[int]], list[list[int]], float, float]:
+    def allreduce_blocks(self, config: dict[str, Any], max_block: int = MAX_BLOCK_DIMS,
+                         deadline: float | None = None) -> tuple[list[list[int]], list[list[int]], float, float]:
         """Best rs_ag block partition: reduce-scatter blocks (priced with their mirrored
         all-gather round) and middle blocks, each by dynamic programme over the order.
 
@@ -1246,6 +1314,12 @@ class Planner:
         def mid_cost(start: int, end: int) -> float:
             return self.split_aware_round_us(self.block_plan(order[start:end], width), split >> h, chunk_bytes)
 
+        # Reduce-scatter blocks at the start carry the most data; middle blocks come next.
+        spans = [(start, end) for start in range(h) for end in range(start + 2, min(h, start + max_block) + 1)]
+        spans += [(start, end) for start in range(h, len(order))
+                  for end in range(start + 2, min(len(order), start + max_block) + 1)]
+        self.warm_blocks(spans, order, width, deadline)
+
         def partition(first: int, last: int, cost) -> tuple[list[list[int]], float, float]:
             best = {first: (0.0, first)}
             singles = 0.0
@@ -1253,6 +1327,8 @@ class Planner:
                 if start not in best:
                     continue
                 for end in range(start + 1, min(last, start + max_block) + 1):
+                    if end > start + 1 and not self.has_plan(order[start:end], width):
+                        continue
                     value = cost(start, end)
                     if end == start + 1:
                         singles += value
