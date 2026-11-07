@@ -1,4 +1,26 @@
-# AgentCC scheduling agent (0.2.8)
+# AgentCC scheduling agent (0.2.9y)
+
+Version names: `s` marks the team lead's versions (0.2.8s, previously plain
+"0.2.8") and `y` marks versions from the yzh branch (0.2.4y, 0.2.9y). The two
+lines have separate numbering, so 0.2.4s and 0.2.4y are different programs.
+
+## Changes in 0.2.9y: 3 s model cap
+
+0.2.9y is 0.2.8s with the two parts of 0.2.4y that the platform confirmed:
+
+- **Model cap 3 s instead of 6 s.** On the platform, 0.2.4y (3 s cap) scored
+  24.3/25 on solve time and 0.2.8s (6 s cap) scored 24.1. A late reply is dropped,
+  the agent's candidates are used, and a recovery is recorded.
+- **Evidence in the answer.** `answer.strategy` ends with `llm_ms` and the model
+  outcome, because the platform returns no logs.
+
+All 0.2.8s algorithms, gates and fallbacks are unchanged. In a container check
+(real SDK, mock model, 1 CPU / 1024 MiB / 256 pids, all 14 public cases over
+HTTP), Replay estimates were identical to 0.2.8s in every case. With a mock model
+answering in 5.5 s, the mean solve time fell from 5.89 s to 3.34 s. With a reply in
+1 s, it stayed at 1.39 s. `bench_local.py` repeats the in-process comparison.
+
+## 0.2.8s
 
 0.2.8 adds a resource-priced two-tree AllReduce candidate to 0.2.7's
 topology-derived logical rank orders, 0.2.6's overlapping model/search pipeline
@@ -287,7 +309,7 @@ The platform injects `PLATFORM_LLM_URL`, `PLATFORM_API_KEY` and
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `AGENT_LLM_BUDGET_SECONDS` | 6 | model call cap |
+| `AGENT_LLM_BUDGET_SECONDS` | 3 | model call cap |
 | `AGENT_MAX_OUTPUT_TOKENS` | 120 | model `max_tokens` |
 | `AGENTCC_SUM_NOTATION` | 1 | write complete-slot copies as `c{slot}_sum` |
 
