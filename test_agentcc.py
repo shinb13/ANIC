@@ -1101,6 +1101,22 @@ class AgentLoopTests(unittest.TestCase):
         emergency = evaluator.emergency()
         validate_answer(data["task"], data["topology"], emergency["_answer"])
 
+    def test_default_model_budget_is_three_seconds(self):
+        module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
+        self.assertEqual(module.DEFAULT_MODEL_BUDGET_SECONDS, 3.0)
+
+    def test_answer_records_model_outcome(self):
+        data = two_plane_input("all-reduce")
+        result, _, _ = self._run(['{"c":[["rs_ag",8,2,3]]}'], task_input=data)
+        self.assertIn("model=ok", result["answer"]["strategy"])
+        self.assertIn("llm_ms=", result["answer"]["strategy"])
+        late, audit, events = self._run(
+            [], task_input=data, delay=0.5, environment={"AGENT_LLM_BUDGET_SECONDS": "0.2"})
+        self.assertIn("model=model_timeout", late["answer"]["strategy"])
+        self.assertEqual(audit["model_error"], "model_timeout")
+        self.assertEqual(len(events["requests"]), 1)
+        validate_answer(data["task"], data["topology"], late["answer"])
+
     def test_sum_notation_switch(self):
         data = two_plane_input("all-reduce")
         _, audit_on, _ = self._run(['{"c":[]}'], task_input=data)

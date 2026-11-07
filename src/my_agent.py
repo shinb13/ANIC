@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.8).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.9y).
 
 Per request, every value comes from the current task and topology:
 
@@ -52,12 +52,15 @@ from agentcc_solver import (
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_MODEL_BUDGET_SECONDS = 6.0
+# 0.2.9y: 3 s instead of 6 s.  On the platform 0.2.4y (3 s cap) scored 24.3/25 on
+# solve time against 24.1 for 0.2.8s (6 s cap); a late reply is dropped and the
+# agent's own candidates are used, recorded as a recovery.
+DEFAULT_MODEL_BUDGET_SECONDS = 3.0
 DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.8"
+TOOL_VERSION = "2.9y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -679,6 +682,8 @@ class AgentCCAgent(BaseAgent):
                     + (f" mapping={config['mapping']}" if "mapping" in config else "")
                     + (f" first_tree_slots={config['first_tree_slots']}" if "first_tree_slots" in config else "")
                     + f" from {'+'.join(sorted(best['sources']))}"
+                    # The platform returns no logs, so the answer itself carries the evidence.
+                    + f" llm_ms={round(audit['llm_ms'])} model={parse_error or 'ok'}"
                 )
                 audit["solve_ms"] = round((perf_counter() - started) * 1000, 3)
                 LOGGER.info("agentcc.audit %s", _safe_json(audit))
