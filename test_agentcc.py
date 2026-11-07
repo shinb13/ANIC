@@ -1069,7 +1069,7 @@ class AgentLoopTests(unittest.TestCase):
                     "parse", "dimension_profiles", "seed_predictions", "portfolio_rank", "portfolio_build",
                     "model", "portfolio_join", "model_candidates", "select_validate", "refine_validate",
                     "mapping_generation", "mapping_prepare", "rank_mapping",
-                    "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate", "final_validate",
+                    "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate", "final_validate", "speculative_finalize",
                 })
 
     def test_initial_predictions_obey_current_task_constraints(self):
@@ -1307,6 +1307,17 @@ class AgentLoopTests(unittest.TestCase):
         self.assertTrue(module.mappable(reduce, {"algorithm": "rs_ag"}))
         self.assertFalse(module.mappable(reduce, {"algorithm": "doubling"}))
         self.assertFalse(module.mappable(reduce, {"algorithm": "tree"}))
+
+    def test_speculative_result_is_reused_only_without_model_choices(self):
+        task, topology = public_case("uneven_pods", "ar")
+        data = {"task": task, "topology": topology}
+        reused, audit, _ = self._run(['{"c":[]}'], task_input=data)
+        self.assertTrue(audit["speculative_reuse"])
+        validate_answer(task, topology, reused["answer"])
+        rerun, audit_m, _ = self._run(['{"c":[],"m":0}'], task_input=data)
+        self.assertFalse(audit_m["speculative_reuse"])
+        self.assertEqual(audit_m["rank_mapping"]["reason"], "model_kept_original")
+        validate_answer(task, topology, rerun["answer"])
 
     def test_default_model_budget_is_three_seconds(self):
         module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})

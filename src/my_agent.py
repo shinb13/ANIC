@@ -341,6 +341,7 @@ class Evaluator:
         self.prepared_mapping: dict[str, Any] | None = None
         self.prepared_tree: dict[str, Any] = {"reason": "ineligible"}
         self.prepared_blocks: dict[tuple[int, int], dict[str, Any]] = {}
+        self.speculative: dict[str, Any] | None = None
 
     def evaluate(self, raw: Any, source: str, parent_llm_call_id: str | None = None) -> dict[str, Any]:
         try:
@@ -448,6 +449,64 @@ class Evaluator:
         self.timings_ms["blocks_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
         return rows, ranked
 
+    def speculate(self) -> None:
+        """0.2.15y: finish the agent's own pick while the model is still thinking.
+
+        After the reply this result is reused only if the model neither changed the
+        pick nor gave a mapping or tree choice; otherwise the pipeline runs again with
+        the model's input, so the model's decisions keep their own evidence.
+        """
+
+        started = perf_counter()
+        if any(row.get("status") == "built" for row in self.results.values()):
+            try:
+                selected = self.select()
+                self.speculative = {"selected": selected, "result": self.finalize(selected, None, None, None)}
+            except Exception as exc:  # noqa: BLE001 - the regular path still runs after the reply
+                self.speculative = {"error": f"{type(exc).__name__}: {exc}"}
+        self.timings_ms["speculative_finalize"] = round((perf_counter() - started) * 1000, 3)
+
+    def portfolio_and_speculate(self) -> tuple[list[dict[str, Any]], list]:
+        result = self.run_portfolio()
+        self.speculate()
+        return result
+
+    def finalize(self, best: dict[str, Any], mapping_choice: int | None, tree_choice: int | None,
+                 call_id: str | None) -> tuple[dict[str, Any], dict[str, Any], dict[str, float]]:
+        """Mapping, blocks, route refinement, dual tree and transfer split for one pick."""
+
+        details: dict[str, Any] = {}
+        timings: dict[str, float] = {}
+        started = perf_counter()
+        best, details["rank_mapping"] = self.remap(best, mapping_choice, call_id)
+        timings["rank_mapping"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        try:
+            best, details["allgather_blocks"] = self.try_blocks(best, call_id)
+        except Exception as exc:  # noqa: BLE001 - the plain schedule is already valid
+            details["allgather_blocks"] = {"error": f"{type(exc).__name__}: {exc}"}
+        timings["blocks_validate"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        best, details["route_refinement"] = self.refine(best, call_id)
+        timings["refine_validate"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        best, details["dual_tree"] = self.try_dual_tree(best, tree_choice, call_id)
+        timings["dual_tree_validate"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        try:
+            best, details["transfer_split"] = self.split_transfers(best, call_id)
+        except Exception as exc:  # noqa: BLE001 - the unsplit schedule is already valid
+            details["transfer_split"] = {"error": f"{type(exc).__name__}: {exc}"}
+        timings["transfer_split"] = round((perf_counter() - started) * 1000, 3)
+        return best, details, timings
+
+    def reusable(self, selected: dict[str, Any], mapping_choice: int | None, tree_choice: int | None) -> bool:
+        """The speculative result stands only when the reply left every agent choice to the agent."""
+
+        spec = self.speculative
+        return (bool(spec) and "result" in spec and spec["selected"] is selected
+                and mapping_choice is None and tree_choice is None)
+
     def prepare_blocks(self, planner: Planner, config: dict[str, Any]) -> dict[str, Any]:
         """Block search at the config's width first, then wider widths while the budget lasts."""
 
@@ -530,6 +589,10 @@ class Evaluator:
         """Validate built candidates in score order; return the first that passes."""
 
         for row in sorted(self.results.values(), key=lambda item: item["score"]):
+            if row.get("status") == "valid":
+                return row
+            if row.get("status") == "invalid":
+                continue
             try:
                 validate_answer(self.planner.task, self.planner.topology, row["_answer"], self.planner.network.raw)
             except Exception as exc:  # noqa: BLE001
@@ -735,7 +798,7 @@ class AgentCCAgent(BaseAgent):
             evaluator = Evaluator(planner)
             with state("tool_execution"):
                 # One worker owns planning caches until the portfolio has completed.
-                portfolio = asyncio.ensure_future(asyncio.to_thread(evaluator.run_portfolio))
+                portfolio = asyncio.ensure_future(asyncio.to_thread(evaluator.portfolio_and_speculate))
             with state("reasoning"):
                 llm_started = perf_counter()
                 audit["llm_started_ms"] = round((llm_started - started) * 1000, 3)
@@ -781,27 +844,16 @@ class AgentCCAgent(BaseAgent):
                     best = await asyncio.to_thread(evaluator.emergency)
                 timings["select_validate"] = round((perf_counter() - phase_started) * 1000, 3)
                 validated = best  # select() and emergency() return a fully validated answer
-                phase_started = perf_counter()
-                best, audit["rank_mapping"] = await asyncio.to_thread(evaluator.remap, best, mapping_choice, call_id)
-                timings["rank_mapping"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                try:
-                    best, audit["allgather_blocks"] = await asyncio.to_thread(evaluator.try_blocks, best, call_id)
-                except Exception as exc:  # noqa: BLE001 - the plain schedule is already valid
-                    audit["allgather_blocks"] = {"error": f"{type(exc).__name__}: {exc}"}
-                timings["blocks_validate"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                best, audit["route_refinement"] = await asyncio.to_thread(evaluator.refine, best, call_id)
-                timings["refine_validate"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                best, audit["dual_tree"] = await asyncio.to_thread(evaluator.try_dual_tree, best, tree_choice, call_id)
-                timings["dual_tree_validate"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                try:
-                    best, audit["transfer_split"] = await asyncio.to_thread(evaluator.split_transfers, best, call_id)
-                except Exception as exc:  # noqa: BLE001 - the unsplit schedule is already valid
-                    audit["transfer_split"] = {"error": f"{type(exc).__name__}: {exc}"}
-                timings["transfer_split"] = round((perf_counter() - phase_started) * 1000, 3)
+                if evaluator.reusable(best, mapping_choice, tree_choice):
+                    best, details, steps = evaluator.speculative["result"]
+                    audit["speculative_reuse"] = True
+                    steps = {key: 0.0 for key in steps}
+                else:
+                    best, details, steps = await asyncio.to_thread(
+                        evaluator.finalize, best, mapping_choice, tree_choice, call_id)
+                    audit["speculative_reuse"] = False
+                audit.update(details)
+                timings.update(steps)
                 audit["agent_candidates"] = [Evaluator.public(row) for row in portfolio_rows]
                 audit["model_candidates"] = [Evaluator.public(row) for row in model_rows]
                 audit["selected"] = {
