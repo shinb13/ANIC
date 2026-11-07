@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.12y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.13y).
 
 Per request, every value comes from the current task and topology:
 
@@ -61,7 +61,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.12y"
+TOOL_VERSION = "2.13y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -310,6 +310,14 @@ async def ask_model(messages: list[dict[str, str]], timeout_seconds: float, max_
     return content, metadata, call_id, None
 
 
+def blockable(planner: Planner, config: dict[str, Any]) -> bool:
+    """Schedules whose XOR dimensions can share rounds (0.2.12y AllGather, 0.2.13y rs_ag)."""
+
+    if config["algorithm"] == "rs_ag":
+        return config.get("rs_blocks") is None
+    return planner.operator == "all-gather" and config["algorithm"] == "doubling" and not config.get("blocks")
+
+
 def mappable(planner: Planner, config: dict[str, Any]) -> bool:
     """Schedules whose XOR dimensions can be re-paired by a logical rank order (0.2.11y adds AllGather)."""
 
@@ -429,10 +437,10 @@ class Evaluator:
                 call.result(self.public(self.prepared_tree))
         self.timings_ms["tree_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
         prepare_started = perf_counter()
-        if built and self.planner.operator == "all-gather":
+        if built:
             best = min(self.results.values(), key=lambda row: row["score"])
-            if best["config"]["algorithm"] == "doubling":
-                with tool_call("prepare_allgather_blocks", "function", arguments={"config": best["config"]},
+            if blockable(self.planner, best["config"]):
+                with tool_call("prepare_dimension_blocks", "function", arguments={"config": best["config"]},
                                tool_version=TOOL_VERSION) as call:
                     call.result(self.prepare_blocks(self.planner, best["config"]))
         self.timings_ms["blocks_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
@@ -446,29 +454,36 @@ class Evaluator:
             :BLOCK_EXTRA_WIDTHS]
         done = []
         for width in widths:
-            key = (id(planner), width)
+            key = (id(planner), width, config.get("rs_dims", 0))
             if key not in self.prepared_blocks:
                 if perf_counter() >= deadline:
                     break
                 started = perf_counter()
-                raw = {"algorithm": "doubling", "split": config["split"], "path_width": width}
-                base = planner.normalize_config(raw)
-                blocks, predicted, singles = planner.allgather_blocks(base)
-                self.prepared_blocks[key] = {"width": width, "blocks": blocks, "predicted_us": predicted,
+                raw = {"algorithm": config["algorithm"], "split": config["split"], "path_width": width}
+                if config["algorithm"] == "rs_ag":
+                    raw["rs_dims"] = config["rs_dims"]
+                    base = planner.normalize_config(raw)
+                    rs_blocks, mid_blocks, predicted, singles = planner.allreduce_blocks(base)
+                    fields = {"rs_blocks": rs_blocks, "mid_blocks": mid_blocks}
+                else:
+                    base = planner.normalize_config(raw)
+                    blocks, predicted, singles = planner.allgather_blocks(base)
+                    fields = {"blocks": blocks}
+                self.prepared_blocks[key] = {"width": width, **fields, "predicted_us": predicted,
                                              "single_dims_us": singles,
                                              "elapsed_ms": round((perf_counter() - started) * 1000, 3)}
             done.append(self.prepared_blocks[key])
         return {"options": done}
 
     def try_blocks(self, best: dict[str, Any], call_id: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Adopt the best AllGather block partition only if it is validated and cheaper once split."""
+        """Adopt the best block partition only if it is validated and cheaper once split."""
 
         planner = best["_planner"]
         info: dict[str, Any] = {"adopted": False, "before_us": best["estimate_us"]}
-        if planner.operator != "all-gather" or best["config"]["algorithm"] != "doubling" or best["config"].get("blocks"):
-            info["reason"] = "not_allgather_doubling"
+        if not blockable(planner, best["config"]):
+            info["reason"] = "not_blockable"
             return best, info
-        with tool_call("search_allgather_blocks", "function", arguments={"config": best["config"]},
+        with tool_call("search_dimension_blocks", "function", arguments={"config": best["config"]},
                        tool_version=TOOL_VERSION, parent_llm_call_id=call_id) as call:
             options = self.prepare_blocks(planner, best["config"])["options"]
             baseline = next((row["single_dims_us"] for row in options if row["width"] == best["config"]["path_width"]),
@@ -480,8 +495,9 @@ class Evaluator:
             elif option["predicted_us"] > baseline * 0.97:
                 info["reason"] = "integer_replay_screen"
             else:
-                raw = {"algorithm": "doubling", "split": best["config"]["split"], "path_width": option["width"],
-                       "blocks": option["blocks"]}
+                raw = {"algorithm": best["config"]["algorithm"], "split": best["config"]["split"],
+                       "path_width": option["width"],
+                       **{key: option[key] for key in ("blocks", "rs_blocks", "mid_blocks") if key in option}}
                 config = planner.normalize_config(raw)
                 # Split-aware integer predictions equal the split Replay estimate, so the
                 # comparison needs no extra builds; the final split pass applies the split.
@@ -810,6 +826,8 @@ class AgentCCAgent(BaseAgent):
                     + (f" mapping={config['mapping']}" if "mapping" in config else "")
                     + (f" first_tree_slots={config['first_tree_slots']}" if "first_tree_slots" in config else "")
                     + (f" blocks={config['blocks']}" if "blocks" in config else "")
+                    + (f" rs_blocks={config['rs_blocks']} mid_blocks={config['mid_blocks']}"
+                       if "rs_blocks" in config else "")
                     + f" from {'+'.join(sorted(best['sources']))}"
                     # The platform returns no logs, so the answer itself carries the evidence.
                     + f" llm_ms={round(audit['llm_ms'])} model={parse_error or 'ok'}"

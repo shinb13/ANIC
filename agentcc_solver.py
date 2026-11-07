@@ -741,6 +741,8 @@ class Planner:
     def round_count(self, config: dict[str, Any]) -> int:
         dims = len(self.steps)
         if config["algorithm"] == "rs_ag":
+            if config.get("rs_blocks") is not None:
+                return 2 * len(config["rs_blocks"]) + len(config["mid_blocks"])
             return 2 * config["rs_dims"] + dims - config["rs_dims"]
         if config["algorithm"] == "tree":
             return 2 * dims
@@ -814,6 +816,26 @@ class Planner:
             config["blocks"] = [[int(step) for step in block] for block in blocks]
             config["order"] = [step for block in config["blocks"] for step in block]
             config["order_source"] = "blocks"
+        rs_blocks, mid_blocks = raw.get("rs_blocks"), raw.get("mid_blocks")
+        if rs_blocks is not None or mid_blocks is not None:
+            if algorithm != "rs_ag":
+                raise AgentCCError("rs_blocks and mid_blocks apply to rs_ag only")
+            for name, value in (("rs_blocks", rs_blocks), ("mid_blocks", mid_blocks)):
+                if (not isinstance(value, list)
+                        or any(not isinstance(block, list) or not 1 <= len(block) <= MAX_BLOCK_DIMS for block in value)
+                        or any(isinstance(step, bool) or not isinstance(step, int) for block in value for step in block)):
+                    raise AgentCCError(f"{name} must be a list of lists of 1-{MAX_BLOCK_DIMS} steps")
+            rs_order = [int(step) for block in rs_blocks for step in block]
+            mid_order = [int(step) for block in mid_blocks for step in block]
+            if sorted(rs_order + mid_order) != self.steps or not rs_order:
+                raise AgentCCError(f"rs_blocks and mid_blocks must together partition {self.steps}")
+            if len(rs_order) > split.bit_length() - 1:
+                raise AgentCCError(f"rs_blocks cover more dimensions than split {split} can halve")
+            config["rs_blocks"] = [[int(step) for step in block] for block in rs_blocks]
+            config["mid_blocks"] = [[int(step) for step in block] for block in mid_blocks]
+            config["rs_dims"] = len(rs_order)
+            config["order"] = rs_order + mid_order
+            config["order_source"] = "blocks"
         rounds = self.round_count(config)
         if rounds > self.max_rounds:
             raise AgentCCError(
@@ -842,6 +864,25 @@ class Planner:
                 group = n if action == "copy" else 1 << index
                 specs.append({"plan": plan, "pairs": len(pairs), "chunks": split, "group": group,
                               "complete": action == "copy"})
+            return specs
+        if config["algorithm"] == "rs_ag" and config.get("rs_blocks") is not None:
+            prior, ag_specs = 0, []
+            for index, block in enumerate(config["rs_blocks"]):
+                plan = self.block_plan(block, self.round_width(config, index))
+                specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": split >> (prior + len(block)),
+                              "group": 1 << prior, "complete": False})
+                ag_specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": split >> (prior + len(block)),
+                                 "group": n, "complete": True})
+                prior += len(block)
+            for block in config["mid_blocks"]:
+                plan = self.block_plan(block, self.round_width(config, len(specs)))
+                specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": split >> config["rs_dims"],
+                              "group": 1 << prior, "complete": False})
+                prior += len(block)
+            for offset, spec in enumerate(reversed(ag_specs)):
+                plan = self.block_plan(config["rs_blocks"][len(ag_specs) - 1 - offset],
+                                       self.round_width(config, len(specs)))
+                specs.append({**spec, "plan": plan})
             return specs
         if self.operator == "all-gather" and config.get("blocks"):
             held = split
@@ -899,6 +940,8 @@ class Planner:
                 self._allocation_keys[key] = allocation_key
             rounds.append(allocation_key)
         blocks = tuple(tuple(block) for block in config.get("blocks") or ())
+        blocks += tuple(("rs",) + tuple(block) for block in config.get("rs_blocks") or ())
+        blocks += tuple(("mid",) + tuple(block) for block in config.get("mid_blocks") or ())
         return (self.operator, config["algorithm"], config["split"], config.get("rs_dims"),
                 self.rank_order, tuple(config["order"]), blocks, tuple(rounds))
 
@@ -908,8 +951,8 @@ class Planner:
         try:
             if not isinstance(raw, dict):
                 return None
-            clean = {key: raw[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths", "blocks")
-                     if key in raw}
+            clean = {key: raw[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths", "blocks",
+                                               "rs_blocks", "mid_blocks") if key in raw}
             return self.normalize_config(clean)
         except (AgentCCError, TypeError, AttributeError):
             return None
@@ -1128,7 +1171,108 @@ class Planner:
             groups = [tuple(sorted(groups[index] + groups[index ^ step])) for index in range(self.rank_count)]
         return rounds
 
+    def _build_rs_ag_blocks(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        """rs_ag with blocks: a block of b dimensions per round in each phase.
+
+        Reduce-scatter block: a rank keeps the 1/2^b of its slots picked by its
+        block coordinate and sends every partner the part that partner keeps;
+        the 2^b - 1 contributions to a slot have disjoint contributor sets.
+        Middle block: block members send each other their owned partial sums.
+        All-gather blocks mirror the reduce-scatter blocks with complete copies.
+        """
+
+        split, n = config["split"], self.rank_count
+        expression = self._expression_cache(split)
+        complete = tuple(range(n))
+        groups = [(index,) for index in range(n)]
+        owned = [list(range(split)) for _ in range(n)]
+        rounds = []
+
+        def coordinate(index: int, block: list[int]) -> int:
+            return sum(1 << bit for bit, step in enumerate(block) if index & step)
+
+        for block in config["rs_blocks"]:
+            masks = block_masks(block)
+            parts = 1 << len(block)
+            keep = []
+            for index in range(n):
+                size = len(owned[index]) // parts
+                start = coordinate(index, block) * size
+                keep.append(owned[index][start:start + size])
+            pairs = [(index, index ^ mask) for mask in masks for index in range(n)]
+            plan = self.block_plan(block, self.round_width(config, len(rounds)))
+            current = groups
+            rounds.append(self._emit(plan, pairs, [keep[dst] for _, dst in pairs], "reduce",
+                                     lambda src, piece, current=current: [expression(current[src], s) for s in piece]))
+            owned = keep
+            groups = [tuple(sorted(set(groups[index]).union(*(groups[index ^ mask] for mask in masks))))
+                      for index in range(n)]
+        for block in config["mid_blocks"]:
+            masks = block_masks(block)
+            pairs = [(index, index ^ mask) for mask in masks for index in range(n)]
+            plan = self.block_plan(block, self.round_width(config, len(rounds)))
+            current = groups
+            rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "reduce",
+                                     lambda src, piece, current=current: [expression(current[src], s) for s in piece]))
+            groups = [tuple(sorted(set(groups[index]).union(*(groups[index ^ mask] for mask in masks))))
+                      for index in range(n)]
+        if any(group != complete for group in groups):
+            raise AgentCCError("reduce phase did not cover every contributor")
+        for block in reversed(config["rs_blocks"]):
+            masks = block_masks(block)
+            pairs = [(index, index ^ mask) for mask in masks for index in range(n)]
+            plan = self.block_plan(block, self.round_width(config, len(rounds)))
+            rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
+                                     lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
+            owned = [sorted(set(owned[index]).union(*(owned[index ^ mask] for mask in masks))) for index in range(n)]
+        return rounds
+
+    def allreduce_blocks(self, config: dict[str, Any], max_block: int = MAX_BLOCK_DIMS
+                         ) -> tuple[list[list[int]], list[list[int]], float, float]:
+        """Best rs_ag block partition: reduce-scatter blocks (priced with their mirrored
+        all-gather round) and middle blocks, each by dynamic programme over the order.
+
+        Returns (rs_blocks, mid_blocks, predicted us, predicted us with one dimension per round).
+        """
+
+        order, width, split, h = config["order"], config["path_width"], config["split"], config["rs_dims"]
+        chunk_bytes = self.data_size // split
+
+        def rs_cost(start: int, end: int) -> float:
+            plan = self.block_plan(order[start:end], width)
+            units = split >> end
+            return 2 * self.split_aware_round_us(plan, units, chunk_bytes) if units else math.inf
+
+        def mid_cost(start: int, end: int) -> float:
+            return self.split_aware_round_us(self.block_plan(order[start:end], width), split >> h, chunk_bytes)
+
+        def partition(first: int, last: int, cost) -> tuple[list[list[int]], float, float]:
+            best = {first: (0.0, first)}
+            singles = 0.0
+            for start in range(first, last):
+                if start not in best:
+                    continue
+                for end in range(start + 1, min(last, start + max_block) + 1):
+                    value = cost(start, end)
+                    if end == start + 1:
+                        singles += value
+                    total = best[start][0] + value
+                    if end not in best or total < best[end][0]:
+                        best[end] = (total, start)
+            blocks, end = [], last
+            while end != first:
+                start = best[end][1]
+                blocks.append(order[start:end])
+                end = start
+            return blocks[::-1], best[last][0], singles
+
+        rs_blocks, rs_us, rs_singles = partition(0, h, rs_cost)
+        mid_blocks, mid_us, mid_singles = partition(h, len(order), mid_cost)
+        return rs_blocks, mid_blocks, rs_us + mid_us, rs_singles + mid_singles
+
     def _build_rs_ag(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        if config.get("rs_blocks") is not None:
+            return self._build_rs_ag_blocks(config)
         split, h = config["split"], config["rs_dims"]
         order = config["order"]
         expression = self._expression_cache(split)

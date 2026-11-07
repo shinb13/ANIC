@@ -627,6 +627,51 @@ class AllGatherBlockTests(unittest.TestCase):
         self.assertAlmostEqual(replay_estimate(task, topology, split, planner.network.raw)["total_us"], predicted, places=3)
 
 
+class AllReduceBlockTests(unittest.TestCase):
+    def test_rs_ag_blocks_validate_and_match_prediction(self):
+        data = two_plane_input("all-reduce", ranks=8)
+        for short in (False, True):
+            planner = Planner(data["task"], data["topology"], sum_notation=short)
+            for rs_blocks, mid_blocks in (([[1, 2, 4]], []), ([[1, 2]], [[4]]), ([[1]], [[2, 4]]), ([[4], [2]], [[1]])):
+                with self.subTest(sum_notation=short, rs=rs_blocks, mid=mid_blocks):
+                    config = planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 2,
+                                                       "rs_blocks": rs_blocks, "mid_blocks": mid_blocks})
+                    answer = planner.build(config)
+                    validate_answer(data["task"], data["topology"], answer)
+                    self.assertEqual(answer["round_count"], 2 * len(rs_blocks) + len(mid_blocks))
+                    actual = replay_estimate(data["task"], data["topology"], answer)["total_us"]
+                    self.assertAlmostEqual(planner.predict(config)["us"], actual, places=6)
+
+    def test_bad_rs_ag_blocks_are_rejected(self):
+        data = two_plane_input("all-reduce", ranks=8)
+        planner = Planner(data["task"], data["topology"])
+        for rs_blocks, mid_blocks, split in (([[1, 2, 4]], [], 4), ([[1, 2]], [[2, 4]], 8), ([], [[1, 2, 4]], 8),
+                                             ([[1, 2]], [[4, 4]], 8), ("x", [], 8)):
+            with self.subTest(rs=rs_blocks, mid=mid_blocks, split=split), self.assertRaises(AgentCCError):
+                planner.normalize_config({"algorithm": "rs_ag", "split": split, "path_width": 1,
+                                          "rs_blocks": rs_blocks, "mid_blocks": mid_blocks})
+        with self.assertRaises(AgentCCError):
+            planner.normalize_config({"algorithm": "tree", "split": 8, "path_width": 1,
+                                      "rs_blocks": [[1]], "mid_blocks": [[2, 4]]})
+
+    def test_block_search_and_public_mesh2d_gain(self):
+        task, topology = public_case("mesh2d", "ar")
+        planner = Planner(task, topology, sum_notation=True)
+        config = planner.normalize_config({"algorithm": "rs_ag", "split": 16, "path_width": 16, "rs_dims": 4})
+        rs_blocks, mid_blocks, predicted, singles = planner.allreduce_blocks(config)
+        self.assertEqual([s for block in rs_blocks + mid_blocks for s in block], config["order"])
+        self.assertLess(predicted, 0.8 * singles)
+        blocked = planner.normalize_config({"algorithm": "rs_ag", "split": 16, "path_width": 16,
+                                            "rs_blocks": rs_blocks, "mid_blocks": mid_blocks})
+        split, _ = split_path_bound_transfers(planner.network, planner.build(blocked), planner.data_size // 16)
+        validate_answer(task, topology, split, planner.network.raw)
+        self.assertAlmostEqual(replay_estimate(task, topology, split, planner.network.raw)["total_us"], predicted,
+                               places=3)
+        plain, _ = split_path_bound_transfers(planner.network, planner.build(config), planner.data_size // 16)
+        self.assertAlmostEqual(replay_estimate(task, topology, plain, planner.network.raw)["total_us"], singles,
+                               places=3)
+
+
 class TransferSplitTests(unittest.TestCase):
     @staticmethod
     def _loads(answer, planner):
@@ -1213,7 +1258,9 @@ class AgentLoopTests(unittest.TestCase):
             result, audit, events = self._run([], **kwargs)
             with self.subTest(reason=reason):
                 self.assertEqual(audit["model_error"], reason)
-                self.assertEqual(audit["selected"]["sources"], ["agent"])
+                # Agent-side steps (e.g. agent_blocks) may refine the pick; no model source may appear.
+                self.assertIn("agent", audit["selected"]["sources"])
+                self.assertFalse([s for s in audit["selected"]["sources"] if s.startswith("model")])
                 self.assertIn("use_agent_portfolio", events["recovery"])
                 data = two_plane_input("all-reduce")
                 validate_answer(data["task"], data["topology"], result["answer"])
