@@ -384,6 +384,20 @@ def strategy_code(reply: str) -> str:
 
 
 class RankMappingTests(unittest.TestCase):
+    def test_allgather_mapping_candidates_and_mapped_build(self):
+        task, topology = public_case("uneven_pods", "ag")
+        planner = Planner(task, topology, sum_notation=True)
+        config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 2})
+        candidates = planner.mapping_candidates(config)
+        self.assertEqual({item["mapping"] for item in candidates}, {"locality", "resource"})
+        best = max((item for item in candidates if item["reachable"]), key=lambda item: item["proxy_gain"])
+        self.assertGreater(best["proxy_gain"], 0)
+        mapped = planner.with_rank_order(best["rank_order"])
+        answer = mapped.build(mapped.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 2}))
+        validate_answer(task, topology, answer, planner.network.raw)
+        baseline = replay_estimate(task, topology, planner.build(config), planner.network.raw)["total_us"]
+        self.assertLess(replay_estimate(task, topology, answer, planner.network.raw)["total_us"], baseline)
+
     def test_logical_order_preserves_physical_data_and_round_semantics(self):
         order = [0, 2, 4, 7, 1, 6, 3, 5]
         configurations = [
@@ -1170,6 +1184,15 @@ class AgentLoopTests(unittest.TestCase):
             evaluator.select()
         emergency = evaluator.emergency()
         validate_answer(data["task"], data["topology"], emergency["_answer"])
+
+    def test_mappable_schedules(self):
+        module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
+        gather = module.Planner(**{k: v for k, v in zip(("task", "topology"), two_plane_input("all-gather").values())})
+        reduce = module.Planner(**{k: v for k, v in zip(("task", "topology"), two_plane_input("all-reduce").values())})
+        self.assertTrue(module.mappable(gather, {"algorithm": "doubling"}))
+        self.assertTrue(module.mappable(reduce, {"algorithm": "rs_ag"}))
+        self.assertFalse(module.mappable(reduce, {"algorithm": "doubling"}))
+        self.assertFalse(module.mappable(reduce, {"algorithm": "tree"}))
 
     def test_default_model_budget_is_three_seconds(self):
         module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})

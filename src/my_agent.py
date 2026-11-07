@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.10y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.11y).
 
 Per request, every value comes from the current task and topology:
 
@@ -61,7 +61,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.10y"
+TOOL_VERSION = "2.11y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -75,7 +75,7 @@ SYSTEM_PROMPT = (
     "all-gather; ~2x data instead of 8x; response MB grows with split), 'tree' (tiny response, "
     "more rounds), 'doubling'. width = parallel switch paths per pair. "
     'Reply JSON only: {"c":[[algorithm,split,width,rs_dims],...],"m":2,"t":1} (rs_dims 0 unless rs_ag). '
-    "Optional m controls remapping the best rs_ag candidate: 0 original, 1 locality, 2 resource-aware; "
+    "Optional m controls remapping the best rs_ag or all-gather candidate: 0 original, 1 locality, 2 resource-aware; "
     "omit for agent choice. Mapping path-work gains are rough screening, not Replay times. "
     "Optional t controls a separate two-tree AllReduce trial: 0 disable, 1 split slots equally, "
     "2 first tree gets 1/4, 3 first gets 3/4; omit for agent choice. Both are four-way trees "
@@ -306,6 +306,12 @@ async def ask_model(messages: list[dict[str, str]], timeout_seconds: float, max_
     return content, metadata, call_id, None
 
 
+def mappable(planner: Planner, config: dict[str, Any]) -> bool:
+    """Schedules whose XOR dimensions can be re-paired by a logical rank order (0.2.11y adds AllGather)."""
+
+    return config["algorithm"] == "rs_ag" or (planner.operator == "all-gather" and config["algorithm"] == "doubling")
+
+
 def _public_config(config: dict[str, Any]) -> dict[str, Any]:
     return {key: config[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths") if key in config}
 
@@ -401,7 +407,7 @@ class Evaluator:
         prepare_started = perf_counter()
         if built:
             best = min(self.results.values(), key=lambda row: row["score"])
-            if best["config"]["algorithm"] == "rs_ag":
+            if mappable(self.planner, best["config"]):
                 with tool_call("prepare_rank_mapping", "function", arguments={"config": best["config"]},
                                tool_version=TOOL_VERSION) as call:
                     self.prepared_mapping = self.public(self.mapping_trial(best["config"], None))
@@ -475,8 +481,8 @@ class Evaluator:
     def remap(self, best: dict[str, Any], choice: int | None, call_id: str | None
               ) -> tuple[dict[str, Any], dict[str, Any]]:
         info: dict[str, Any] = {"model_choice": choice, "adopted": False, "before_us": best["estimate_us"]}
-        if best["config"]["algorithm"] != "rs_ag" or choice == 0:
-            info["reason"] = "not_rs_ag" if best["config"]["algorithm"] != "rs_ag" else "model_kept_original"
+        if not mappable(self.planner, best["config"]) or choice == 0:
+            info["reason"] = "not_mappable" if not mappable(self.planner, best["config"]) else "model_kept_original"
             return best, info
         started = perf_counter()
         with tool_call(
@@ -622,7 +628,7 @@ class AgentCCAgent(BaseAgent):
                 seeds = await asyncio.to_thread(rank_portfolio, planner, seed_raws)
                 timings["seed_predictions"] = round((perf_counter() - phase_started) * 1000, 3)
                 phase_started = perf_counter()
-                rs_seed = next((config for _, config, _ in seeds if config["algorithm"] == "rs_ag"), None)
+                rs_seed = next((config for _, config, _ in seeds if mappable(planner, config)), None)
                 mappings = await asyncio.to_thread(planner.mapping_candidates, rs_seed) if rs_seed is not None else []
                 timings["mapping_generation"] = round((perf_counter() - phase_started) * 1000, 3)
                 prompt = build_prompt(planner, profiles, seeds, mappings)

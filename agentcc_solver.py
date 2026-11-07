@@ -651,8 +651,13 @@ class Planner:
 
         if self._rank_orders is None:
             self._rank_orders = self.network.rank_orders()
-        split, h = config["split"], config["rs_dims"]
-        weights = [split >> position for position in range(h)] + [split >> h] * (len(self.steps) - h)
+        if config["algorithm"] == "doubling" and self.operator == "all-gather":
+            # 0.2.11y: AllGather payload doubles every round and the agent puts the
+            # costliest dimension first, so the cheapest dimension carries the most.
+            weights = [1 << position for position in reversed(range(len(self.steps)))]
+        else:
+            split, h = config["split"], config["rs_dims"]
+            weights = [split >> position for position in range(h)] + [split >> h] * (len(self.steps) - h)
         candidates = []
         for name, info in self._rank_orders.items():
             original = sorted(info["original_mean"])
