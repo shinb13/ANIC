@@ -161,6 +161,24 @@ image, and called `solve` directly rather than over HTTP. Figures are medians of
 These figures do not include the real model, the real SDK or platform transfer
 time. To repeat them, run `python bench_local.py --help`.
 
+### Container HTTP check (real SDK, mock model)
+
+Both images were built on `agenthack/base:1.1.1` (SDK 1.1.1, Python 3.11.16,
+numpy 1.26.4) from the committed source. `local_test.py` sent all 14 cases over
+HTTP under 1 CPU / 1024 MiB / 256 pids. An OpenAI-compatible mock model answered
+after a fixed delay.
+
+| Mock model delay | 0.2.3 per case | 0.2.4 per case | Valid | Peak memory |
+| ---: | ---: | ---: | --- | ---: |
+| 1 s | 1.1–1.7 s | 1.1–1.6 s | 14/14 both | 139 / 177 MiB |
+| 5.5 s | 5.6–6.2 s | 3.1–3.6 s | 14/14 both | 142 / 131 MiB |
+
+The SDK recorded one model call per case. When 0.2.4 timed out at 3 s, the call
+was recorded with 0 tokens. Replay estimates were the same in both images.
+
+The delivered image is `yzh-agentcc-opt-01.tar` (`team-001-agent:0.2.4`). Its
+checksum is in [yzh-agentcc-opt-01.tar.sha256](yzh-agentcc-opt-01.tar.sha256).
+
 The local validator accepts `c{slot}_sum` only as the complete set of
 contributors for that slot. A copy of an incomplete slot written this way is
 rejected.
