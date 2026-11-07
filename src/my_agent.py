@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.15y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.16y).
 
 Per request, every value comes from the current task and topology:
 
@@ -61,11 +61,12 @@ DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.15y"
+TOOL_VERSION = "2.16y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
 SIZE_WEIGHT = 0.10
+PROFILE_MIB = 1 << 20
 # 0.2.12y: wall-clock budget for the AllGather block search (dynamic programme per width).
 # 0.2.14y: the platform ran the 0.2.12y search about 5x slower than local tests,
 # so the budget is a hard deadline checked between block plans.
@@ -178,7 +179,19 @@ def rank_portfolio(
     return ranked
 
 
-def build_prompt(planner: Planner, profiles: list[dict[str, Any]], seeds: list, mappings: list) -> str:
+def path_work_dims(planner: Planner) -> list[list[Any]]:
+    """Per XOR dimension: mean shortest-path work per MiB, priced with shared resources.
+
+    0.2.16y: these come from the rank cost matrix that rank mapping computes anyway,
+    so the model request needs no route generation.
+    """
+
+    info = planner.network_rank_orders()["resource"]
+    return [[step, round(cost * PROFILE_MIB, 1), "path_work_estimate"]
+            for step, cost in zip(planner.steps, info["original_mean"])]
+
+
+def build_prompt(planner: Planner, dims: list[list[Any]], mappings: list) -> str:
     network = planner.network
     capacity = network.raw[0]
     algorithms = list(ALGORITHMS[planner.operator])
@@ -194,7 +207,7 @@ def build_prompt(planner: Planner, profiles: list[dict[str, Any]], seeds: list, 
         "max_rounds": planner.max_rounds,
         "algorithms": algorithms,
         "max_width": MAX_PATH_WIDTH,
-        "prediction_scope": "initial_single_path_seeds",
+        "dims_scope": "mean shortest-path work per MiB with shared-resource prices, before routing",
         "links": {
             "directed": network.edge_count,
             "one_way": sum((dst, src) not in capacity for src, dst in capacity),
@@ -203,10 +216,7 @@ def build_prompt(planner: Planner, profiles: list[dict[str, Any]], seeds: list, 
             "GBps_range": [float(network.edge_capacity.min()) / 1e9, float(network.edge_capacity.max()) / 1e9],
         },
         "tight_resources_GBps": [[name, round(capacity / 1e9, 2)] for name, capacity in tight],
-        "dims_us_per_MiB_w1": [[row["step"], round(row["us_per_MiB_single_path"], 1),
-                                _label(row["single_path_bottleneck"])] for row in profiles],
-        "agent_predicted": [_cfg_row(config) + [round(pred["us"], 1), round(pred["mb"], 2)]
-                            for _, config, pred in seeds],
+        "dims_us_per_MiB": dims,
     }
     if mappings:
         payload["rank_mapping_path_work_gain_pct"] = [
@@ -224,9 +234,8 @@ def build_prompt(planner: Planner, profiles: list[dict[str, Any]], seeds: list, 
             "prediction_scope": "not_yet_measured",
         }
     return (
-        "agent_predicted rows = [algorithm,split,width,rs_dims,integer_Replay_us,approx_response_MB]. "
-        "Initial single-path seeds on this topology, not a full search. "
-        "The agent searches other widths while you decide:\n"
+        "dims_us_per_MiB rows = [step, estimated us per MiB, source]: a routing-free estimate per XOR "
+        "dimension on this topology. The agent routes and measures candidates while you decide:\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         + f"\nGive up to {MAX_PROPOSALS} picks likely to lower the cost, best first; you may add picks "
         "the agent did not list."
@@ -318,6 +327,16 @@ def blockable(planner: Planner, config: dict[str, Any]) -> bool:
     if config["algorithm"] == "rs_ag":
         return config.get("rs_blocks") is None
     return planner.operator == "all-gather" and config["algorithm"] == "doubling" and not config.get("blocks")
+
+
+def mapping_seed_config(planner: Planner) -> dict[str, Any] | None:
+    """The schedule shape whose rank mapping is screened for the prompt (no routing needed)."""
+
+    if planner.operator == "all-gather":
+        return {"algorithm": "doubling", "split": planner.splits[0]}
+    if planner.allow_copy and planner.splits[-1] >= 2:
+        return {"algorithm": "rs_ag", "split": planner.splits[-1], "rs_dims": planner.splits[-1].bit_length() - 1}
+    return None
 
 
 def mappable(planner: Planner, config: dict[str, Any]) -> bool:
@@ -776,23 +795,15 @@ class AgentCCAgent(BaseAgent):
                     lambda: Planner(task, topology, sum_notation=sum_notation_enabled()))
                 timings["parse"] = round((perf_counter() - phase_started) * 1000, 3)
                 phase_started = perf_counter()
-                profiles = await asyncio.to_thread(planner.dimension_profiles, 1)
-                timings["dimension_profiles"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                seed_raws = [{"algorithm": "doubling", "split": planner.splits[0], "path_width": 1}]
-                if planner.operator == "all-reduce" and planner.allow_copy:
-                    if planner.splits[-1] >= 2:
-                        seed_raws.append({"algorithm": "rs_ag", "split": planner.splits[-1], "path_width": 1})
-                    seed_raws.append({"algorithm": "tree", "split": planner.splits[0], "path_width": 1})
-                seeds = await asyncio.to_thread(rank_portfolio, planner, seed_raws)
-                timings["seed_predictions"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                rs_seed = next((config for _, config, _ in seeds if mappable(planner, config)), None)
-                mappings = await asyncio.to_thread(planner.mapping_candidates, rs_seed) if rs_seed is not None else []
+                # 0.2.16y: the model is asked before any routing; the portfolio worker
+                # generates routes while the model is thinking.
+                mapping_seed = mapping_seed_config(planner)
+                mappings = (await asyncio.to_thread(planner.mapping_candidates, mapping_seed)
+                            if mapping_seed is not None else [])
+                dims = await asyncio.to_thread(path_work_dims, planner)
                 timings["mapping_generation"] = round((perf_counter() - phase_started) * 1000, 3)
-                prompt = build_prompt(planner, profiles, seeds, mappings)
+                prompt = build_prompt(planner, dims, mappings)
                 audit["planning_ms"] = round((perf_counter() - started) * 1000, 3)
-                audit["initial_candidate_count"] = len(seeds)
                 audit["prompt_bytes"] = len(prompt.encode())
 
             evaluator = Evaluator(planner)

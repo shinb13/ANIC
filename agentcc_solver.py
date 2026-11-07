@@ -697,6 +697,11 @@ class Planner:
         mapped._allocations, mapped._allocation_keys, mapped._integer_times = {}, {}, {}
         return mapped
 
+    def network_rank_orders(self) -> dict[str, dict[str, Any]]:
+        if self._rank_orders is None:
+            self._rank_orders = self.network.rank_orders()
+        return self._rank_orders
+
     def mapping_candidates(self, config: dict[str, Any]) -> list[dict[str, Any]]:
         """Cheap path-work screening; these scores are not Replay predictions."""
 

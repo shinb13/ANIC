@@ -1012,7 +1012,7 @@ class AgentLoopTests(unittest.TestCase):
         request = events["requests"][0]
         prompt = request["messages"][-1]["content"]
         self.assertIn("plane-A-ingress", prompt)
-        self.assertIn("agent_predicted", prompt)
+        self.assertIn("dims_us_per_MiB", prompt)
         self.assertLess(len(prompt), 2000)
         self.assertEqual(request["max_tokens"], 120)
         changed = deepcopy(data)
@@ -1064,9 +1064,8 @@ class AgentLoopTests(unittest.TestCase):
                 self.assertEqual(len(events["requests"]), 1)
                 self.assertNotIn("portfolio_error", audit)
                 self.assertNotIn("model_error", {key: value for key, value in audit.items() if value})
-                self.assertEqual(audit["initial_candidate_count"], 3)
                 self.assertEqual(set(audit["timings_ms"]), {
-                    "parse", "dimension_profiles", "seed_predictions", "portfolio_rank", "portfolio_build",
+                    "parse", "portfolio_rank", "portfolio_build",
                     "model", "portfolio_join", "model_candidates", "select_validate", "refine_validate",
                     "mapping_generation", "mapping_prepare", "rank_mapping",
                     "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate", "final_validate", "speculative_finalize",
@@ -1084,20 +1083,14 @@ class AgentLoopTests(unittest.TestCase):
                 validate_answer(data["task"], data["topology"], result["answer"])
                 prompt = events["requests"][0]["messages"][-1]["content"]
                 payload, _ = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])
-                self.assertEqual(payload["prediction_scope"], "initial_single_path_seeds")
+                self.assertIn("before routing", payload["dims_scope"])
                 self.assertEqual(payload["bytes_per_rank"], data["task"]["data_size"]["per_rank_bytes"])
                 self.assertEqual(payload["alignment_bytes"], data["task"]["split_policy"]["alignment_bytes"])
-                self.assertEqual(len(payload["agent_predicted"]), audit["initial_candidate_count"])
-                self.assertGreater(audit["initial_candidate_count"], 0)
-                self.assertLessEqual(audit["initial_candidate_count"], 3)
                 planner = Planner(data["task"], data["topology"], sum_notation=True)
-                for algorithm, split, width, rs_dims, us, mb in payload["agent_predicted"]:
-                    config = planner.normalize_config({"algorithm": algorithm, "split": split,
-                                                       "path_width": width, "rs_dims": rs_dims})
-                    self.assertEqual(width, 1)
-                    predicted = planner.predict(config)
-                    self.assertEqual(us, round(predicted["us"], 1))
-                    self.assertEqual(mb, round(predicted["mb"], 2))
+                self.assertEqual([row[0] for row in payload["dims_us_per_MiB"]], planner.steps)
+                self.assertTrue(all(row[1] > 0 for row in payload["dims_us_per_MiB"]))
+                # The model request is sent before any route is generated.
+                self.assertEqual(audit["planning_ms"] < audit["solve_ms"], True)
 
     def test_initial_prompt_exposes_reverse_bandwidth_changes_off_single_path(self):
         data = two_plane_input("all-reduce")
@@ -1111,8 +1104,6 @@ class AgentLoopTests(unittest.TestCase):
             payload, _ = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])
             payloads.append(payload)
         original, modified = payloads
-        self.assertEqual(original["dims_us_per_MiB_w1"], modified["dims_us_per_MiB_w1"])
-        self.assertEqual(original["agent_predicted"], modified["agent_predicted"])
         self.assertEqual(original["links"]["unequal_reverse"], 0)
         self.assertEqual(modified["links"]["unequal_reverse"], 1)
         self.assertEqual(modified["links"]["one_way"], 0)
