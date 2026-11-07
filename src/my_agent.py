@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.9y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.10y).
 
 Per request, every value comes from the current task and topology:
 
@@ -47,6 +47,7 @@ from agentcc_solver import (
     reference_config,
     refine_schedule_routes,
     replay_estimate,
+    split_path_bound_transfers,
     validate_answer,
 )
 
@@ -60,7 +61,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.9y"
+TOOL_VERSION = "2.10y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -526,6 +527,34 @@ class Evaluator:
                     "response_mb": round(size_mb, 2), "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb}
         return best, detail
 
+    def split_transfers(self, best: dict[str, Any], call_id: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Final pass: split path-bound transfers; adopt only a validated, cheaper schedule."""
+
+        planner = best["_planner"]
+        with tool_call(
+            "split_path_bound_transfers", "function",
+            arguments={"config": best["config"], "size_weight": SIZE_WEIGHT},
+            tool_version=TOOL_VERSION, parent_llm_call_id=call_id,
+        ) as call:
+            chunk_bytes = planner.data_size // best["_answer"]["split"]
+            answer, detail = split_path_bound_transfers(planner.network, best["_answer"], chunk_bytes,
+                                                        size_weight=SIZE_WEIGHT)
+            detail["adopted"] = False
+            if answer is not best["_answer"]:
+                validate_answer(planner.task, planner.topology, answer, planner.network.raw)
+                estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
+                size_mb = answer_size_estimate(answer) / 1e6
+                score = math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb
+                detail.update(measured_us=estimate["total_us"], response_mb=size_mb)
+                if estimate["total_us"] < best["estimate_us"] and score < best["score"]:
+                    best = {**best, "_answer": answer, "_estimate": estimate, "estimate_us": estimate["total_us"],
+                            "response_mb": round(size_mb, 2), "score": score}
+                    detail["adopted"] = True
+                else:
+                    detail["rejection"] = "complete_schedule_cost"
+            call.result({key: value for key, value in detail.items() if key != "rounds"})
+        return best, detail
+
     def try_dual_tree(self, best: dict[str, Any], choice: int | None, call_id: str | None
                       ) -> tuple[dict[str, Any], dict[str, Any]]:
         info: dict[str, Any] = {"model_choice": choice, "before_us": best["estimate_us"], "adopted": False}
@@ -658,6 +687,12 @@ class AgentCCAgent(BaseAgent):
                 phase_started = perf_counter()
                 best, audit["dual_tree"] = await asyncio.to_thread(evaluator.try_dual_tree, best, tree_choice, call_id)
                 timings["dual_tree_validate"] = round((perf_counter() - phase_started) * 1000, 3)
+                phase_started = perf_counter()
+                try:
+                    best, audit["transfer_split"] = await asyncio.to_thread(evaluator.split_transfers, best, call_id)
+                except Exception as exc:  # noqa: BLE001 - the unsplit schedule is already valid
+                    audit["transfer_split"] = {"error": f"{type(exc).__name__}: {exc}"}
+                timings["transfer_split"] = round((perf_counter() - phase_started) * 1000, 3)
                 audit["agent_candidates"] = [Evaluator.public(row) for row in portfolio_rows]
                 audit["model_candidates"] = [Evaluator.public(row) for row in model_rows]
                 audit["selected"] = {

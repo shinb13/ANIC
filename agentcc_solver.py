@@ -1400,6 +1400,99 @@ def refine_schedule_routes(
     return result, result_estimate, info
 
 
+def split_path_bound_transfers(
+    network: Network, answer: dict[str, Any], chunk_bytes: int, *, size_weight: float = 0.10,
+    max_targets: int = 24,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split transfers whose own path time is above the round's contention time.
+
+    Replay charges a transfer its path time, startup + switch overhead + bytes
+    times the sum of per-edge times, while edge and resource busy times depend
+    only on the total bytes on each element.  Sending a pair's chunks as several
+    transfers on the same path therefore leaves every load unchanged and only
+    shortens the longest path time.  Each round is split down to the target
+    time that minimises ln(total Replay time) + size_weight * response MB, so
+    rounds where the saving is small next to the extra transfer records stay as
+    they are.  Chunk lists stay in order and no chunk is sent twice.
+    """
+
+    started = perf_counter()
+    plans = []
+    for round_data in answer["rounds"]:
+        transfers = round_data["transfers"]
+        if not transfers:
+            plans.append(None)
+            continue
+        routes = [network._route(tuple(transfer["path"])) for transfer in transfers]
+        counts = np.array([len(transfer["chunk_ranges"]) for transfer in transfers], dtype=np.int64)
+        overhead = np.array([route.overhead_us for route in routes])
+        unit = np.array([route.per_byte_us for route in routes]) * chunk_bytes
+        lengths = [len(route.elements) for route in routes]
+        load = np.bincount(np.concatenate([route.elements for route in routes]),
+                           weights=np.repeat(counts * chunk_bytes, lengths), minlength=len(network.element_inv))
+        contention = float(overhead.max() + (load * network.element_inv).max())
+        path = overhead + counts * unit
+        record = 80 + np.array([sum(len(node) + 3 for node in transfer["path"]) for transfer in transfers])
+        plans.append({"contention": contention, "path": path, "counts": counts, "overhead": overhead,
+                      "unit": unit, "record": record, "time": float(max(contention, path.max()))})
+    total = sum(plan["time"] for plan in plans if plan is not None)
+
+    def pieces_for(plan: dict[str, Any], target: float) -> np.ndarray:
+        room = target - plan["overhead"]
+        per_piece = np.where(room > plan["unit"], np.floor(room / plan["unit"]), 1).astype(np.int64)
+        return np.where(plan["path"] > target, -(-plan["counts"] // np.maximum(per_piece, 1)), 1)
+
+    def evaluate(plan: dict[str, Any], target: float) -> tuple[float, float, np.ndarray]:
+        pieces = pieces_for(plan, target)
+        size = -(-plan["counts"] // pieces)
+        time = float(max(plan["contention"], (plan["overhead"] + size * plan["unit"]).max()))
+        extra_mb = float(((pieces - 1) * plan["record"]).sum()) / 1e6
+        return time, extra_mb, pieces
+
+    info: dict[str, Any] = {"before_us": total, "rounds": []}
+    chosen: list[np.ndarray | None] = []
+    current = total
+    for index, plan in enumerate(plans):
+        if plan is None or plan["path"].max() <= plan["contention"] * (1 + 1e-12):
+            chosen.append(None)
+            continue
+        above = np.unique(plan["path"][plan["path"] > plan["contention"]])[::-1]
+        targets = [plan["contention"]] + list(above[1:max_targets])
+        best = (0.0, plan["time"], 0.0, None)
+        for target in targets:
+            time, extra_mb, pieces = evaluate(plan, float(target))
+            gain = math.log((current - plan["time"] + time) / current) + size_weight * extra_mb
+            if gain < best[0]:
+                best = (gain, time, extra_mb, pieces)
+        if best[3] is None:
+            chosen.append(None)
+            continue
+        info["rounds"].append({"round": index + 1, "before_us": plan["time"], "after_us": best[1],
+                               "extra_transfers": int((best[3] - 1).sum()), "extra_mb": best[2]})
+        current += best[1] - plan["time"]
+        chosen.append(best[3])
+    info.update(after_us=current, extra_transfers=sum(row["extra_transfers"] for row in info["rounds"]),
+                elapsed_ms=(perf_counter() - started) * 1000)
+    if not info["rounds"]:
+        return answer, info
+    rounds = []
+    for round_data, pieces in zip(answer["rounds"], chosen):
+        if pieces is None:
+            rounds.append(round_data)
+            continue
+        transfers = []
+        for transfer, count in zip(round_data["transfers"], pieces.tolist()):
+            items = transfer["chunk_ranges"]
+            if count <= 1:
+                transfers.append(transfer)
+                continue
+            step = -(-len(items) // count)
+            transfers.extend({**transfer, "chunk_ranges": items[start:start + step]}
+                             for start in range(0, len(items), step))
+        rounds.append({**round_data, "transfers": transfers})
+    return {**answer, "rounds": rounds}, info
+
+
 def replay_estimate(
     task: dict[str, Any],
     topology: dict[str, Any],

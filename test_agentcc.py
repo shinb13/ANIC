@@ -26,6 +26,7 @@ from agentcc_solver import (
     replay_estimate,
     refine_schedule_routes,
     solve_request,
+    split_path_bound_transfers,
     validate_answer,
 )
 
@@ -553,6 +554,75 @@ class DualTreeTests(unittest.TestCase):
         self.assertEqual(original, original_snapshot)
 
 
+def single_switch_input(operator="all-gather", ranks=4, candidates=(1, 2, 4, 8)):
+    """Every rank has one link to one switch: every transfer is path-time bound."""
+
+    names = [f"r{index}" for index in range(ranks)]
+    data = two_plane_input(operator, ranks, candidates)
+    data["topology"]["switches"] = ["A"]
+    data["topology"]["edges"] = [{"src": rank, "dst": "A", "bw": "10GB/s", "bidirectional": True} for rank in names]
+    data["topology"]["resources"] = []
+    return data
+
+
+class TransferSplitTests(unittest.TestCase):
+    @staticmethod
+    def _loads(answer, planner):
+        chunk = planner.data_size // answer["split"]
+        rounds = []
+        for round_data in answer["rounds"]:
+            load = {}
+            for transfer in round_data["transfers"]:
+                for edge in zip(transfer["path"], transfer["path"][1:]):
+                    load[edge] = load.get(edge, 0) + chunk * len(transfer["chunk_ranges"])
+            rounds.append(load)
+        return rounds
+
+    @staticmethod
+    def _sent(answer):
+        return [sorted((t["src"], t["dst"], item) for t in r["transfers"] for item in t["chunk_ranges"])
+                for r in answer["rounds"]]
+
+    def test_split_keeps_loads_and_chunks_and_lowers_replay(self):
+        for operator, raw in (("all-gather", {"algorithm": "doubling", "split": 8, "path_width": 1}),
+                              ("all-reduce", {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 2})):
+            data = single_switch_input(operator)
+            planner = Planner(data["task"], data["topology"], sum_notation=True)
+            answer = planner.build(planner.normalize_config(raw))
+            before = replay_estimate(data["task"], data["topology"], answer)
+            split, info = split_path_bound_transfers(planner.network, answer, planner.data_size // 8, size_weight=0.0)
+            after = replay_estimate(data["task"], data["topology"], split)
+            with self.subTest(operator=operator):
+                validate_answer(data["task"], data["topology"], split)
+                self.assertLess(after["total_us"], before["total_us"])
+                self.assertAlmostEqual(after["total_us"], info["after_us"], places=6)
+                self.assertEqual(self._loads(split, planner), self._loads(answer, planner))
+                self.assertEqual(self._sent(split), self._sent(answer))
+                self.assertGreater(info["extra_transfers"], 0)
+                for round_before, round_after in zip(before["rounds"], after["rounds"]):
+                    self.assertLessEqual(round_after["time_us"], round_before["time_us"] + 1e-9)
+
+    def test_no_split_when_size_cost_dominates_or_nothing_is_path_bound(self):
+        data = single_switch_input()
+        planner = Planner(data["task"], data["topology"], sum_notation=True)
+        answer = planner.build(planner.normalize_config({"algorithm": "doubling", "split": 8, "path_width": 1}))
+        same, info = split_path_bound_transfers(planner.network, answer, planner.data_size // 8, size_weight=1e9)
+        self.assertIs(same, answer)
+        self.assertEqual(info["extra_transfers"], 0)
+        once, _ = split_path_bound_transfers(planner.network, answer, planner.data_size // 8, size_weight=0.0)
+        twice, info = split_path_bound_transfers(planner.network, once, planner.data_size // 8, size_weight=0.0)
+        self.assertIs(twice, once)
+
+    def test_public_directed_ring_allgather_gets_faster(self):
+        task, topology = public_case("directed_ring", "ag")
+        planner = Planner(task, topology, sum_notation=True)
+        answer = planner.build(planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 2}))
+        before = replay_estimate(task, topology, answer, planner.network.raw)["total_us"]
+        split, _ = split_path_bound_transfers(planner.network, answer, planner.data_size)
+        validate_answer(task, topology, split, planner.network.raw)
+        self.assertLess(replay_estimate(task, topology, split, planner.network.raw)["total_us"], 0.95 * before)
+
+
 class RouteRefinementTests(unittest.TestCase):
     @staticmethod
     def congested_case(operator="all-gather", split=1, slow_plane=False):
@@ -892,7 +962,7 @@ class AgentLoopTests(unittest.TestCase):
                     "parse", "dimension_profiles", "seed_predictions", "portfolio_rank", "portfolio_build",
                     "model", "portfolio_join", "model_candidates", "select_validate", "refine_validate",
                     "mapping_generation", "mapping_prepare", "rank_mapping",
-                    "tree_prepare", "dual_tree_validate",
+                    "tree_prepare", "dual_tree_validate", "transfer_split",
                 })
 
     def test_initial_predictions_obey_current_task_constraints(self):
