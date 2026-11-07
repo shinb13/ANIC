@@ -1682,7 +1682,7 @@ def repair_round_routes(
 
 def refine_schedule_routes(
     planner: Planner, config: dict[str, Any], answer: dict[str, Any], estimate: dict[str, Any],
-    *, size_weight: float = 0.10, budget_seconds: float = 0.1,
+    *, size_weight: float = 0.10, budget_seconds: float = 0.1, validate: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Repair up to three slow rounds; validate and adopt only a better complete schedule."""
 
@@ -1712,7 +1712,8 @@ def refine_schedule_routes(
     if info["accepted_moves"]:
         candidate = {**answer, "rounds": rounds}
         measured = replay_estimate(planner.task, planner.topology, candidate, planner.network.raw)
-        validate_answer(planner.task, planner.topology, candidate, planner.network.raw)
+        if validate:
+            validate_answer(planner.task, planner.topology, candidate, planner.network.raw)
         candidate_mb = answer_size_estimate(candidate) / 1e6
         before_cost = math.log(estimate["total_us"]) + size_weight * info["before_response_mb"]
         candidate_cost = math.log(measured["total_us"]) + size_weight * candidate_mb
@@ -2219,12 +2220,12 @@ class StrategyAPI:
 def answer_size_estimate(answer: dict[str, Any]) -> int:
     """Approximate serialized size in bytes without building the JSON string."""
 
-    total = 0
+    total = 16 * len(answer["chunks"])
     for round_data in answer["rounds"]:
         for transfer in round_data["transfers"]:
-            total += 80 + sum(len(item) + 3 for item in transfer["chunk_ranges"])
-            total += sum(len(node) + 3 for node in transfer["path"])
-    return total + 16 * len(answer["chunks"])
+            items, path = transfer["chunk_ranges"], transfer["path"]
+            total += 80 + 3 * (len(items) + len(path)) + sum(map(len, items)) + sum(map(len, path))
+    return total
 
 
 def portfolio_configs(planner: Planner) -> list[dict[str, Any]]:

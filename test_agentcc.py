@@ -1069,7 +1069,7 @@ class AgentLoopTests(unittest.TestCase):
                     "parse", "dimension_profiles", "seed_predictions", "portfolio_rank", "portfolio_build",
                     "model", "portfolio_join", "model_candidates", "select_validate", "refine_validate",
                     "mapping_generation", "mapping_prepare", "rank_mapping",
-                    "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate",
+                    "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate", "final_validate",
                 })
 
     def test_initial_predictions_obey_current_task_constraints(self):
@@ -1182,15 +1182,34 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(detail["reason"], "integer_replay_screen")
         self.assertNotIn("candidate", detail)
 
-    def test_mapping_validation_errors_propagate(self):
+    def test_mapping_defers_validation_to_the_final_answer(self):
         module = self._load_agent_module({"tools": [], "recovery": []})
         task, topology = public_case("uneven_pods", "ar")
         evaluator = module.Evaluator(Planner(task, topology, sum_notation=True))
         evaluator.run_portfolio()
         best = evaluator.select()
-        with patch.object(module, "validate_answer", side_effect=RuntimeError("mapping validation failed")):
-            with self.assertRaisesRegex(RuntimeError, "mapping validation failed"):
-                evaluator.remap(best, 1, None)
+        with patch.object(module, "validate_answer", side_effect=AssertionError("remap must not validate")):
+            result, _ = evaluator.remap(best, 1, None)
+        validate_answer(task, topology, result["_answer"])
+
+    def test_final_validation_failure_falls_back_to_the_validated_selection(self):
+        task, topology = public_case("uneven_pods", "ar")
+        calls = []
+        module_validate = validate_answer
+
+        def second_call_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > 1:
+                raise AgentCCError("final validation failed")
+            return module_validate(*args, **kwargs)
+
+        events = {"requests": [], "tools": [], "recovery": []}
+        module = self._load_agent_module(events)
+        with patch.object(module, "validate_answer", side_effect=second_call_fails),                 patch.object(AgentLoopTests, "_load_agent_module", staticmethod(lambda _events: module)):
+            result, audit, _ = self._run(['{"c":[]}'], task_input={"task": task, "topology": topology})
+        self.assertEqual(audit.get("final_validation_error"), "AgentCCError: final validation failed")
+        validate_answer(task, topology, result["answer"])
+        self.assertEqual(result["answer"]["round_count"], len(result["answer"]["rounds"]))
 
     def test_equivalent_widths_share_build_and_keep_model_evidence(self):
         events = {"tools": [], "recovery": []}
@@ -1356,7 +1375,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(results[0][2]["requests"][0], results[1][2]["requests"][0])
         self.assertIn("parent_llm_call_id", results[1][2]["tools"][-1])
 
-    def test_tree_prediction_gate_and_validation_errors_propagate(self):
+    def test_tree_prediction_gate_and_deferred_validation(self):
         events = {"tools": [], "recovery": []}
         module = self._load_agent_module(events)
         task, topology = public_case("fullmesh_clos", "ar")
@@ -1368,11 +1387,9 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIs(result, original)
         self.assertEqual(detail["reason"], "integer_replay_screen")
         original["estimate_us"] = 1000
-        with patch.object(module, "validate_answer", side_effect=RuntimeError("tree validation failed")):
-            with self.assertRaisesRegex(RuntimeError, "tree validation failed"):
-                evaluator.try_dual_tree(original, 1, "model-tree-123")
+        with patch.object(module, "validate_answer", side_effect=AssertionError("dual tree must not validate")):
+            result, detail = evaluator.try_dual_tree(original, 1, "model-tree-123")
         self.assertEqual(events["tools"][-1]["parent_llm_call_id"], "model-tree-123")
-        result, detail = evaluator.try_dual_tree(original, 1, "model-tree-123")
         self.assertIs(result, original)
         self.assertEqual(detail["reason"], "complete_schedule_cost")
 

@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.14y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.15y).
 
 Per request, every value comes from the current task and topology:
 
@@ -61,7 +61,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.14y"
+TOOL_VERSION = "2.15y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -509,7 +509,6 @@ class Evaluator:
                 info.update(chosen=option, split_before_us=old_us, split_after_us=new_us)
                 if new_us < old_us and new_cost < old_cost:
                     answer = planner.build(config)
-                    validate_answer(planner.task, planner.topology, answer, planner.network.raw)
                     estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
                     size_mb = answer_size_estimate(answer) / 1e6
                     if "mapping" in best["config"]:
@@ -603,7 +602,6 @@ class Evaluator:
                     if candidate["status"] != "built":
                         info["reason"] = "candidate_rejected"
                     else:
-                        validate_answer(mapped.task, mapped.topology, candidate["_answer"], mapped.network.raw)
                         if candidate["estimate_us"] < best["estimate_us"] and candidate["score"] <= best["score"]:
                             candidate["config"]["mapping"] = trial["mapping"]
                             candidate["sources"].update(best["sources"])
@@ -624,6 +622,7 @@ class Evaluator:
         ) as call:
             answer, estimate, detail = refine_schedule_routes(
                 best["_planner"], best["config"], best["_answer"], best["_estimate"], size_weight=SIZE_WEIGHT,
+                validate=False,
             )
             call.result(detail)
         if detail["adopted"]:
@@ -646,7 +645,6 @@ class Evaluator:
                                                         size_weight=SIZE_WEIGHT)
             detail["adopted"] = False
             if answer is not best["_answer"]:
-                validate_answer(planner.task, planner.topology, answer, planner.network.raw)
                 estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
                 size_mb = answer_size_estimate(answer) / 1e6
                 score = math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb
@@ -676,7 +674,6 @@ class Evaluator:
                 info["reason"] = "integer_replay_screen"
             else:
                 answer = build_dual_tree(planner, prepared, option["choice"])
-                validate_answer(planner.task, planner.topology, answer, planner.network.raw)
                 estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
                 size_mb = answer_size_estimate(answer) / 1e6
                 score = math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb
@@ -783,6 +780,7 @@ class AgentCCAgent(BaseAgent):
                     recovery("agent_emergency_reference", count=0)
                     best = await asyncio.to_thread(evaluator.emergency)
                 timings["select_validate"] = round((perf_counter() - phase_started) * 1000, 3)
+                validated = best  # select() and emergency() return a fully validated answer
                 phase_started = perf_counter()
                 best, audit["rank_mapping"] = await asyncio.to_thread(evaluator.remap, best, mapping_choice, call_id)
                 timings["rank_mapping"] = round((perf_counter() - phase_started) * 1000, 3)
@@ -819,6 +817,17 @@ class AgentCCAgent(BaseAgent):
                 )
 
             with state("final_answer"):
+                # 0.2.15y: later steps are gated by Replay estimates only; the answer that is
+                # returned is validated here, falling back to the validated selection.
+                phase_started = perf_counter()
+                if best is not validated:
+                    try:
+                        validate_answer(planner.task, planner.topology, best["_answer"], planner.network.raw)
+                    except Exception as exc:  # noqa: BLE001
+                        audit["final_validation_error"] = f"{type(exc).__name__}: {exc}"
+                        recovery("validated_selection_fallback", count=0)
+                        best = validated
+                timings["final_validate"] = round((perf_counter() - phase_started) * 1000, 3)
                 answer = best["_answer"]
                 attach_metrics(answer, best["_estimate"])
                 config = best["config"]
