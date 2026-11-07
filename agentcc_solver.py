@@ -265,6 +265,7 @@ class Network:
         self._segment_cache: dict[tuple[int, int], list[tuple[tuple[str, ...], float]]] = {}
         self._route_objects: dict[tuple[str, ...], Route] = {}
         self._quick_cache: dict[tuple[int, int, int], list[Route]] = {}
+        self._ports: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
         self._prepare_switch_graph()
 
     def _prepare_switch_graph(self) -> None:
@@ -345,6 +346,83 @@ class Network:
         )
         self._route_objects[nodes] = route
         return route
+
+    def _port_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Padded per-rank switch ports and costs (inf padding) for batched route search."""
+
+        if self._ports is None:
+            n = len(self.ranks)
+            width_out = max((len(self.rank_out[r]) for r in self.ranks), default=0) or 1
+            width_in = max((len(self.rank_in[r]) for r in self.ranks), default=0) or 1
+            out_sw = np.zeros((n, width_out), dtype=np.int64)
+            out_c = np.full((n, width_out), inf)
+            in_sw = np.zeros((n, width_in), dtype=np.int64)
+            in_c = np.full((n, width_in), inf)
+            for index, rank in enumerate(self.ranks):
+                for slot, (switch, cost) in enumerate(self.rank_out[rank]):
+                    out_sw[index, slot], out_c[index, slot] = switch, cost
+                for slot, (switch, cost) in enumerate(self.rank_in[rank]):
+                    in_sw[index, slot], in_c[index, slot] = switch, cost
+            self._ports = (out_sw, out_c, in_sw, in_c)
+        return self._ports
+
+    def quick_routes_batch(self, pairs: list[tuple[int, int]], width: int) -> list[list[Route]]:
+        """``quick_routes`` for many pairs: one numpy pass picks every pair's cheapest switch routes."""
+
+        width = max(1, width)
+        result: list[list[Route] | None] = [self._quick_cache.get((s, d, width)) for s, d in pairs]
+        todo = [index for index, routes in enumerate(result) if routes is None]
+        if todo and self.switch_names:
+            out_sw, out_c, in_sw, in_c = self._port_arrays()
+            src = np.array([pairs[index][0] for index in todo])
+            dst = np.array([pairs[index][1] for index in todo])
+            for start in range(0, len(todo), 2048):
+                part = slice(start, start + 2048)
+                s, d = src[part], dst[part]
+                total = (out_c[s][:, :, None] + self.switch_distance[out_sw[s][:, :, None], in_sw[d][:, None, :]]
+                         + in_c[d][:, None, :]).reshape(len(s), -1)
+                limit = min(width, total.shape[1])
+                if limit < total.shape[1]:
+                    head = np.argpartition(total, limit - 1, axis=1)[:, :limit]
+                else:
+                    head = np.broadcast_to(np.arange(total.shape[1]), (len(s), total.shape[1]))
+                costs = np.take_along_axis(total, head, axis=1)
+                ranking = np.argsort(costs, axis=1, kind="stable")
+                head = np.take_along_axis(head, ranking, axis=1)
+                costs = np.take_along_axis(costs, ranking, axis=1)
+                columns = in_sw.shape[1]
+                for row, index in enumerate(todo[part]):
+                    source, destination = pairs[index]
+                    names = self.ranks[source], self.ranks[destination]
+                    candidates: dict[tuple[str, ...], float] = {}
+                    if names in self.edge_index:
+                        candidates[names] = float(self.static_cost[self.edge_index[names]])
+                    for flat, cost in zip(head[row].tolist(), costs[row].tolist()):
+                        if cost == inf:
+                            continue
+                        u = int(out_sw[source, flat // columns])
+                        v = int(in_sw[destination, flat % columns])
+                        nodes = ((names[0], self.switch_names[u], names[1]) if u == v
+                                 else (names[0],) + self._switch_path(u, v) + (names[1],))
+                        candidates.setdefault(nodes, cost)
+                    result[index] = self._finish_quick(source, destination, width, candidates)
+        for index in todo:
+            if result[index] is None:
+                source, destination = pairs[index]
+                result[index] = self.quick_routes(source, destination, width)
+        return result  # type: ignore[return-value]
+
+    def _finish_quick(self, source: int, destination: int, width: int,
+                      candidates: dict[tuple[str, ...], float]) -> list[Route]:
+        if not candidates:
+            raise AgentCCError(f"no legal route from {self.ranks[source]} to {self.ranks[destination]}")
+        ordered = sorted(candidates.items(), key=lambda item: (item[1], len(item[0])))
+        if not self.allow_detour:
+            fewest = min(len(nodes) for nodes, _ in ordered)
+            ordered = [item for item in ordered if len(item[0]) == fewest]
+        routes = [self._route(nodes) for nodes, _ in ordered[:width]]
+        self._quick_cache[(source, destination, width)] = routes
+        return routes
 
     def quick_routes(self, source: int, destination: int, width: int) -> list[Route]:
         """Up to ``width`` cheapest switch routes, without the diversity pass of ``routes``.
@@ -558,7 +636,7 @@ def optimize_round(
 
     started = perf_counter()
     if quick:
-        route_lists = [network.quick_routes(src, dst, max(1, width)) for src, dst in pairs]
+        route_lists = network.quick_routes_batch(pairs, width)
     else:
         route_lists = [network.routes(src, dst)[:max(1, width)] for src, dst in pairs]
     demand_count = len(route_lists)
