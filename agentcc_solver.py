@@ -31,6 +31,10 @@ ALGORITHMS = {
     "all-reduce": ("rs_ag", "doubling", "tree"),
 }
 MAX_PATH_WIDTH = 16
+MAX_BLOCK_DIMS = 3
+# Block rounds carry 3-7x more pairs than an XOR round; fewer Frank-Wolfe steps keep the
+# search inside the model wait.  Predictions stay exact: they price the plan actually emitted.
+BLOCK_OPTIMIZER_ITERATIONS = 24
 OPTIMIZER_ITERATIONS = 48
 PROFILE_BYTES = 1 << 20
 
@@ -673,12 +677,13 @@ class Planner:
     def exchange_pairs(self, step: int) -> list[tuple[int, int]]:
         return [(index, index ^ step) for index in range(self.rank_count)]
 
-    def round_plan(self, key: tuple, pairs: list[tuple[int, int]], width: int) -> RoundPlan:
+    def round_plan(self, key: tuple, pairs: list[tuple[int, int]], width: int,
+                   iterations: int = OPTIMIZER_ITERATIONS) -> RoundPlan:
         cache_key = key + (width,)
         plan = self._plans.get(cache_key)
         if plan is None:
             physical_pairs = [(self.rank_order[src], self.rank_order[dst]) for src, dst in pairs]
-            plan = optimize_round(self.network, physical_pairs, width)
+            plan = optimize_round(self.network, physical_pairs, width, iterations)
             self._plans[cache_key] = plan
         return plan
 
@@ -739,6 +744,8 @@ class Planner:
             return 2 * config["rs_dims"] + dims - config["rs_dims"]
         if config["algorithm"] == "tree":
             return 2 * dims
+        if config.get("blocks"):
+            return len(config["blocks"])
         return dims
 
     @staticmethod
@@ -795,6 +802,18 @@ class Planner:
                 raise AgentCCError(f"order must be 'auto' or a permutation of {self.steps}")
             config["order"] = [int(step) for step in order]
             config["order_source"] = "proposed"
+        blocks = raw.get("blocks")
+        if blocks is not None:
+            if self.operator != "all-gather" or algorithm != "doubling":
+                raise AgentCCError("blocks apply to all-gather doubling only")
+            if (not isinstance(blocks, list) or not blocks
+                    or any(not isinstance(block, list) or not 1 <= len(block) <= MAX_BLOCK_DIMS for block in blocks)
+                    or any(isinstance(step, bool) or not isinstance(step, int) for block in blocks for step in block)
+                    or sorted(step for block in blocks for step in block) != self.steps):
+                raise AgentCCError(f"blocks must partition {self.steps} into lists of 1-{MAX_BLOCK_DIMS} steps")
+            config["blocks"] = [[int(step) for step in block] for block in blocks]
+            config["order"] = [step for block in config["blocks"] for step in block]
+            config["order_source"] = "blocks"
         rounds = self.round_count(config)
         if rounds > self.max_rounds:
             raise AgentCCError(
@@ -823,6 +842,14 @@ class Planner:
                 group = n if action == "copy" else 1 << index
                 specs.append({"plan": plan, "pairs": len(pairs), "chunks": split, "group": group,
                               "complete": action == "copy"})
+            return specs
+        if self.operator == "all-gather" and config.get("blocks"):
+            held = split
+            for index, block in enumerate(config["blocks"]):
+                plan = self.block_plan(block, self.round_width(config, index))
+                specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": held, "group": 1,
+                              "complete": False})
+                held <<= len(block)
             return specs
         for index, (step, chunks) in enumerate(self.round_payloads(config)):
             plan = self.exchange_plan(step, self.round_width(config, index))
@@ -871,8 +898,9 @@ class Planner:
                 )
                 self._allocation_keys[key] = allocation_key
             rounds.append(allocation_key)
+        blocks = tuple(tuple(block) for block in config.get("blocks") or ())
         return (self.operator, config["algorithm"], config["split"], config.get("rs_dims"),
-                self.rank_order, tuple(config["order"]), tuple(rounds))
+                self.rank_order, tuple(config["order"]), blocks, tuple(rounds))
 
     def normalize_config_safe(self, raw: Any) -> dict[str, Any] | None:
         """normalize_config that returns None instead of raising."""
@@ -880,7 +908,8 @@ class Planner:
         try:
             if not isinstance(raw, dict):
                 return None
-            clean = {key: raw[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths") if key in raw}
+            clean = {key: raw[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths", "blocks")
+                     if key in raw}
             return self.normalize_config(clean)
         except (AgentCCError, TypeError, AttributeError):
             return None
@@ -983,6 +1012,8 @@ class Planner:
         return transfers
 
     def _build_allgather(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        if config.get("blocks"):
+            return self._build_allgather_blocks(config)
         split = config["split"]
         names = self.chunk_names(split)
         members = [[index] for index in range(self.rank_count)]
@@ -995,6 +1026,73 @@ class Planner:
             rounds.append(self._emit(plan, pairs, units, "copy", lambda _src, piece: piece))
             members = [sorted(members[index] + members[index ^ step]) for index in range(self.rank_count)]
         return rounds
+
+    def _build_allgather_blocks(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        """One round per block: every rank sends all it holds to each XOR combination of the block."""
+
+        names = self.chunk_names(config["split"])
+        members = [[index] for index in range(self.rank_count)]
+        rounds = []
+        for index_round, block in enumerate(config["blocks"]):
+            masks = block_masks(block)
+            pairs = [(index, index ^ mask) for mask in masks for index in range(self.rank_count)]
+            plan = self.block_plan(block, self.round_width(config, index_round))
+            held = [[name for member in group for name in names[member]] for group in members]
+            rounds.append(self._emit(plan, pairs, [held[src] for src, _ in pairs], "copy", lambda _src, piece: piece))
+            members = [sorted(set(members[index]).union(*(members[index ^ mask] for mask in masks)))
+                       for index in range(self.rank_count)]
+        return rounds
+
+    def block_plan(self, block: list[int], width: int) -> RoundPlan:
+        """Round plan for one block; a single dimension reuses the plain XOR exchange plan."""
+
+        if len(block) == 1:
+            return self.exchange_plan(block[0], width)
+        masks = block_masks(block)
+        pairs = [(index, index ^ mask) for mask in masks for index in range(self.rank_count)]
+        return self.round_plan(("block", tuple(sorted(block))), pairs, width, BLOCK_OPTIMIZER_ITERATIONS)
+
+    def split_aware_round_us(self, plan: RoundPlan, units: int, chunk_bytes: int) -> float:
+        """Integer round cost once path-bound transfers are split (see split_path_bound_transfers)."""
+
+        counts = self.integer_allocation(plan, units)
+        sizes = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]) * chunk_bytes
+        active = sizes > 0
+        loads = np.bincount(plan.entry_element, weights=sizes[plan.entry_path], minlength=len(self.network.element_inv))
+        overhead = float(plan.path_overhead_us[active].max(initial=0.0))
+        single = (plan.path_overhead_us[active] + chunk_bytes * plan.path_per_byte_us[active]).max(initial=0.0)
+        return float(max(single, overhead + float((loads * self.network.element_inv).max(initial=0.0))))
+
+    def allgather_blocks(self, config: dict[str, Any], max_block: int = MAX_BLOCK_DIMS
+                         ) -> tuple[list[list[int]], float, float]:
+        """Best partition of the AllGather order into consecutive blocks (dynamic programme).
+
+        Keeps the configured dimension order (costliest first, smallest payload)
+        and only decides which neighbouring dimensions share a round.  Returns
+        (blocks, predicted us, predicted us with one dimension per round), both
+        priced with split-aware integer round costs.
+        """
+
+        order, width = config["order"], config["path_width"]
+        chunk_bytes = self.data_size // config["split"]
+        count = len(order)
+        best = [math.inf] * (count + 1)
+        choice = [0] * (count + 1)
+        best[0] = 0.0
+        singles = 0.0
+        for start in range(count):
+            units = config["split"] << start
+            for end in range(start + 1, min(count, start + max_block) + 1):
+                cost = self.split_aware_round_us(self.block_plan(order[start:end], width), units, chunk_bytes)
+                if end == start + 1:
+                    singles += cost
+                if best[start] + cost < best[end]:
+                    best[end], choice[end] = best[start] + cost, start
+        blocks, end = [], count
+        while end:
+            blocks.append(order[choice[end]:end])
+            end = choice[end]
+        return blocks[::-1], best[count], singles
 
     def _complete(self, expression, complete: tuple[int, ...], slot: int) -> str:
         return f"c{slot}_sum" if self.sum_notation else expression(complete, slot)
@@ -1106,6 +1204,12 @@ class Planner:
         if groups[0] != complete:
             raise AgentCCError("tree reduction did not reach rank 0 with every contributor")
         return rounds
+
+
+def block_masks(block: list[int]) -> list[int]:
+    """Every non-empty XOR combination of the block's dimensions."""
+
+    return [sum(step for bit, step in enumerate(block) if mask >> bit & 1) for mask in range(1, 1 << len(block))]
 
 
 def prepare_dual_tree(planner: Planner) -> dict[str, Any]:

@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.11y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.12y).
 
 Per request, every value comes from the current task and topology:
 
@@ -61,11 +61,15 @@ DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.11y"
+TOOL_VERSION = "2.12y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
 SIZE_WEIGHT = 0.10
+# 0.2.12y: wall-clock budget for the AllGather block search (dynamic programme per width).
+BLOCK_SEARCH_BUDGET_SECONDS = 1.5
+BLOCK_WIDTHS = (16, 8)
+BLOCK_EXTRA_WIDTHS = 1
 
 SYSTEM_PROMPT = (
     "You pick collective-communication schedule parameters. A tool builds each pick on the "
@@ -326,6 +330,7 @@ class Evaluator:
         self.mapping_planners: dict[tuple[int, ...], Planner] = {}
         self.prepared_mapping: dict[str, Any] | None = None
         self.prepared_tree: dict[str, Any] = {"reason": "ineligible"}
+        self.prepared_blocks: dict[tuple[int, int], dict[str, Any]] = {}
 
     def evaluate(self, raw: Any, source: str, parent_llm_call_id: str | None = None) -> dict[str, Any]:
         try:
@@ -423,7 +428,83 @@ class Evaluator:
                     self.prepared_tree = {"reason": "unroutable_tree", "error": str(exc)}
                 call.result(self.public(self.prepared_tree))
         self.timings_ms["tree_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
+        prepare_started = perf_counter()
+        if built and self.planner.operator == "all-gather":
+            best = min(self.results.values(), key=lambda row: row["score"])
+            if best["config"]["algorithm"] == "doubling":
+                with tool_call("prepare_allgather_blocks", "function", arguments={"config": best["config"]},
+                               tool_version=TOOL_VERSION) as call:
+                    call.result(self.prepare_blocks(self.planner, best["config"]))
+        self.timings_ms["blocks_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
         return rows, ranked
+
+    def prepare_blocks(self, planner: Planner, config: dict[str, Any]) -> dict[str, Any]:
+        """Block search at the config's width first, then wider widths while the budget lasts."""
+
+        deadline = perf_counter() + BLOCK_SEARCH_BUDGET_SECONDS
+        widths = [config["path_width"]] + [width for width in BLOCK_WIDTHS if width != config["path_width"]][
+            :BLOCK_EXTRA_WIDTHS]
+        done = []
+        for width in widths:
+            key = (id(planner), width)
+            if key not in self.prepared_blocks:
+                if perf_counter() >= deadline:
+                    break
+                started = perf_counter()
+                raw = {"algorithm": "doubling", "split": config["split"], "path_width": width}
+                base = planner.normalize_config(raw)
+                blocks, predicted, singles = planner.allgather_blocks(base)
+                self.prepared_blocks[key] = {"width": width, "blocks": blocks, "predicted_us": predicted,
+                                             "single_dims_us": singles,
+                                             "elapsed_ms": round((perf_counter() - started) * 1000, 3)}
+            done.append(self.prepared_blocks[key])
+        return {"options": done}
+
+    def try_blocks(self, best: dict[str, Any], call_id: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Adopt the best AllGather block partition only if it is validated and cheaper once split."""
+
+        planner = best["_planner"]
+        info: dict[str, Any] = {"adopted": False, "before_us": best["estimate_us"]}
+        if planner.operator != "all-gather" or best["config"]["algorithm"] != "doubling" or best["config"].get("blocks"):
+            info["reason"] = "not_allgather_doubling"
+            return best, info
+        with tool_call("search_allgather_blocks", "function", arguments={"config": best["config"]},
+                       tool_version=TOOL_VERSION, parent_llm_call_id=call_id) as call:
+            options = self.prepare_blocks(planner, best["config"])["options"]
+            baseline = next((row["single_dims_us"] for row in options if row["width"] == best["config"]["path_width"]),
+                            None)
+            option = min(options, key=lambda row: row["predicted_us"]) if options else None
+            info["options"] = options
+            if option is None or baseline is None:
+                info["reason"] = "no_search_result"
+            elif option["predicted_us"] > baseline * 0.97:
+                info["reason"] = "integer_replay_screen"
+            else:
+                raw = {"algorithm": "doubling", "split": best["config"]["split"], "path_width": option["width"],
+                       "blocks": option["blocks"]}
+                config = planner.normalize_config(raw)
+                # Split-aware integer predictions equal the split Replay estimate, so the
+                # comparison needs no extra builds; the final split pass applies the split.
+                new_us, old_us = option["predicted_us"], baseline
+                new_cost = math.log(new_us) + SIZE_WEIGHT * planner.predict(config)["mb"]
+                old_cost = math.log(old_us) + SIZE_WEIGHT * best["response_mb"]
+                info.update(chosen=option, split_before_us=old_us, split_after_us=new_us)
+                if new_us < old_us and new_cost < old_cost:
+                    answer = planner.build(config)
+                    validate_answer(planner.task, planner.topology, answer, planner.network.raw)
+                    estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
+                    size_mb = answer_size_estimate(answer) / 1e6
+                    if "mapping" in best["config"]:
+                        config["mapping"] = best["config"]["mapping"]
+                    best = {**best, "config": config, "_answer": answer, "_estimate": estimate,
+                            "estimate_us": estimate["total_us"], "response_mb": round(size_mb, 2),
+                            "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb,
+                            "sources": best["sources"] | {"agent_blocks"}}
+                    info["adopted"] = True
+                else:
+                    info["reason"] = "complete_schedule_cost"
+            call.result(info)
+        return best, info
 
     def run_proposals(self, proposals: list[Any], call_id: str | None) -> list[dict[str, Any]]:
         return [self.evaluate(proposal, "model", call_id) for proposal in proposals]
@@ -688,6 +769,12 @@ class AgentCCAgent(BaseAgent):
                 best, audit["rank_mapping"] = await asyncio.to_thread(evaluator.remap, best, mapping_choice, call_id)
                 timings["rank_mapping"] = round((perf_counter() - phase_started) * 1000, 3)
                 phase_started = perf_counter()
+                try:
+                    best, audit["allgather_blocks"] = await asyncio.to_thread(evaluator.try_blocks, best, call_id)
+                except Exception as exc:  # noqa: BLE001 - the plain schedule is already valid
+                    audit["allgather_blocks"] = {"error": f"{type(exc).__name__}: {exc}"}
+                timings["blocks_validate"] = round((perf_counter() - phase_started) * 1000, 3)
+                phase_started = perf_counter()
                 best, audit["route_refinement"] = await asyncio.to_thread(evaluator.refine, best, call_id)
                 timings["refine_validate"] = round((perf_counter() - phase_started) * 1000, 3)
                 phase_started = perf_counter()
@@ -722,6 +809,7 @@ class AgentCCAgent(BaseAgent):
                     + (f" rs_dims={config['rs_dims']}" if "rs_dims" in config else "")
                     + (f" mapping={config['mapping']}" if "mapping" in config else "")
                     + (f" first_tree_slots={config['first_tree_slots']}" if "first_tree_slots" in config else "")
+                    + (f" blocks={config['blocks']}" if "blocks" in config else "")
                     + f" from {'+'.join(sorted(best['sources']))}"
                     # The platform returns no logs, so the answer itself carries the evidence.
                     + f" llm_ms={round(audit['llm_ms'])} model={parse_error or 'ok'}"

@@ -579,6 +579,54 @@ def single_switch_input(operator="all-gather", ranks=4, candidates=(1, 2, 4, 8))
     return data
 
 
+class AllGatherBlockTests(unittest.TestCase):
+    def test_blocks_validate_and_match_prediction(self):
+        data = two_plane_input("all-gather", ranks=8)
+        planner = Planner(data["task"], data["topology"], sum_notation=True)
+        for blocks in ([[1, 2, 4]], [[4], [1, 2]], [[2, 4], [1]], [[1], [2], [4]]):
+            with self.subTest(blocks=blocks):
+                config = planner.normalize_config({"algorithm": "doubling", "split": 2, "path_width": 2, "blocks": blocks})
+                self.assertEqual(planner.round_count(config), len(blocks))
+                answer = planner.build(config)
+                validate_answer(data["task"], data["topology"], answer)
+                self.assertEqual(answer["round_count"], len(blocks))
+                actual = replay_estimate(data["task"], data["topology"], answer)["total_us"]
+                self.assertAlmostEqual(planner.predict(config)["us"], actual, places=6)
+
+    def test_bad_blocks_are_rejected(self):
+        data = two_plane_input("all-gather", ranks=8)
+        planner = Planner(data["task"], data["topology"])
+        for blocks in ([[1, 2]], [[1, 2, 4, 4]], [[1], [1, 2, 4]], [[]], "x", [[1, 2, True]]):
+            with self.subTest(blocks=blocks), self.assertRaises(AgentCCError):
+                planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 1, "blocks": blocks})
+        reduce = two_plane_input("all-reduce", ranks=8)
+        planner = Planner(reduce["task"], reduce["topology"])
+        with self.assertRaises(AgentCCError):
+            planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 1, "blocks": [[1, 2, 4]]})
+
+    def test_block_search_returns_a_partition_and_singletons_match_plain_schedule(self):
+        data = two_plane_input("all-gather", ranks=8)
+        planner = Planner(data["task"], data["topology"], sum_notation=True)
+        config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 2})
+        blocks, predicted, singles = planner.allgather_blocks(config)
+        self.assertEqual([step for block in blocks for step in block], config["order"])
+        self.assertLessEqual(predicted, singles + 1e-9)
+        split, _ = split_path_bound_transfers(planner.network, planner.build(config), planner.data_size)
+        self.assertAlmostEqual(replay_estimate(data["task"], data["topology"], split)["total_us"], singles, places=6)
+
+    def test_public_mesh2d_allgather_blocks_are_faster(self):
+        task, topology = public_case("mesh2d", "ag")
+        planner = Planner(task, topology, sum_notation=True)
+        config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 16})
+        blocks, predicted, singles = planner.allgather_blocks(config)
+        self.assertLess(predicted, 0.6 * singles)
+        answer = planner.build(planner.normalize_config({**{k: config[k] for k in ("algorithm", "split", "path_width")},
+                                                         "blocks": blocks}))
+        split, _ = split_path_bound_transfers(planner.network, answer, planner.data_size)
+        validate_answer(task, topology, split, planner.network.raw)
+        self.assertAlmostEqual(replay_estimate(task, topology, split, planner.network.raw)["total_us"], predicted, places=3)
+
+
 class TransferSplitTests(unittest.TestCase):
     @staticmethod
     def _loads(answer, planner):
@@ -976,7 +1024,7 @@ class AgentLoopTests(unittest.TestCase):
                     "parse", "dimension_profiles", "seed_predictions", "portfolio_rank", "portfolio_build",
                     "model", "portfolio_join", "model_candidates", "select_validate", "refine_validate",
                     "mapping_generation", "mapping_prepare", "rank_mapping",
-                    "tree_prepare", "dual_tree_validate", "transfer_split",
+                    "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate",
                 })
 
     def test_initial_predictions_obey_current_task_constraints(self):
