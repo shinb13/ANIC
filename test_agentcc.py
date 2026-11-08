@@ -1328,9 +1328,9 @@ class AgentLoopTests(unittest.TestCase):
         calls = []
         module_validate = validate_answer
 
-        def second_call_fails(*args, **kwargs):
+        def second_call_fails(*args, **kwargs):  # 0.2.21y: the first call is the final validation
             calls.append(1)
-            if len(calls) > 1:
+            if len(calls) == 1:
                 raise AgentCCError("final validation failed")
             return module_validate(*args, **kwargs)
 

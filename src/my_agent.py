@@ -494,7 +494,7 @@ class Evaluator:
         started = perf_counter()
         if any(row.get("status") == "built" for row in self.results.values()):
             try:
-                selected = self.select()
+                selected = self.select(validate=False)
                 self.speculative = {"selected": selected, "result": self.finalize(selected, None, None, None)}
             except Exception as exc:  # noqa: BLE001 - the regular path still runs after the reply
                 self.speculative = {"error": f"{type(exc).__name__}: {exc}"}
@@ -623,7 +623,7 @@ class Evaluator:
                     size_mb = answer_size_estimate(answer) / 1e6
                     if "mapping" in best["config"]:
                         config["mapping"] = best["config"]["mapping"]
-                    best = {**best, "config": config, "_answer": answer, "_estimate": estimate,
+                    best = {**best, "_validated": False, "config": config, "_answer": answer, "_estimate": estimate,
                             "estimate_us": estimate["total_us"], "response_mb": round(size_mb, 2),
                             "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb,
                             "sources": best["sources"] | {"agent_blocks"}}
@@ -636,9 +636,19 @@ class Evaluator:
     def run_proposals(self, proposals: list[Any], call_id: str | None) -> list[dict[str, Any]]:
         return [self.evaluate(proposal, "model", call_id) for proposal in proposals]
 
-    def select(self) -> dict[str, Any]:
-        """Validate built candidates in score order; return the first that passes."""
+    def select(self, validate: bool = True) -> dict[str, Any]:
+        """Best built candidate by score; with ``validate`` the first that passes validation.
 
+        0.2.21y: the agent pipeline selects without validating (later steps replace the
+        answer anyway); the returned answer is validated once at the end and fallback
+        candidates are validated only if that fails (see fallback()).
+        """
+
+        if not validate:
+            rows = [row for row in self.results.values() if row.get("status") in ("built", "valid")]
+            if rows:
+                return min(rows, key=lambda item: item["score"])
+            raise AgentCCError("no candidate was built")
         for row in sorted(self.results.values(), key=lambda item: item["score"]):
             if row.get("status") == "valid":
                 return row
@@ -650,9 +660,24 @@ class Evaluator:
                 row["status"] = "invalid"
                 row["error"] = str(exc)
                 continue
-            row["status"] = "valid"
+            row.update(status="valid", _validated=True)
             return row
         raise AgentCCError("no candidate passed validation")
+
+    def fallback(self, failed: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Validated replacement after the final answer failed validation."""
+
+        for row in sorted(self.results.values(), key=lambda item: item.get("score", math.inf)):
+            if row is failed or row.get("status") not in ("built", "valid"):
+                continue
+            try:
+                validate_answer(self.planner.task, self.planner.topology, row["_answer"], self.planner.network.raw)
+            except Exception as exc:  # noqa: BLE001
+                row["status"], row["error"] = "invalid", str(exc)
+                continue
+            row.update(status="valid", _validated=True)
+            return row
+        return self.emergency()
 
     def emergency(self) -> dict[str, Any]:
         """Last resort: build and validate the reference configuration directly."""
@@ -662,7 +687,8 @@ class Evaluator:
         validate_answer(self.planner.task, self.planner.topology, answer, self.planner.network.raw)
         estimate = replay_estimate(self.planner.task, self.planner.topology, answer, self.planner.network.raw)
         size_mb = answer_size_estimate(answer) / 1e6
-        return {"config": _public_config(config), "estimate_us": estimate["total_us"], "response_mb": round(size_mb, 2),
+        return {"_validated": True, "config": _public_config(config), "estimate_us": estimate["total_us"],
+                "response_mb": round(size_mb, 2),
                 "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb,
                 "sources": {"agent_emergency"}, "_answer": answer, "_estimate": estimate, "_planner": self.planner}
 
@@ -751,7 +777,7 @@ class Evaluator:
             call.result(detail)
         if detail["adopted"]:
             size_mb = answer_size_estimate(answer) / 1e6
-            best = {**best, "_answer": answer, "_estimate": estimate, "estimate_us": estimate["total_us"],
+            best = {**best, "_validated": False, "_answer": answer, "_estimate": estimate, "estimate_us": estimate["total_us"],
                     "response_mb": round(size_mb, 2), "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb}
         return best, detail
 
@@ -774,7 +800,7 @@ class Evaluator:
                 score = math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb
                 detail.update(measured_us=estimate["total_us"], response_mb=size_mb)
                 if estimate["total_us"] < best["estimate_us"] and score < best["score"]:
-                    best = {**best, "_answer": answer, "_estimate": estimate, "estimate_us": estimate["total_us"],
+                    best = {**best, "_validated": False, "_answer": answer, "_estimate": estimate, "estimate_us": estimate["total_us"],
                             "response_mb": round(size_mb, 2), "score": score}
                     detail["adopted"] = True
                 else:
@@ -824,7 +850,7 @@ class Evaluator:
                     size_mb = answer_size_estimate(answer) / 1e6
                     if "mapping" in best["config"]:
                         config["mapping"] = best["config"]["mapping"]
-                    best = {**best, "config": config, "_answer": answer, "_estimate": estimate,
+                    best = {**best, "_validated": False, "config": config, "_answer": answer, "_estimate": estimate,
                             "estimate_us": estimate["total_us"], "response_mb": round(size_mb, 2),
                             "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb,
                             "sources": best["sources"] | {"agent_hierarchy"}}
@@ -838,7 +864,7 @@ class Evaluator:
         size_mb = answer_size_estimate(answer) / 1e6
         if "mapping" in best["config"]:
             config = {**config, "mapping": best["config"]["mapping"]}
-        return {**best, "config": config, "_answer": answer, "_estimate": estimate, "_planner": planner,
+        return {**best, "_validated": False, "config": config, "_answer": answer, "_estimate": estimate, "_planner": planner,
                 "estimate_us": estimate["total_us"], "response_mb": round(size_mb, 2),
                 "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb,
                 "sources": best["sources"] | {source}}
@@ -1079,13 +1105,13 @@ class AgentCCAgent(BaseAgent):
                     recovery("use_agent_portfolio", count=0)
                 phase_started = perf_counter()
                 try:
-                    best = await asyncio.to_thread(evaluator.select)
+                    best = await asyncio.to_thread(evaluator.select, False)
                 except Exception as exc:  # noqa: BLE001
                     audit["select_error"] = f"{type(exc).__name__}: {exc}"
                     recovery("agent_emergency_reference", count=0)
                     best = await asyncio.to_thread(evaluator.emergency)
                 timings["select_validate"] = round((perf_counter() - phase_started) * 1000, 3)
-                validated = best  # select() and emergency() return a fully validated answer
+                selected_row = best
                 if evaluator.reusable(best, mapping_choice, tree_choice):
                     best, details, steps = evaluator.speculative["result"]
                     audit["speculative_reuse"] = True
@@ -1112,15 +1138,17 @@ class AgentCCAgent(BaseAgent):
 
             with state("final_answer"):
                 # 0.2.15y: later steps are gated by Replay estimates only; the answer that is
-                # returned is validated here, falling back to the validated selection.
+                # returned is validated here (0.2.21y: the only validation on the normal path),
+                # falling back to the best candidate that passes validation.
                 phase_started = perf_counter()
-                if best is not validated:
+                if not best.get("_validated"):
                     try:
                         validate_answer(planner.task, planner.topology, best["_answer"], planner.network.raw)
                     except Exception as exc:  # noqa: BLE001
                         audit["final_validation_error"] = f"{type(exc).__name__}: {exc}"
                         recovery("validated_selection_fallback", count=0)
-                        best = validated
+                        best = await asyncio.to_thread(
+                            evaluator.fallback, selected_row if best is selected_row else None)
                 timings["final_validate"] = round((perf_counter() - phase_started) * 1000, 3)
                 answer = best["_answer"]
                 attach_metrics(answer, best["_estimate"])
