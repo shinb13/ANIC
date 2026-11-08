@@ -463,18 +463,6 @@ class Evaluator:
         if not any(row.get("status") == "built" for row in rows):
             rows.append(self.evaluate(reference_config(self.planner), "agent"))
         self.timings_ms["portfolio_build"] = round((perf_counter() - ranked_at) * 1000, 3)
-        prepare_started = perf_counter()
-        if built:
-            best = min(self.results.values(), key=lambda row: row["score"])
-            estimate = self.timings_ms["portfolio_rank"] / 1000 / max(1, len({c["path_width"] for _, c, _ in ranked}))
-            if mappable(self.planner, best["config"]) and not self.idle_for(estimate):
-                self.prepared_mapping = {"reason": "no_idle_time", "estimate_s": round(estimate, 3)}
-            elif mappable(self.planner, best["config"]):
-                with tool_call("prepare_rank_mapping", "function", arguments={"config": best["config"]},
-                               tool_version=TOOL_VERSION) as call:
-                    self.prepared_mapping = self.public(self.mapping_trial(best["config"], None))
-                    call.result(self.prepared_mapping)
-        self.timings_ms["mapping_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
         # 0.2.20y: the two-tree trial is prepared only when the model asks for it; the
         # blocked hierarchy beat it on every public and perturbed AllReduce example.
         self.timings_ms["tree_prepare"] = 0.0
@@ -486,6 +474,20 @@ class Evaluator:
                                tool_version=TOOL_VERSION) as call:
                     call.result(self.prepare_blocks(self.planner, best["config"]))
         self.timings_ms["blocks_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
+        prepare_started = perf_counter()
+        if built:
+            best = min(self.results.values(), key=lambda row: row["score"])
+            # A remapped schedule needs a routing pass about as long as the ranking pass,
+            # plus its rebuild; start it only if that still fits in the model-wait window.
+            estimate = self.timings_ms["portfolio_rank"] / 1000
+            if mappable(self.planner, best["config"]) and not self.idle_for(estimate):
+                self.prepared_mapping = {"reason": "no_idle_time", "estimate_s": round(estimate, 3)}
+            elif mappable(self.planner, best["config"]):
+                with tool_call("prepare_rank_mapping", "function", arguments={"config": best["config"]},
+                               tool_version=TOOL_VERSION) as call:
+                    self.prepared_mapping = self.public(self.mapping_trial(best["config"], None))
+                    call.result(self.prepared_mapping)
+        self.timings_ms["mapping_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
         return rows, ranked
 
     def speculate(self) -> None:
