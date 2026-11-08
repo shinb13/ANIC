@@ -746,6 +746,67 @@ class HierarchicalAllReduceTests(unittest.TestCase):
         self.assertLess(results["hier"], 0.85 * results["plain"])
 
 
+class GreedyAllocationTests(unittest.TestCase):
+    def test_greedy_counts_match_replay_and_never_lose_a_round(self):
+        for family, short, raw in (("mesh2d", "ar", {"algorithm": "rs_ag", "split": 16, "path_width": 8, "rs_dims": 4}),
+                                   ("uneven_pods", "ag", {"algorithm": "doubling", "split": 1, "path_width": 8})):
+            with self.subTest(family=family):
+                task, topology = public_case(family, short)
+                planner = Planner(task, topology, sum_notation=True)
+                config = planner.normalize_config(raw)
+                chunk = planner.data_size // config["split"]
+                specs = planner.round_specs(config)
+                before = [planner.split_aware_round_us(spec["plan"], spec["chunks"], chunk) for spec in specs]
+                planner.greedy_allocation = True
+                after = [planner.split_aware_round_us(spec["plan"], spec["chunks"], chunk) for spec in specs]
+                self.assertTrue(all(a <= b * (1 + 1e-9) + 0.5 for a, b in zip(after, before)))
+                self.assertLess(sum(after), sum(before))
+                answer, _ = split_path_bound_transfers(planner.network, planner.build(config), chunk)
+                validate_answer(task, topology, answer, planner.network.raw)
+                self.assertAlmostEqual(replay_estimate(task, topology, answer, planner.network.raw)["total_us"],
+                                       planner.split_aware_us(config), delta=1e-6 * sum(after))
+
+
+class HierBlocksTests(unittest.TestCase):
+    def test_hier_blocks_validate_and_match_prediction(self):
+        data = two_plane_input("all-reduce", ranks=16, candidates=(1, 2, 4, 8))
+        for short in (False, True):
+            planner = Planner(data["task"], data["topology"], sum_notation=short)
+            order = planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 2, "rs_dims": 3})["order"]
+            for hb_rs, k, cross in (([order[:3]], 1, "doubling"), ([order[:2], order[2:3]], 0, "doubling"),
+                                    ([order[:1], order[1:3]], 1, "block"), ([order[:3]], 0, "block")):
+                with self.subTest(sum_notation=short, hb_rs=hb_rs, k=k, cross=cross):
+                    config = planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 2,
+                                                       "hb_rs": hb_rs, "hb_k": k, "hb_cross": cross})
+                    answer = planner.build(config)
+                    validate_answer(data["task"], data["topology"], answer)
+                    self.assertEqual(answer["round_count"], planner.round_count(config))
+                    self.assertAlmostEqual(planner.predict(config)["us"],
+                                           replay_estimate(data["task"], data["topology"], answer)["total_us"], places=6)
+
+    def test_bad_hier_blocks_are_rejected(self):
+        data = two_plane_input("all-reduce", ranks=16, candidates=(1, 2, 4, 8))
+        planner = Planner(data["task"], data["topology"])
+        for raw in ({"hb_rs": [[1, 2, 4, 8]]}, {"hb_rs": [[1], [1]]}, {"hb_rs": [[1]], "hb_k": 4},
+                    {"hb_rs": [[1]], "hb_cross": "ring"}, {"hb_rs": [], "hb_k": 0},
+                    {"hb_rs": [[1]], "hier_k": 1}):
+            with self.subTest(raw=raw), self.assertRaises(AgentCCError):
+                planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 1, **raw})
+
+    def test_search_finds_public_mesh2d_gain(self):
+        task, topology = public_case("mesh2d", "ar")
+        planner = Planner(task, topology, sum_notation=True)
+        plain = planner.normalize_config({"algorithm": "rs_ag", "split": 16, "path_width": 8, "rs_dims": 4})
+        before = planner.split_aware_us(plain)
+        planner.greedy_allocation = True
+        config, predicted = planner.hb_search(16, 8, 4)
+        self.assertLess(predicted, 0.7 * before)
+        answer, _ = split_path_bound_transfers(planner.network, planner.build(config), planner.data_size // 16)
+        validate_answer(task, topology, answer, planner.network.raw)
+        self.assertAlmostEqual(replay_estimate(task, topology, answer, planner.network.raw)["total_us"], predicted,
+                               delta=1e-6 * predicted)
+
+
 class TransferSplitTests(unittest.TestCase):
     @staticmethod
     def _loads(answer, planner):
@@ -1142,7 +1203,7 @@ class AgentLoopTests(unittest.TestCase):
                     "parse", "portfolio_rank", "portfolio_build",
                     "model", "portfolio_join", "model_candidates", "select_validate", "refine_validate",
                     "mapping_generation", "mapping_prepare", "rank_mapping",
-                    "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate", "final_validate", "speculative_finalize", "hier_validate",
+                    "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate", "final_validate", "speculative_finalize", "hier_validate", "hier_blocks_validate", "greedy_validate",
                 })
 
     def test_initial_predictions_obey_current_task_constraints(self):
@@ -1483,6 +1544,8 @@ class AgentLoopTests(unittest.TestCase):
         def without_hierarchy(events):
             module = loader(events)
             module.Evaluator.try_hierarchy = lambda _self, best, _call: (best, {"adopted": False})
+            module.Evaluator.try_hier_blocks = lambda _self, best, _call: (best, {"adopted": False})
+            module.Evaluator.try_greedy = lambda _self, best, _call: (best, {"adopted": False})
             return module
 
         for choice in (0, 1):
@@ -1503,18 +1566,20 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(results[0][2]["requests"][0], results[1][2]["requests"][0])
         self.assertIn("parent_llm_call_id", results[1][2]["tools"][-1])
 
-    def test_hierarchy_is_adopted_on_public_allreduce_and_validated(self):
+    def test_hier_blocks_are_adopted_on_public_allreduce_and_validated(self):
         task, topology = public_case("nvlink_like", "ar")
         result, audit, events = self._run([json.dumps({"c": [], "m": 0, "t": 0})],
                                            task_input={"task": task, "topology": topology})
         validate_answer(task, topology, result["answer"])
-        detail = audit["hierarchy"]
+        detail = audit["hier_blocks"]
         self.assertTrue(detail["adopted"])
         self.assertLess(detail["after_us"], detail["before_us"])
-        self.assertIn("hier_k", audit["selected"]["config"])
-        self.assertIn("agent_hierarchy", audit["selected"]["sources"])
-        self.assertIn("hier_k=", result["answer"]["strategy"])
-        self.assertTrue(any(tool["name"] == "search_hierarchy" for tool in events["tools"]))
+        self.assertAlmostEqual(detail["predicted_us"],
+                               replay_estimate(task, topology, result["answer"])["total_us"], delta=0.01)  # audit rounds to 3 decimals
+        self.assertIn("hb_rs", audit["selected"]["config"])
+        self.assertIn("agent_hier_blocks", audit["selected"]["sources"])
+        self.assertIn("hb_rs=", result["answer"]["strategy"])
+        self.assertTrue(any(tool["name"] == "search_hier_blocks" for tool in events["tools"]))
 
     def test_tree_prediction_gate_and_deferred_validation(self):
         events = {"tools": [], "recovery": []}

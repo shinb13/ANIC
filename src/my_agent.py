@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.19y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.20y).
 
 Per request, every value comes from the current task and topology:
 
@@ -65,7 +65,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 48
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.19y"
+TOOL_VERSION = "2.20y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -340,8 +340,7 @@ async def ask_model(messages: list[dict[str, str]], timeout_seconds: float, max_
 def blockable(planner: Planner, config: dict[str, Any]) -> bool:
     """Schedules whose XOR dimensions can share rounds (0.2.12y AllGather, 0.2.13y rs_ag)."""
 
-    if config["algorithm"] == "rs_ag":
-        return config.get("rs_blocks") is None
+    # 0.2.20y: AllReduce blocks are searched by the blocked hierarchy (try_hier_blocks).
     return planner.operator == "all-gather" and config["algorithm"] == "doubling" and not config.get("blocks")
 
 
@@ -467,16 +466,9 @@ class Evaluator:
                     self.prepared_mapping = self.public(self.mapping_trial(best["config"], None))
                     call.result(self.prepared_mapping)
         self.timings_ms["mapping_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
-        prepare_started = perf_counter()
-        if self.planner.operator == "all-reduce" and self.planner.allow_copy:
-            with tool_call("prepare_dual_tree", "function", arguments={"split": self.planner.splits[-1]},
-                           tool_version=TOOL_VERSION) as call:
-                try:
-                    self.prepared_tree = prepare_dual_tree(self.planner)
-                except AgentCCError as exc:
-                    self.prepared_tree = {"reason": "unroutable_tree", "error": str(exc)}
-                call.result(self.public(self.prepared_tree))
-        self.timings_ms["tree_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
+        # 0.2.20y: the two-tree trial is prepared only when the model asks for it; the
+        # blocked hierarchy beat it on every public and perturbed AllReduce example.
+        self.timings_ms["tree_prepare"] = 0.0
         prepare_started = perf_counter()
         if built:
             best = min(self.results.values(), key=lambda row: row["score"])
@@ -525,11 +517,21 @@ class Evaluator:
             details["allgather_blocks"] = {"error": f"{type(exc).__name__}: {exc}"}
         timings["blocks_validate"] = round((perf_counter() - started) * 1000, 3)
         started = perf_counter()
-        try:
-            best, details["hierarchy"] = self.try_hierarchy(best, call_id)
-        except Exception as exc:  # noqa: BLE001 - the current schedule is already valid
-            details["hierarchy"] = {"error": f"{type(exc).__name__}: {exc}"}
+        # 0.2.20y: the blocked hierarchy (next step) replaces the per-step hierarchy.
+        details["hierarchy"] = {"adopted": False, "reason": "superseded_by_hier_blocks"}
         timings["hier_validate"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        try:
+            best, details["hier_blocks"] = self.try_hier_blocks(best, call_id)
+        except Exception as exc:  # noqa: BLE001 - the current schedule is already valid
+            details["hier_blocks"] = {"error": f"{type(exc).__name__}: {exc}"}
+        timings["hier_blocks_validate"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        try:
+            best, details["greedy_allocation"] = self.try_greedy(best, call_id)
+        except Exception as exc:  # noqa: BLE001
+            details["greedy_allocation"] = {"error": f"{type(exc).__name__}: {exc}"}
+        timings["greedy_validate"] = round((perf_counter() - started) * 1000, 3)
         started = perf_counter()
         best, details["route_refinement"] = self.refine(best, call_id)
         timings["refine_validate"] = round((perf_counter() - started) * 1000, 3)
@@ -819,9 +821,110 @@ class Evaluator:
             call.result(info)
         return best, info
 
+    def _rebuilt(self, best: dict[str, Any], planner: Planner, config: dict[str, Any], source: str) -> dict[str, Any]:
+        answer = planner.build(config)
+        estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
+        size_mb = answer_size_estimate(answer) / 1e6
+        if "mapping" in best["config"]:
+            config = {**config, "mapping": best["config"]["mapping"]}
+        return {**best, "config": config, "_answer": answer, "_estimate": estimate, "_planner": planner,
+                "estimate_us": estimate["total_us"], "response_mb": round(size_mb, 2),
+                "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb,
+                "sources": best["sources"] | {source}}
+
+    def try_hier_blocks(self, best: dict[str, Any], call_id: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+        """0.2.20y: reduce-scatter blocks + one-round reduction to representatives +
+        representatives-only exchange across the costly steps + mirrored all-gather blocks,
+        priced with greedy integer route counts; adopted only if its split-aware integer
+        Replay cost (exact for the emitted schedule) beats the current schedule's."""
+
+        planner = best["_planner"]
+        info: dict[str, Any] = {"adopted": False, "before_us": best["estimate_us"]}
+        if (planner.operator != "all-reduce" or not planner.allow_copy or planner.splits[-1] < 2
+                or best["config"]["algorithm"] not in ("rs_ag", "doubling", "tree")):
+            info["reason"] = "not_applicable"
+            return best, info
+        with tool_call("search_hier_blocks", "function", arguments={"config": best["config"]},
+                       tool_version=TOOL_VERSION, parent_llm_call_id=call_id) as call:
+            split = planner.splits[-1]
+            width = best["config"]["path_width"] if best["config"]["algorithm"] == "rs_ag" else 4
+            top = split.bit_length() - 1
+            previous = planner.greedy_allocation
+            planner.greedy_allocation = True
+            try:
+                baseline = planner.split_aware_us(best["config"]) if best["config"]["algorithm"] == "rs_ag" else None
+                found = []
+                rs_dims = best["config"].get("rs_dims", top) if best["config"]["algorithm"] == "rs_ag" else top
+                for rs_dims in (rs_dims,):
+                    config, predicted = planner.hb_search(split, width, rs_dims)
+                    if config is not None:
+                        found.append((predicted, config))
+                info["baseline_greedy_us"] = baseline
+                if not found:
+                    info["reason"] = "no_option"
+                else:
+                    predicted, config = min(found, key=lambda item: item[0])
+                    info["chosen"] = {key: config[key] for key in ("split", "path_width", "rs_dims", "hb_rs",
+                                                                     "hb_k", "hb_cross")}
+                    info["predicted_us"] = predicted
+                    reference = baseline if baseline is not None else best["estimate_us"]
+                    new_cost = math.log(predicted) + SIZE_WEIGHT * planner.predict(config)["mb"]
+                    old_cost = math.log(reference) + SIZE_WEIGHT * best["response_mb"]
+                    if predicted >= reference or new_cost >= old_cost:
+                        info["reason"] = "integer_replay_screen"
+                    else:
+                        best = self._rebuilt(best, planner, config, "agent_hier_blocks")
+                        best["_greedy"] = True
+                        info.update(adopted=True, after_us=best["estimate_us"])
+            finally:
+                planner.greedy_allocation = previous
+            call.result(info)
+        return best, info
+
+    def try_greedy(self, best: dict[str, Any], call_id: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+        """0.2.20y: re-pick each round's integer route counts greedily (per round, only
+        where that lowers the round's cost) and rebuild if the whole schedule gets faster."""
+
+        planner = best["_planner"]
+        info: dict[str, Any] = {"adopted": False, "before_us": best["estimate_us"]}
+        if best.get("_greedy") or best["config"]["algorithm"] == "dual_tree" or "_planner" not in best:
+            info["reason"] = "already_greedy" if best.get("_greedy") else "not_applicable"
+            return best, info
+        with tool_call("greedy_route_allocation", "function", arguments={"config": best["config"]},
+                       tool_version=TOOL_VERSION, parent_llm_call_id=call_id) as call:
+            config = {key: value for key, value in best["config"].items() if key != "mapping"}
+            before = planner.split_aware_us(config)
+            previous = planner.greedy_allocation
+            planner.greedy_allocation = True
+            try:
+                after = planner.split_aware_us(config)
+                info.update(split_before_us=before, split_after_us=after)
+                if after < before:
+                    best = self._rebuilt(best, planner, config, "agent_greedy_routes")
+                    best["_greedy"] = True
+                    info.update(adopted=True, after_us=best["estimate_us"])
+                else:
+                    info["reason"] = "no_gain"
+            finally:
+                planner.greedy_allocation = previous
+            call.result(info)
+        return best, info
+
     def try_dual_tree(self, best: dict[str, Any], choice: int | None, call_id: str | None
                       ) -> tuple[dict[str, Any], dict[str, Any]]:
         info: dict[str, Any] = {"model_choice": choice, "before_us": best["estimate_us"], "adopted": False}
+        if choice is None:
+            info["reason"] = "model_did_not_ask"
+            return best, info
+        if (choice and self.prepared_tree.get("reason") == "ineligible" and self.planner.operator == "all-reduce"
+                and self.planner.allow_copy):
+            with tool_call("prepare_dual_tree", "function", arguments={"split": self.planner.splits[-1]},
+                           tool_version=TOOL_VERSION, parent_llm_call_id=call_id) as call:
+                try:
+                    self.prepared_tree = prepare_dual_tree(self.planner)
+                except AgentCCError as exc:
+                    self.prepared_tree = {"reason": "unroutable_tree", "error": str(exc)}
+                call.result(self.public(self.prepared_tree))
         if choice == 0 or "options" not in self.prepared_tree:
             info["reason"] = "model_disabled" if choice == 0 else self.prepared_tree["reason"]
             return best, info
@@ -999,6 +1102,8 @@ class AgentCCAgent(BaseAgent):
                     + (f" rs_blocks={config['rs_blocks']} mid_blocks={config['mid_blocks']}"
                        if "rs_blocks" in config else "")
                     + (f" hier_k={config['hier_k']}" if "hier_k" in config else "")
+                    + (f" hb_rs={config['hb_rs']} hb_k={config['hb_k']} hb_cross={config['hb_cross']}"
+                       if "hb_rs" in config else "")
                     + f" from {'+'.join(sorted(best['sources']))}"
                     # The platform returns no logs, so the answer itself carries the evidence.
                     + f" llm_ms={round(audit['llm_ms'])} model={parse_error or 'ok'}"

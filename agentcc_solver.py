@@ -38,6 +38,10 @@ BLOCK_OPTIMIZER_ITERATIONS = 24
 # A block round already spreads a rank's traffic over several partners; four routes per
 # pair kept most of the gain on the public examples at about 40% of the search time.
 BLOCK_WIDTH_CAP = 4
+# 0.2.20y: largest block (dimensions per round) of the blocked hierarchical rs_ag.
+HB_MAX_BLOCK = 4
+# Fractional optimizer iterations of the intra-group hb plans (greedy counts usually win).
+HB_ITERATIONS = 8
 OPTIMIZER_ITERATIONS = 48
 PROFILE_BYTES = 1 << 20
 
@@ -713,6 +717,71 @@ def optimize_round(
 _GOLDEN = 0.6180339887498949
 
 
+# Greedy assignments per round are capped (pairs x units / batch); batches share a load snapshot.
+GREEDY_STEPS = 512
+
+
+def _greedy_counts(plan: RoundPlan, element_inv: np.ndarray, units: int) -> np.ndarray:
+    """Integer route counts chosen unit by unit (0.2.20y).
+
+    The fractional optimizer assumes divisible traffic; with one to a few units per
+    pair the rounded result can put a pair's only slot on a slow or loaded route.
+    Here every unit goes to the candidate route with the lowest resulting cost
+    max(single-unit path time, load of its busiest element), pairs with the slowest
+    best route first, in small batches that share a load snapshot.  Costs are per
+    byte, so the result does not depend on the chunk size.
+    """
+
+    struct = getattr(plan, "_greedy_struct", None)
+    if struct is None:
+        path_count = len(plan.path_per_byte_us)
+        lengths = np.bincount(plan.entry_path, minlength=path_count)
+        starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+        dummy = len(element_inv)
+        elements = np.full((path_count, max(1, int(lengths.max(initial=1)))), dummy, dtype=np.int64)
+        elements[plan.entry_path, np.arange(len(plan.entry_path)) - starts[plan.entry_path]] = plan.entry_element
+        width = max(len(routes) for routes in plan.routes)
+        index = np.full((len(plan.routes), width), -1, dtype=np.int64)
+        flat = 0
+        for demand, routes in enumerate(plan.routes):
+            index[demand, :len(routes)] = np.arange(flat, flat + len(routes))
+            flat += len(routes)
+        valid = index >= 0
+        safe = np.where(valid, index, 0)
+        per_byte = np.where(valid, plan.path_per_byte_us[safe], np.inf)
+        order = np.argsort(-per_byte.min(axis=1), kind="stable")
+        struct = (elements, safe, valid, per_byte, order)
+        plan._greedy_struct = struct
+    elements, safe, valid, per_byte, order = struct
+    inv = np.append(element_inv, 0.0)
+    load = np.zeros(len(inv))
+    counts = np.zeros(safe.shape, dtype=np.int64)
+    size = max(1, -(-len(order) * units // GREEDY_STEPS))
+    rows = np.arange(size)
+    for _ in range(units):
+        for start in range(0, len(order), size):
+            batch = order[start:start + size]
+            candidates = safe[batch]
+            touched = elements[candidates]
+            busy = ((load[touched] + 1.0) * inv[touched]).max(axis=2)
+            cost = np.maximum(per_byte[batch], busy)
+            cost = np.where(valid[batch], cost + 1e-9 * per_byte[batch], np.inf)
+            choice = np.argmin(cost, axis=1)
+            counts[batch, choice] += 1
+            chosen = candidates[rows[:len(batch)], choice]
+            np.add.at(load, elements[chosen].ravel(), 1.0)
+    return counts
+
+
+def _per_byte_round_cost(plan: RoundPlan, element_inv: np.ndarray, counts: np.ndarray) -> float:
+    """Split-aware round cost per chunk byte (overheads ignored) of integer counts."""
+
+    flat = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]).astype(float)
+    loads = np.bincount(plan.entry_element, weights=flat[plan.entry_path], minlength=len(element_inv))
+    single = plan.path_per_byte_us[flat > 0].max(initial=0.0)
+    return float(max(single, (loads * element_inv).max(initial=0.0)))
+
+
 def _discretize(fractions: np.ndarray, units: int) -> np.ndarray:
     """Round each row to ``units`` integer pieces with per-row offsets.
 
@@ -766,6 +835,8 @@ class Planner:
         self._allocation_keys: dict[tuple[int, int], tuple] = {}
         self._integer_times: dict[tuple[int, int, int], float] = {}
         self._rank_orders: dict[str, dict[str, Any]] | None = None
+        # 0.2.20y: integer route counts chosen greedily instead of rounding fractions.
+        self.greedy_allocation = False
 
     def with_rank_order(self, order: list[int]) -> "Planner":
         """Use logical ranks internally, sharing only the physical network/route cache."""
@@ -825,17 +896,21 @@ class Planner:
     def integer_allocation(self, plan: RoundPlan, units: int) -> np.ndarray:
         """The same integer route counts are used for prediction and emission."""
 
-        key = (id(plan), units)
+        key = (id(plan), units, self.greedy_allocation)
         counts = self._allocations.get(key)
         if counts is None:
             counts = _discretize(plan.fractions, units)
+            if self.greedy_allocation and units > 0:
+                greedy = _greedy_counts(plan, self.network.element_inv, units)
+                if _per_byte_round_cost(plan, self.network.element_inv, greedy) <                         _per_byte_round_cost(plan, self.network.element_inv, counts):
+                    counts = greedy
             self._allocations[key] = counts
         return counts
 
     def integer_round_time_us(self, plan: RoundPlan, units: int, chunk_bytes: int) -> float:
         """Replay cost of the emitted integer allocation, without chunk expressions."""
 
-        key = (id(plan), units, chunk_bytes)
+        key = (id(plan), units, chunk_bytes, self.greedy_allocation)
         if key not in self._integer_times:
             counts = self.integer_allocation(plan, units)
             sizes = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]) * chunk_bytes
@@ -873,6 +948,10 @@ class Planner:
     def round_count(self, config: dict[str, Any]) -> int:
         dims = len(self.steps)
         if config["algorithm"] == "rs_ag":
+            if config.get("hb_rs") is not None:
+                costly = dims - config["rs_dims"] - config["hb_k"]
+                cross = (1 if costly else 0) if config["hb_cross"] == "block" else costly
+                return 2 * len(config["hb_rs"]) + (2 if config["hb_k"] else 0) + cross
             if config.get("rs_blocks") is not None:
                 return 2 * len(config["rs_blocks"]) + len(config["mid_blocks"])
             return 2 * config["rs_dims"] + dims - config["rs_dims"] + config.get("hier_k", 0)
@@ -968,6 +1047,27 @@ class Planner:
             config["rs_dims"] = len(rs_order)
             config["order"] = rs_order + mid_order
             config["order_source"] = "blocks"
+        hb_rs = raw.get("hb_rs")
+        if hb_rs is not None:
+            if algorithm != "rs_ag" or "rs_blocks" in config or raw.get("hier_k") is not None:
+                raise AgentCCError("hb_rs applies to rs_ag without rs_blocks or hier_k")
+            if (not isinstance(hb_rs, list) or not hb_rs
+                    or any(not isinstance(block, list) or not 1 <= len(block) <= HB_MAX_BLOCK for block in hb_rs)
+                    or any(isinstance(step, bool) or not isinstance(step, int) for block in hb_rs for step in block)):
+                raise AgentCCError(f"hb_rs must be a list of lists of 1-{HB_MAX_BLOCK} steps")
+            rs_order = [int(step) for block in hb_rs for step in block]
+            if len(set(rs_order)) != len(rs_order) or not set(rs_order) <= set(self.steps):
+                raise AgentCCError("hb_rs steps must be distinct XOR steps")
+            if len(rs_order) > split.bit_length() - 1:
+                raise AgentCCError(f"hb_rs covers more dimensions than split {split} can halve")
+            rest = [step for step in config["order"] if step not in rs_order]
+            hb_k, cross = raw.get("hb_k", 0), raw.get("hb_cross", "doubling")
+            if isinstance(hb_k, bool) or not isinstance(hb_k, int) or not 0 <= hb_k <= min(len(rest), HB_MAX_BLOCK):
+                raise AgentCCError(f"hb_k must be an integer in [0, {min(len(rest), HB_MAX_BLOCK)}]")
+            if cross not in ("doubling", "block") or (cross == "block" and len(rest) - hb_k > HB_MAX_BLOCK):
+                raise AgentCCError("hb_cross must be 'doubling' or 'block' (at most HB_MAX_BLOCK costly steps)")
+            config.update(hb_rs=[[int(step) for step in block] for block in hb_rs], hb_k=hb_k, hb_cross=cross,
+                          rs_dims=len(rs_order), order=rs_order + rest, order_source="hb")
         hier_k = raw.get("hier_k")
         if hier_k is not None:
             if algorithm != "rs_ag" or "rs_blocks" in config:
@@ -1004,6 +1104,25 @@ class Planner:
                 group = n if action == "copy" else 1 << index
                 specs.append({"plan": plan, "pairs": len(pairs), "chunks": split, "group": group,
                               "complete": action == "copy"})
+            return specs
+        if config["algorithm"] == "rs_ag" and config.get("hb_rs") is not None:
+            prior, ag_specs = 0, []
+            for index, block in enumerate(config["hb_rs"]):
+                plan = self.block_plan(block, self.round_width(config, index))
+                units = split >> (prior + len(block))
+                specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": units, "group": 1 << prior,
+                              "complete": False})
+                ag_specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": units, "group": n,
+                                 "complete": True, "_block": block})
+                prior += len(block)
+            for key, pairs, action, group, quick in self.hb_stages(config):
+                plan = self.round_plan(key, pairs, self.round_width(config, len(specs)),
+                                       HB_ITERATIONS if quick else OPTIMIZER_ITERATIONS, quick=quick)
+                specs.append({"plan": plan, "pairs": len(pairs), "chunks": split >> prior, "group": group,
+                              "complete": action == "copy"})
+            for spec in reversed(ag_specs):
+                block = spec.pop("_block")
+                specs.append({**spec, "plan": self.block_plan(block, self.round_width(config, len(specs)))})
             return specs
         if config["algorithm"] == "rs_ag" and config.get("hier_k"):
             h = config["rs_dims"]
@@ -1087,7 +1206,7 @@ class Planner:
         rounds = []
         for spec in self.round_specs(config):
             plan = spec["plan"]
-            key = (id(plan), spec["chunks"])
+            key = (id(plan), spec["chunks"], self.greedy_allocation)
             allocation_key = self._allocation_keys.get(key)
             if allocation_key is None:
                 counts = self.integer_allocation(plan, spec["chunks"])
@@ -1099,6 +1218,8 @@ class Planner:
             rounds.append(allocation_key)
         blocks = tuple(tuple(block) for block in config.get("blocks") or ())
         blocks += (("hier", config.get("hier_k", 0)),)
+        if config.get("hb_rs") is not None:
+            blocks += (("hb", tuple(tuple(b) for b in config["hb_rs"]), config["hb_k"], config["hb_cross"]),)
         blocks += tuple(("rs",) + tuple(block) for block in config.get("rs_blocks") or ())
         blocks += tuple(("mid",) + tuple(block) for block in config.get("mid_blocks") or ())
         return (self.operator, config["algorithm"], config["split"], config.get("rs_dims"),
@@ -1111,7 +1232,8 @@ class Planner:
             if not isinstance(raw, dict):
                 return None
             clean = {key: raw[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths", "blocks",
-                                               "rs_blocks", "mid_blocks", "hier_k") if key in raw}
+                                               "rs_blocks", "mid_blocks", "hier_k", "hb_rs", "hb_k", "hb_cross")
+                     if key in raw}
             return self.normalize_config(clean)
         except (AgentCCError, TypeError, AttributeError):
             return None
@@ -1573,7 +1695,138 @@ class Planner:
             owned = [sorted(owned[index] + owned[index ^ step]) for index in range(n)]
         return rounds
 
+    def hb_stages(self, config: dict[str, Any]) -> list[tuple[tuple, list[tuple[int, int]], str, int, bool]]:
+        """Middle phase of the blocked hierarchical rs_ag: (key, pairs, action, sender group, quick routes).
+
+        One round reduces the owned partial sums of each sub-cube of the next ``hb_k``
+        steps to its representative, representatives exchange over the remaining
+        (costly) steps by doubling or in one block round, and one round copies the
+        complete slots back.  Cross rounds use full route generation.
+        """
+
+        h, k, order, n = config["rs_dims"], config["hb_k"], config["order"], self.rank_count
+        cheap, costly = order[h:h + k], order[h + k:]
+        mask = sum(cheap)
+        stages = []
+        up = [(index, index & ~mask) for index in range(n) if index & mask]
+        if up:
+            stages.append((("hb-up", tuple(sorted(cheap))), up, "reduce", 1 << h, True))
+        reps = [index for index in range(n) if not index & mask]
+        if costly:
+            groups = [costly] if config["hb_cross"] == "block" else [[step] for step in costly]
+            for position, block in enumerate(groups):
+                pairs = [(index, index ^ m) for m in block_masks(sorted(block)) for index in reps]
+                sender = (1 << h) << k << (0 if config["hb_cross"] == "block" else position)
+                stages.append((("hb-x", tuple(sorted(cheap)), tuple(sorted(block))), pairs, "reduce", sender, False))
+        if up:
+            stages.append((("hb-down", tuple(sorted(cheap))), [(dst, src) for src, dst in up], "copy", n, True))
+        return stages
+
+    def hb_search(self, split: int, width: int, rs_dims: int,
+                  deadline: float | None = None) -> tuple[dict[str, Any] | None, float]:
+        """Best blocked hierarchical rs_ag for one split/width/rs_dims (split-aware integer cost).
+
+        Reduce-scatter blocks are chosen by dynamic programme over consecutive steps of the
+        auto order (each block priced twice: reduce-scatter and mirrored all-gather); the
+        middle phase (hb_k, hb_cross) is then chosen by full evaluation.  Uses whatever
+        allocation mode the planner is in.
+        """
+
+        base = self.normalize_config({"algorithm": "rs_ag", "split": split, "path_width": width, "rs_dims": rs_dims})
+        order, h, chunk = base["order"], rs_dims, self.data_size // split
+        best = {0: (0.0, 0)}
+        for start in range(h):
+            if start not in best:
+                continue
+            for end in range(start + 1, min(h, start + HB_MAX_BLOCK) + 1):
+                if deadline is not None and perf_counter() >= deadline and end > start + 1:
+                    continue
+                cost = 2 * self.split_aware_round_us(self.block_plan(order[start:end], width), split >> end, chunk)
+                total = best[start][0] + cost
+                if end not in best or total < best[end][0]:
+                    best[end] = (total, start)
+        blocks, end = [], h
+        while end:
+            start = best[end][1]
+            blocks.append(order[start:end])
+            end = start
+        blocks.reverse()
+        choice, choice_us = None, math.inf
+        # A one-round "block" exchange among representatives needs routes for XOR
+        # combinations of the costly steps; it never won on the public examples or the
+        # perturbed suite and costs route generation, so the search uses doubling only.
+        for k in range(0, min(HB_MAX_BLOCK, len(order) - h) + 1):
+            for cross in ("doubling",):
+                if deadline is not None and perf_counter() >= deadline and choice is not None:
+                    return choice, choice_us
+                try:
+                    config = self.normalize_config({"algorithm": "rs_ag", "split": split, "path_width": width,
+                                                    "hb_rs": blocks, "hb_k": k, "hb_cross": cross})
+                except AgentCCError:
+                    continue
+                cost = self.split_aware_us(config)
+                if cost < choice_us:
+                    choice, choice_us = config, cost
+        return choice, choice_us
+
+    def _build_rs_ag_hb(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        split, n = config["split"], self.rank_count
+        expression = self._expression_cache(split)
+        complete = tuple(range(n))
+        groups = [(index,) for index in range(n)]
+        owned = [list(range(split)) for _ in range(n)]
+        rounds = []
+
+        def coordinate(index: int, block: list[int]) -> int:
+            return sum(1 << bit for bit, step in enumerate(block) if index & step)
+
+        for block in config["hb_rs"]:
+            masks = block_masks(block)
+            parts = 1 << len(block)
+            keep = []
+            for index in range(n):
+                size = len(owned[index]) // parts
+                start = coordinate(index, block) * size
+                keep.append(owned[index][start:start + size])
+            pairs = self.block_pairs(block)
+            plan = self.block_plan(block, self.round_width(config, len(rounds)))
+            current = groups
+            rounds.append(self._emit(plan, pairs, [keep[dst] for _, dst in pairs], "reduce",
+                                     lambda src, piece, current=current: [expression(current[src], s) for s in piece]))
+            owned = keep
+            groups = [tuple(sorted(set(groups[index]).union(*(groups[index ^ m] for m in masks)))) for index in range(n)]
+        for key, pairs, action, _, quick in self.hb_stages(config):
+            plan = self.round_plan(key, pairs, self.round_width(config, len(rounds)),
+                                   HB_ITERATIONS if quick else OPTIMIZER_ITERATIONS, quick=quick)
+            if action == "reduce":
+                current = list(groups)
+                rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "reduce",
+                                         lambda src, piece, current=current: [expression(current[src], s)
+                                                                              for s in piece]))
+                incoming: dict[int, set] = {}
+                for src, dst in pairs:
+                    incoming.setdefault(dst, set(current[dst])).update(current[src])
+                for dst, members in incoming.items():
+                    groups[dst] = tuple(sorted(members))
+            else:
+                rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
+                                         lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
+                for _, dst in pairs:
+                    groups[dst] = complete
+        if any(group != complete for group in groups):
+            raise AgentCCError("blocked hierarchical reduce did not cover every contributor")
+        for block in reversed(config["hb_rs"]):
+            masks = block_masks(block)
+            pairs = self.block_pairs(block)
+            plan = self.block_plan(block, self.round_width(config, len(rounds)))
+            rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
+                                     lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
+            owned = [sorted(set(owned[index]).union(*(owned[index ^ m] for m in masks))) for index in range(n)]
+        return rounds
+
     def _build_rs_ag(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        if config.get("hb_rs") is not None:
+            return self._build_rs_ag_hb(config)
         if config.get("rs_blocks") is not None:
             return self._build_rs_ag_blocks(config)
         if config.get("hier_k"):
