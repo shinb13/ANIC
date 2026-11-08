@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.20y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.21y).
 
 Per request, every value comes from the current task and topology:
 
@@ -29,6 +29,7 @@ import logging
 import math
 import os
 import re
+import threading
 from time import perf_counter
 from typing import Any
 
@@ -68,7 +69,7 @@ MAX_PROPOSALS = 3
 # candidate is built (4 builds cost time and changed no selection on the perturbed suite).
 PORTFOLIO_BUILDS = 1
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.20y"
+TOOL_VERSION = "2.21y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -377,6 +378,8 @@ class Evaluator:
         # 0.2.20y: the agent waits for the model until about this time anyway; rank
         # mapping (useful on few topologies, costly on large ones) only uses that time.
         self.idle_until: float | None = None
+        # 0.2.21y: set when the model reply arrives; after that no time is idle.
+        self.model_replied = threading.Event()
         self.prepared_tree: dict[str, Any] = {"reason": "ineligible"}
         self.prepared_blocks: dict[tuple[int, int], dict[str, Any]] = {}
         self.speculative: dict[str, Any] | None = None
@@ -719,6 +722,8 @@ class Evaluator:
                 "predicted": prediction, "config": config, "_planner": mapped}
 
     def idle_for(self, seconds: float) -> bool:
+        if self.model_replied.is_set():
+            return False
         return self.idle_until is None or perf_counter() + seconds <= self.idle_until
 
     def remap(self, best: dict[str, Any], choice: int | None, call_id: str | None
@@ -1054,6 +1059,7 @@ class AgentCCAgent(BaseAgent):
                 hard_budget = max(model_budget, _configured("AGENT_LLM_HARD_SECONDS",
                                                             MODEL_HARD_FACTOR * model_budget))
                 model_task = asyncio.ensure_future(ask_model(messages, hard_budget, max_tokens))
+                model_task.add_done_callback(lambda _task: evaluator.model_replied.set())
                 done, _ = await asyncio.wait({model_task}, timeout=model_budget)
                 audit["model_wait"] = "reply"
                 if not done:
