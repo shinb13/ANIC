@@ -1192,6 +1192,7 @@ class AgentLoopTests(unittest.TestCase):
         costs = [cost for cost, _, _ in ranked]
         self.assertEqual(costs, sorted(costs))
 
+    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_model_mapping_choice_changes_the_current_instance_schedule(self):
         task, topology = public_case("uneven_pods", "ar")
         outputs = []
@@ -1211,6 +1212,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("model_mapping", outputs[1][1]["selected"]["sources"])
         self.assertEqual(sorted(mapped["rank_order"]), list(range(256)))
 
+    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_mapping_tool_keeps_model_link_and_original_candidate(self):
         events = {"tools": [], "recovery": []}
         module = self._load_agent_module(events)
@@ -1235,6 +1237,7 @@ class AgentLoopTests(unittest.TestCase):
         validate_answer(task, topology, refined["_answer"])
         self.assertIsNot(mapped["_planner"], planner)
 
+    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_mapping_screen_rejects_a_slower_schedule_without_building_it(self):
         module = self._load_agent_module({"tools": [], "recovery": []})
         task, topology = public_case("mesh2d", "ar")
@@ -1247,6 +1250,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(detail["reason"], "integer_replay_screen")
         self.assertNotIn("candidate", detail)
 
+    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_mapping_defers_validation_to_the_final_answer(self):
         module = self._load_agent_module({"tools": [], "recovery": []})
         task, topology = public_case("uneven_pods", "ar")
@@ -1287,7 +1291,7 @@ class AgentLoopTests(unittest.TestCase):
         with patch.object(planner, "build", wraps=planner.build) as build:
             rows, _ = evaluator.run_portfolio()
             self.assertEqual(build.call_count, 2)
-            self.assertEqual(sum(row["status"] == "duplicate" for row in rows), 6)
+            self.assertEqual(sum(row["status"] == "duplicate" for row in rows), 2)  # 2 splits x widths (8, 16)
             duplicate = evaluator.evaluate({"algorithm": "doubling", "split": 1, "path_width": 16},
                                            "model", "model-call-123")
             self.assertEqual(duplicate["status"], "duplicate")
@@ -1364,6 +1368,20 @@ class AgentLoopTests(unittest.TestCase):
         emergency = evaluator.emergency()
         validate_answer(data["task"], data["topology"], emergency["_answer"])
 
+    def test_rank_mapping_is_off_by_default(self):
+        data = two_plane_input("all-reduce")
+        result, audit, events = self._run(['{"c":[],"m":1}'], task_input=data)
+        validate_answer(data["task"], data["topology"], result["answer"])
+        self.assertEqual(audit["rank_mapping"]["reason"], "disabled")
+        self.assertNotIn("mapping", audit["selected"]["config"])
+        request = events["requests"][0]["messages"]
+        self.assertNotIn('"m"', request[0]["content"])
+        self.assertNotIn("rank_mapping", request[1]["content"])
+        module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
+        reduce = module.Planner(**{k: v for k, v in zip(("task", "topology"), data.values())})
+        self.assertFalse(module.mappable(reduce, {"algorithm": "rs_ag"}))
+
+    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_mappable_schedules(self):
         module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
         gather = module.Planner(**{k: v for k, v in zip(("task", "topology"), two_plane_input("all-gather").values())})
@@ -1373,6 +1391,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertFalse(module.mappable(reduce, {"algorithm": "doubling"}))
         self.assertFalse(module.mappable(reduce, {"algorithm": "tree"}))
 
+    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_speculative_result_is_reused_only_without_model_choices(self):
         task, topology = public_case("uneven_pods", "ar")
         data = {"task": task, "topology": topology}

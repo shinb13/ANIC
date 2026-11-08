@@ -13,6 +13,8 @@ not platform solve times and not real model latency.
 
 import argparse
 import asyncio
+import concurrent.futures
+import math
 import contextlib
 import json
 import logging
@@ -38,9 +40,9 @@ def pin_one_cpu() -> None:
         kernel32 = ctypes.windll.kernel32
         kernel32.GetCurrentProcess.restype = ctypes.c_void_p
         kernel32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-        kernel32.SetProcessAffinityMask(kernel32.GetCurrentProcess(), 1 << 2)
+        kernel32.SetProcessAffinityMask(kernel32.GetCurrentProcess(), 1 << int(os.environ.get("BENCH_CPU", "2")))
     else:
-        os.sched_setaffinity(0, {2})
+        os.sched_setaffinity(0, {int(os.environ.get("BENCH_CPU", "2"))})
 
 
 def install_stub_sdk(spans: list, tools: list) -> None:
@@ -110,7 +112,7 @@ def install_mock_model(openai_module, delay: float, reply: str = "") -> None:
     openai_module.AsyncOpenAI = Client
 
 
-def run_one(src: str, family: str, short: str, delay: float, reply: str = "") -> dict:
+def run_one(src: str, family: str, short: str, delay: float, reply: str = "", examples: Path = EXAMPLES) -> dict:
     pin_one_cpu()
     sys.path.insert(0, str(Path(src).resolve()))
     sys.dont_write_bytecode = True
@@ -134,7 +136,7 @@ def run_one(src: str, family: str, short: str, delay: float, reply: str = "") ->
     from agentcc_solver import estimate_schedule_time_us, validate_answer
     from src.my_agent import AgentCCAgent
 
-    base = EXAMPLES / family / short
+    base = Path(examples) / family / short
     task = json.loads((base / "task.json").read_text(encoding="utf-8"))
     topology = json.loads((base / "topology.json").read_text(encoding="utf-8"))
     started = perf_counter()
@@ -187,28 +189,35 @@ def run_one(src: str, family: str, short: str, delay: float, reply: str = "") ->
 
 
 def run_all(args) -> int:
+    examples = Path(args.examples)
+    families = FAMILIES if examples == EXAMPLES else sorted(d.name for d in examples.iterdir() if d.is_dir())
+    jobs = [(family, short) for family in families if not args.only or args.only in family for short in ("ag", "ar")]
+
+    def run_case(item):
+        index, (family, short) = item
+        samples = []
+        env = {**os.environ, "BENCH_CPU": str(2 + index % max(1, args.jobs))}
+        for _ in range(args.repeat):
+            completed = subprocess.run(
+                [sys.executable, __file__, "--one", family, short, "--src", args.src, "--delay", str(args.delay),
+                 "--reply", args.reply, "--examples", str(examples)],
+                capture_output=True, text=True, encoding="utf-8", env=env,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(f"{family}/{short}: {completed.stderr[-2000:]}")
+            samples.append(json.loads(completed.stdout.strip().splitlines()[-1]))
+        return samples
+
     results = []
-    for family in FAMILIES:
-        if args.only and args.only not in family:
-            continue
-        for short in ("ag", "ar"):
-            samples = []
-            for _ in range(args.repeat):
-                completed = subprocess.run(
-                    [sys.executable, __file__, "--one", family, short, "--src", args.src, "--delay", str(args.delay),
-                     "--reply", args.reply],
-                    capture_output=True, text=True, encoding="utf-8",
-                )
-                if completed.returncode != 0:
-                    print(completed.stderr[-2000:], file=sys.stderr)
-                    return 1
-                samples.append(json.loads(completed.stdout.strip().splitlines()[-1]))
+    with concurrent.futures.ThreadPoolExecutor(max(1, args.jobs)) as pool:
+        for samples in pool.map(run_case, enumerate(jobs)):
             median = sorted(samples, key=lambda row: row["solve_s"])[len(samples) // 2]
             median["solve_s_samples"] = [round(row["solve_s"], 3) for row in samples]
             results.append(median)
             print(f"{median['case']:22s} {median['verdict'][:20]:7s} T={median['replay_us'] or 0:10.1f}us "
                   f"solve={median['solve_s']:6.2f}s mb={median['response_mb']:5.2f} llm={median['llm_s']:5.2f}s "
                   f"plan={median['planning_s']:5.2f}s err={median['model_error']} {median['strategy']}", flush=True)
+
     Path(args.out).write_text(json.dumps({"delay": args.delay, "src": args.src, "cases": results}, indent=1), encoding="utf-8")
     return 0
 
@@ -226,7 +235,9 @@ def compare(before_path: str, after_path: str) -> int:
         times_after.append(new["solve_s"])
         print(f"{case:22s} {new['verdict'][:5]:5s} {old['replay_us']:10.1f} {new['replay_us']:10.1f} {change:+7.2%} | "
               f"{old['solve_s']:6.2f} {new['solve_s']:6.2f} | {old['response_mb']:5.2f} {new['response_mb']:5.2f}")
-    print(f"mean replay change {statistics.mean(changes):+.2%}; worst {max(changes):+.2%}; "
+    geo = math.exp(statistics.mean(math.log1p(change) for change in changes)) - 1
+    print(f"mean replay change {statistics.mean(changes):+.2%}; geometric {geo:+.2%}; worst {max(changes):+.2%}; "
+          f"better {sum(c < -0.005 for c in changes)} worse {sum(c > 0.005 for c in changes)} of {len(changes)}; "
           f"mean solve {statistics.mean(times_before):.2f}s -> {statistics.mean(times_after):.2f}s")
     return 0
 
@@ -241,11 +252,13 @@ def main() -> int:
     parser.add_argument("--out", default="bench.json")
     parser.add_argument("--one", nargs=2, metavar=("FAMILY", "OP"))
     parser.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"))
+    parser.add_argument("--examples", default=str(EXAMPLES), help="directory of <case>/<ag|ar>/task.json")
+    parser.add_argument("--jobs", type=int, default=1, help="parallel cases, each pinned to its own CPU")
     args = parser.parse_args()
     if args.compare:
         return compare(*args.compare)
     if args.one:
-        print(json.dumps(run_one(args.src, args.one[0], args.one[1], args.delay, args.reply)))
+        print(json.dumps(run_one(args.src, args.one[0], args.one[1], args.delay, args.reply, Path(args.examples))))
         return 0
     return run_all(args)
 

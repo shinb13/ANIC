@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.18y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.19y).
 
 Per request, every value comes from the current task and topology:
 
@@ -65,7 +65,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 48
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.18y"
+TOOL_VERSION = "2.19y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -82,15 +82,35 @@ BLOCK_WIDE_BUDGET_SECONDS = 0.6
 BLOCK_WIDTHS = (16, 8)
 BLOCK_EXTRA_WIDTHS = 0
 
-SYSTEM_PROMPT = (
-    "Pick one collective schedule. The agent builds, routes, validates and Replay-measures your pick "
-    "next to its own; lowest cost = ln(Replay us) + 0.1*response_MB wins. rs_ag: reduce-scatter on "
-    "rs_dims dims then all-gather (response grows with split); tree: tiny response, more rounds; "
-    "width: switch paths per pair. Optional m remaps the best schedule: 0 off, 1 locality, 2 resource. "
-    "Optional t, AllReduce two-tree trial: 0 off, 1 equal slots, 2 first tree 1/4, 3 first 3/4. "
-    "Omit m/t for agent choice. Gains shown are rough screens, not Replay times. "
-    'Reply JSON only: {"c":[[algorithm,split,width,rs_dims]],"m":2,"t":1} (rs_dims 0 unless rs_ag).'
-)
+def rank_mapping_enabled() -> bool:
+    """0.2.19y: rank mapping is off unless AGENTCC_RANK_MAPPING is set.
+
+    On a 70-instance perturbed local suite (platform-speed emulation) mapping changed
+    the communication score by -0.01 on average while its preparation cost 0.1-0.6 s
+    of local compute per case (about 4.5x that on the platform), an estimated -0.24
+    points overall.
+    """
+
+    return os.environ.get("AGENTCC_RANK_MAPPING", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def system_prompt() -> str:
+    mapping = rank_mapping_enabled()
+    return (
+        "Pick one collective schedule. The agent builds, routes, validates and Replay-measures your pick "
+        "next to its own; lowest cost = ln(Replay us) + 0.1*response_MB wins. rs_ag: reduce-scatter on "
+        "rs_dims dims then all-gather (response grows with split); tree: tiny response, more rounds; "
+        "width: switch paths per pair. "
+        + ("Optional m remaps the best schedule: 0 off, 1 locality, 2 resource. " if mapping else "")
+        + "Optional t, AllReduce two-tree trial: 0 off, 1 equal slots, 2 first tree 1/4, 3 first 3/4. "
+        + ("Omit m/t for agent choice. Gains shown are rough screens, not Replay times. " if mapping
+           else "Omit t for agent choice. ")
+        + 'Reply JSON only: {"c":[[algorithm,split,width,rs_dims]],' + ('"m":2,' if mapping else "")
+        + '"t":1} (rs_dims 0 unless rs_ag).'
+    )
+
+
+SYSTEM_PROMPT = system_prompt()
 
 
 def _configured(name: str, default: float) -> float:
@@ -148,8 +168,10 @@ def portfolio_raw(planner: Planner) -> list[dict[str, Any]]:
 
     raws: list[dict[str, Any]] = []
     if planner.operator == "all-gather":
+        # 0.2.19y: widths 2 and 4 were rarely best on the local suite; dropping them saved
+        # route-plan time at no measurable communication cost.
         for split in planner.splits[:2]:
-            for width in (2, 4, 8, 16):
+            for width in (8, 16):
                 raws.append({"algorithm": "doubling", "split": split, "path_width": width})
         return raws
     algorithms = ALGORITHMS[planner.operator] if planner.allow_copy else ("doubling",)
@@ -324,6 +346,8 @@ def blockable(planner: Planner, config: dict[str, Any]) -> bool:
 def mapping_seed_config(planner: Planner) -> dict[str, Any] | None:
     """The schedule shape whose rank mapping is screened for the prompt (no routing needed)."""
 
+    if not rank_mapping_enabled():
+        return None
     if planner.operator == "all-gather":
         return {"algorithm": "doubling", "split": planner.splits[0]}
     if planner.allow_copy and planner.splits[-1] >= 2:
@@ -334,7 +358,8 @@ def mapping_seed_config(planner: Planner) -> dict[str, Any] | None:
 def mappable(planner: Planner, config: dict[str, Any]) -> bool:
     """Schedules whose XOR dimensions can be re-paired by a logical rank order (0.2.11y adds AllGather)."""
 
-    return config["algorithm"] == "rs_ag" or (planner.operator == "all-gather" and config["algorithm"] == "doubling")
+    return rank_mapping_enabled() and (
+        config["algorithm"] == "rs_ag" or (planner.operator == "all-gather" and config["algorithm"] == "doubling"))
 
 
 def _public_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -660,6 +685,9 @@ class Evaluator:
     def remap(self, best: dict[str, Any], choice: int | None, call_id: str | None
               ) -> tuple[dict[str, Any], dict[str, Any]]:
         info: dict[str, Any] = {"model_choice": choice, "adopted": False, "before_us": best["estimate_us"]}
+        if not rank_mapping_enabled():
+            info["reason"] = "disabled"
+            return best, info
         if not mappable(self.planner, best["config"]) or choice == 0:
             info["reason"] = "not_mappable" if not mappable(self.planner, best["config"]) else "model_kept_original"
             return best, info
@@ -862,7 +890,7 @@ class AgentCCAgent(BaseAgent):
             with state("reasoning"):
                 llm_started = perf_counter()
                 audit["llm_started_ms"] = round((llm_started - started) * 1000, 3)
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+                messages = [{"role": "system", "content": system_prompt()}, {"role": "user", "content": prompt}]
                 hard_budget = max(model_budget, _configured("AGENT_LLM_HARD_SECONDS",
                                                             MODEL_HARD_FACTOR * model_budget))
                 model_task = asyncio.ensure_future(ask_model(messages, hard_budget, max_tokens))
