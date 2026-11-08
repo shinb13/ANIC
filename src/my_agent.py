@@ -83,15 +83,14 @@ BLOCK_WIDTHS = (16, 8)
 BLOCK_EXTRA_WIDTHS = 0
 
 def rank_mapping_enabled() -> bool:
-    """0.2.19y: rank mapping is off unless AGENTCC_RANK_MAPPING is set.
+    """Rank mapping on unless AGENTCC_RANK_MAPPING=0.
 
-    On a 70-instance perturbed local suite (platform-speed emulation) mapping changed
-    the communication score by -0.01 on average while its preparation cost 0.1-0.6 s
-    of local compute per case (about 4.5x that on the platform), an estimated -0.24
-    points overall.
+    0.2.19y first switched it off (a perturbed local suite showed little gain for
+    0.1-0.6 s of compute), but on the platform directed_ring AllGather lost 23%
+    without it.  It is back behind a cheap same-routing screen (see mapping_trial).
     """
 
-    return os.environ.get("AGENTCC_RANK_MAPPING", "0").strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get("AGENTCC_RANK_MAPPING", "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def system_prompt() -> str:
@@ -661,21 +660,40 @@ class Evaluator:
                 "sources": {"agent_emergency"}, "_answer": answer, "_estimate": estimate, "_planner": self.planner}
 
     def mapping_trial(self, base_config: dict[str, Any], choice: int | None) -> dict[str, Any]:
+        """Pick a rank order and predict it.
+
+        0.2.19y: the path-work proxy did not predict when mapping pays off, so every
+        eligible order is first compared with the original under the same cheap routing
+        (screen_us); full route generation runs only for the best order, and only if it
+        beats the original in that comparison.
+        """
+
         options = self.planner.mapping_candidates(base_config)
         preferred = {1: "locality", 2: "resource"}.get(choice)
-        eligible = [option for option in options if option["reachable"] and option["proxy_gain"] >= 0.0025
+        eligible = [option for option in options if option["reachable"]
                     and tuple(option["rank_order"]) != self.planner.rank_order
                     and (preferred is None or option["mapping"] == preferred)]
         info: dict[str, Any] = {"options": options}
         if not eligible:
-            return {**info, "reason": "proxy_screen"}
-        option = max(eligible, key=lambda item: item["proxy_gain"])
-        key = tuple(option["rank_order"])
-        mapped = self.mapping_planners.get(key)
-        if mapped is None:
-            mapped = self.planner.with_rank_order(option["rank_order"])
-            self.mapping_planners[key] = mapped
+            return {**info, "reason": "no_option"}
         raw = {key: value for key, value in base_config.items() if key not in ("order", "mapping")}
+        try:
+            screened = []
+            original_us = self.planner.screen_us(raw)
+            for option in eligible:
+                key = tuple(option["rank_order"])
+                mapped = self.mapping_planners.get(key)
+                if mapped is None:
+                    mapped = self.planner.with_rank_order(option["rank_order"])
+                    self.mapping_planners[key] = mapped
+                screened.append((mapped.screen_us(raw), option, mapped))
+        except AgentCCError as exc:
+            return {**info, "reason": "unroutable_mapping", "error": str(exc)}
+        screen_us, option, mapped = min(screened, key=lambda item: item[0])
+        info["screen"] = {"original_us": original_us,
+                          "mapped_us": {item[1]["mapping"]: item[0] for item in screened}}
+        if screen_us >= original_us:
+            return {**info, "reason": "same_routing_screen"}
         try:
             config = mapped.normalize_config(raw)
             prediction = mapped.predict(config)

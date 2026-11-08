@@ -1222,9 +1222,11 @@ class AgentLoopTests(unittest.TestCase):
         evaluator.run_portfolio()
         best = evaluator.select()
         original = deepcopy(best["_answer"])
-        self.assertEqual(evaluator.prepared_mapping["mapping"], "resource")
+        prepared = evaluator.prepared_mapping["mapping"]
+        self.assertIn(prepared, ("locality", "resource"))
+        choice = {"locality": 1, "resource": 2}[prepared]
         with patch("agentcc_solver.optimize_round", side_effect=AssertionError("mapping prediction cache missed")):
-            mapped, detail = evaluator.remap(best, 2, "model-map-123")
+            mapped, detail = evaluator.remap(best, choice, "model-map-123")
         self.assertTrue(detail["adopted"])
         self.assertEqual(best["_answer"], original)
         self.assertEqual(planner.build(best["config"]), original)
@@ -1247,8 +1249,31 @@ class AgentLoopTests(unittest.TestCase):
         result, detail = evaluator.remap(best, 1, None)
         self.assertIs(result, best)
         self.assertFalse(detail["adopted"])
-        self.assertEqual(detail["reason"], "integer_replay_screen")
+        self.assertIn(detail["reason"], ("same_routing_screen", "integer_replay_screen"))
         self.assertNotIn("candidate", detail)
+
+    def test_same_routing_screen_skips_full_prediction_of_a_worse_order(self):
+        module = self._load_agent_module({"tools": [], "recovery": []})
+        task, topology = public_case("mesh2d", "ag")
+        planner = Planner(task, topology, sum_notation=True)
+        evaluator = module.Evaluator(planner)
+        config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 8})
+        with patch.object(Planner, "predict", side_effect=AssertionError("full prediction after a failed screen")):
+            trial = evaluator.mapping_trial(config, None)
+        self.assertEqual(trial["reason"], "same_routing_screen")
+        self.assertEqual(set(trial["screen"]["mapped_us"]), {"locality", "resource"})
+        self.assertTrue(all(value >= trial["screen"]["original_us"] for value in trial["screen"]["mapped_us"].values()))
+
+    def test_screen_uses_cheap_plans_and_leaves_full_plans_alone(self):
+        task, topology = public_case("directed_ring", "ag")
+        planner = Planner(task, topology, sum_notation=True)
+        raw = {"algorithm": "doubling", "split": 1, "path_width": 8}
+        screened = planner.screen_us(raw)
+        self.assertGreater(screened, 0)
+        self.assertFalse(any(key[0] == "xor" for key in planner._plans))
+        self.assertTrue(all(key[0] == "xor-screen" for key in planner._plans))
+        self.assertGreater(planner.predict(planner.normalize_config(raw))["us"], 0)
+        self.assertTrue(any(key[0] == "xor" for key in planner._plans))
 
     @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_mapping_defers_validation_to_the_final_answer(self):
@@ -1368,9 +1393,10 @@ class AgentLoopTests(unittest.TestCase):
         emergency = evaluator.emergency()
         validate_answer(data["task"], data["topology"], emergency["_answer"])
 
-    def test_rank_mapping_is_off_by_default(self):
+    def test_rank_mapping_can_be_switched_off(self):
         data = two_plane_input("all-reduce")
-        result, audit, events = self._run(['{"c":[],"m":1}'], task_input=data)
+        result, audit, events = self._run(['{"c":[],"m":1}'], task_input=data,
+                                           environment={"AGENTCC_RANK_MAPPING": "0"})
         validate_answer(data["task"], data["topology"], result["answer"])
         self.assertEqual(audit["rank_mapping"]["reason"], "disabled")
         self.assertNotIn("mapping", audit["selected"]["config"])
@@ -1379,7 +1405,9 @@ class AgentLoopTests(unittest.TestCase):
         self.assertNotIn("rank_mapping", request[1]["content"])
         module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
         reduce = module.Planner(**{k: v for k, v in zip(("task", "topology"), data.values())})
-        self.assertFalse(module.mappable(reduce, {"algorithm": "rs_ag"}))
+        with patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "0"}):
+            self.assertFalse(module.mappable(reduce, {"algorithm": "rs_ag"}))
+        self.assertTrue(module.mappable(reduce, {"algorithm": "rs_ag"}))
 
     @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_mappable_schedules(self):
