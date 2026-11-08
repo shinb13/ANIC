@@ -31,6 +31,17 @@ ALGORITHMS = {
     "all-reduce": ("rs_ag", "doubling", "tree"),
 }
 MAX_PATH_WIDTH = 16
+MAX_BLOCK_DIMS = 3
+# Block rounds carry 3-7x more pairs than an XOR round; fewer Frank-Wolfe steps keep the
+# search inside the model wait.  Predictions stay exact: they price the plan actually emitted.
+BLOCK_OPTIMIZER_ITERATIONS = 24
+# A block round already spreads a rank's traffic over several partners; four routes per
+# pair kept most of the gain on the public examples at about 40% of the search time.
+BLOCK_WIDTH_CAP = 4
+# 0.2.20y: largest block (dimensions per round) of the blocked hierarchical rs_ag.
+HB_MAX_BLOCK = 4
+# Fractional optimizer iterations of the intra-group hb plans (greedy counts usually win).
+HB_ITERATIONS = 8
 OPTIMIZER_ITERATIONS = 48
 PROFILE_BYTES = 1 << 20
 
@@ -257,6 +268,8 @@ class Network:
         self._route_cache: dict[tuple[int, int], list[Route]] = {}
         self._segment_cache: dict[tuple[int, int], list[tuple[tuple[str, ...], float]]] = {}
         self._route_objects: dict[tuple[str, ...], Route] = {}
+        self._quick_cache: dict[tuple[int, int, int], list[Route]] = {}
+        self._ports: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
         self._prepare_switch_graph()
 
     def _prepare_switch_graph(self) -> None:
@@ -337,6 +350,122 @@ class Network:
         )
         self._route_objects[nodes] = route
         return route
+
+    def _port_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Padded per-rank switch ports and costs (inf padding) for batched route search."""
+
+        if self._ports is None:
+            n = len(self.ranks)
+            width_out = max((len(self.rank_out[r]) for r in self.ranks), default=0) or 1
+            width_in = max((len(self.rank_in[r]) for r in self.ranks), default=0) or 1
+            out_sw = np.zeros((n, width_out), dtype=np.int64)
+            out_c = np.full((n, width_out), inf)
+            in_sw = np.zeros((n, width_in), dtype=np.int64)
+            in_c = np.full((n, width_in), inf)
+            for index, rank in enumerate(self.ranks):
+                for slot, (switch, cost) in enumerate(self.rank_out[rank]):
+                    out_sw[index, slot], out_c[index, slot] = switch, cost
+                for slot, (switch, cost) in enumerate(self.rank_in[rank]):
+                    in_sw[index, slot], in_c[index, slot] = switch, cost
+            self._ports = (out_sw, out_c, in_sw, in_c)
+        return self._ports
+
+    def quick_routes_batch(self, pairs: list[tuple[int, int]], width: int) -> list[list[Route]]:
+        """``quick_routes`` for many pairs: one numpy pass picks every pair's cheapest switch routes."""
+
+        width = max(1, width)
+        result: list[list[Route] | None] = [self._quick_cache.get((s, d, width)) for s, d in pairs]
+        todo = [index for index, routes in enumerate(result) if routes is None]
+        if todo and self.switch_names:
+            out_sw, out_c, in_sw, in_c = self._port_arrays()
+            src = np.array([pairs[index][0] for index in todo])
+            dst = np.array([pairs[index][1] for index in todo])
+            for start in range(0, len(todo), 2048):
+                part = slice(start, start + 2048)
+                s, d = src[part], dst[part]
+                total = (out_c[s][:, :, None] + self.switch_distance[out_sw[s][:, :, None], in_sw[d][:, None, :]]
+                         + in_c[d][:, None, :]).reshape(len(s), -1)
+                limit = min(width, total.shape[1])
+                if limit < total.shape[1]:
+                    head = np.argpartition(total, limit - 1, axis=1)[:, :limit]
+                else:
+                    head = np.broadcast_to(np.arange(total.shape[1]), (len(s), total.shape[1]))
+                costs = np.take_along_axis(total, head, axis=1)
+                ranking = np.argsort(costs, axis=1, kind="stable")
+                head = np.take_along_axis(head, ranking, axis=1)
+                costs = np.take_along_axis(costs, ranking, axis=1)
+                columns = in_sw.shape[1]
+                for row, index in enumerate(todo[part]):
+                    source, destination = pairs[index]
+                    names = self.ranks[source], self.ranks[destination]
+                    candidates: dict[tuple[str, ...], float] = {}
+                    if names in self.edge_index:
+                        candidates[names] = float(self.static_cost[self.edge_index[names]])
+                    for flat, cost in zip(head[row].tolist(), costs[row].tolist()):
+                        if cost == inf:
+                            continue
+                        u = int(out_sw[source, flat // columns])
+                        v = int(in_sw[destination, flat % columns])
+                        nodes = ((names[0], self.switch_names[u], names[1]) if u == v
+                                 else (names[0],) + self._switch_path(u, v) + (names[1],))
+                        candidates.setdefault(nodes, cost)
+                    result[index] = self._finish_quick(source, destination, width, candidates)
+        for index in todo:
+            if result[index] is None:
+                source, destination = pairs[index]
+                result[index] = self.quick_routes(source, destination, width)
+        return result  # type: ignore[return-value]
+
+    def _finish_quick(self, source: int, destination: int, width: int,
+                      candidates: dict[tuple[str, ...], float]) -> list[Route]:
+        if not candidates:
+            raise AgentCCError(f"no legal route from {self.ranks[source]} to {self.ranks[destination]}")
+        ordered = sorted(candidates.items(), key=lambda item: (item[1], len(item[0])))
+        if not self.allow_detour:
+            fewest = min(len(nodes) for nodes, _ in ordered)
+            ordered = [item for item in ordered if len(item[0]) == fewest]
+        routes = [self._route(nodes) for nodes, _ in ordered[:width]]
+        self._quick_cache[(source, destination, width)] = routes
+        return routes
+
+    def quick_routes(self, source: int, destination: int, width: int) -> list[Route]:
+        """Up to ``width`` cheapest switch routes, without the diversity pass of ``routes``.
+
+        Used for the extra XOR combinations of dimension blocks, where the
+        full candidate generation dominated the search time.
+        """
+
+        key = (source, destination, width)
+        cached = self._quick_cache.get(key)
+        if cached is not None:
+            return cached
+        src, dst = self.ranks[source], self.ranks[destination]
+        candidates: dict[tuple[str, ...], float] = {}
+        if (src, dst) in self.edge_index:
+            candidates[(src, dst)] = float(self.static_cost[self.edge_index[(src, dst)]])
+        out_list, in_list = self.rank_out[src], self.rank_in[dst]
+        if out_list and in_list:
+            ui = np.array([u for u, _ in out_list])
+            vi = np.array([v for v, _ in in_list])
+            total = (np.array([c for _, c in out_list])[:, None] + self.switch_distance[np.ix_(ui, vi)]
+                     + np.array([c for _, c in in_list])[None, :]).ravel()
+            limit = min(width, total.size)
+            head = np.argpartition(total, limit - 1)[:limit] if limit < total.size else np.arange(total.size)
+            for flat in head[np.argsort(total[head], kind="stable")].tolist():
+                if not np.isfinite(total[flat]):
+                    continue
+                u, v = int(ui[flat // len(vi)]), int(vi[flat % len(vi)])
+                nodes = (src, self.switch_names[u], dst) if u == v else (src,) + self._switch_path(u, v) + (dst,)
+                candidates.setdefault(nodes, float(total[flat]))
+        if not candidates:
+            raise AgentCCError(f"no legal route from {src} to {dst}")
+        ordered = sorted(candidates.items(), key=lambda item: (item[1], len(item[0])))
+        if not self.allow_detour:
+            fewest = min(len(nodes) for nodes, _ in ordered)
+            ordered = [item for item in ordered if len(item[0]) == fewest]
+        result = [self._route(nodes) for nodes, _ in ordered[:max(1, width)]]
+        self._quick_cache[key] = result
+        return result
 
     def routes(self, source: int, destination: int) -> list[Route]:
         """Diverse switch-only candidate routes, ordered for use as the width grows."""
@@ -498,6 +627,7 @@ def optimize_round(
     pairs: list[tuple[int, int]],
     width: int,
     iterations: int = OPTIMIZER_ITERATIONS,
+    quick: bool = False,
 ) -> RoundPlan:
     """Split equal demands over candidate routes to minimize the Replay round time.
 
@@ -509,7 +639,10 @@ def optimize_round(
     """
 
     started = perf_counter()
-    route_lists = [network.routes(src, dst)[:max(1, width)] for src, dst in pairs]
+    if quick:
+        route_lists = network.quick_routes_batch(pairs, width)
+    else:
+        route_lists = [network.routes(src, dst)[:max(1, width)] for src, dst in pairs]
     demand_count = len(route_lists)
     width_max = max(len(routes) for routes in route_lists)
     index = np.full((demand_count, width_max), -1, dtype=np.int64)
@@ -584,6 +717,82 @@ def optimize_round(
 _GOLDEN = 0.6180339887498949
 
 
+# Greedy assignments per round are capped (pairs x units / batch); batches share a load snapshot.
+GREEDY_STEPS = 512
+
+
+def _greedy_counts(plan: RoundPlan, element_inv: np.ndarray, units: int) -> np.ndarray:
+    """Integer route counts chosen unit by unit (0.2.20y).
+
+    The fractional optimizer assumes divisible traffic; with one to a few units per
+    pair the rounded result can put a pair's only slot on a slow or loaded route.
+    Here every unit goes to the candidate route with the lowest resulting cost
+    max(single-unit path time, load of its busiest element), pairs with the slowest
+    best route first, in small batches that share a load snapshot.  Costs are per
+    byte, so the result does not depend on the chunk size.
+    """
+
+    struct = getattr(plan, "_greedy_struct", None)
+    if struct is None:
+        path_count = len(plan.path_per_byte_us)
+        lengths = np.bincount(plan.entry_path, minlength=path_count)
+        starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+        dummy = len(element_inv)
+        elements = np.full((path_count, max(1, int(lengths.max(initial=1)))), dummy, dtype=np.int64)
+        elements[plan.entry_path, np.arange(len(plan.entry_path)) - starts[plan.entry_path]] = plan.entry_element
+        width = max(len(routes) for routes in plan.routes)
+        index = np.full((len(plan.routes), width), -1, dtype=np.int64)
+        flat = 0
+        for demand, routes in enumerate(plan.routes):
+            index[demand, :len(routes)] = np.arange(flat, flat + len(routes))
+            flat += len(routes)
+        valid = index >= 0
+        safe = np.where(valid, index, 0)
+        per_byte = np.where(valid, plan.path_per_byte_us[safe], np.inf)
+        order = np.argsort(-per_byte.min(axis=1), kind="stable")
+        struct = (elements, safe, valid, per_byte, order)
+        plan._greedy_struct = struct
+    elements, safe, valid, per_byte, order = struct
+    inv = np.append(element_inv, 0.0)
+    load = np.zeros(len(inv))
+    counts = np.zeros(safe.shape, dtype=np.int64)
+    size = max(1, -(-len(order) * units // GREEDY_STEPS))
+    rows = np.arange(size)
+    for _ in range(units):
+        for start in range(0, len(order), size):
+            batch = order[start:start + size]
+            candidates = safe[batch]
+            touched = elements[candidates]
+            busy = ((load[touched] + 1.0) * inv[touched]).max(axis=2)
+            cost = np.maximum(per_byte[batch], busy)
+            cost = np.where(valid[batch], cost + 1e-9 * per_byte[batch], np.inf)
+            choice = np.argmin(cost, axis=1)
+            counts[batch, choice] += 1
+            chosen = candidates[rows[:len(batch)], choice]
+            np.add.at(load, elements[chosen].ravel(), 1.0)
+    return counts
+
+
+def _per_byte_round_cost(plan: RoundPlan, element_inv: np.ndarray, counts: np.ndarray) -> float:
+    """Split-aware round cost per chunk byte (overheads ignored) of integer counts."""
+
+    flat = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]).astype(float)
+    loads = np.bincount(plan.entry_element, weights=flat[plan.entry_path], minlength=len(element_inv))
+    single = plan.path_per_byte_us[flat > 0].max(initial=0.0)
+    return float(max(single, (loads * element_inv).max(initial=0.0)))
+
+
+def _split_aware_cost(plan: RoundPlan, element_inv: np.ndarray, counts: np.ndarray, chunk_bytes: int) -> float:
+    """Split-aware integer round cost (us) of integer counts, overheads included."""
+
+    flat = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]).astype(float)
+    active = flat > 0
+    loads = np.bincount(plan.entry_element, weights=flat[plan.entry_path] * chunk_bytes, minlength=len(element_inv))
+    overhead = float(plan.path_overhead_us[active].max(initial=0.0))
+    single = float((plan.path_overhead_us[active] + chunk_bytes * plan.path_per_byte_us[active]).max(initial=0.0))
+    return max(single, overhead + float((loads * element_inv).max(initial=0.0)))
+
+
 def _discretize(fractions: np.ndarray, units: int) -> np.ndarray:
     """Round each row to ``units`` integer pieces with per-row offsets.
 
@@ -630,11 +839,16 @@ class Planner:
         self.max_rounds = int(task["max_nonempty_rounds"])
         self.allow_copy = bool(task.get("allow_copy", True))
         self._plans: dict[tuple, RoundPlan] = {}
+        # (sorted block, path width) -> width cap of the block plan in use (0.2.18y).
+        self._block_caps: dict[tuple[tuple[int, ...], int], int] = {}
         self._names: dict[int, list[list[str]]] = {}
         self._allocations: dict[tuple[int, int], np.ndarray] = {}
         self._allocation_keys: dict[tuple[int, int], tuple] = {}
         self._integer_times: dict[tuple[int, int, int], float] = {}
         self._rank_orders: dict[str, dict[str, Any]] | None = None
+        # 0.2.20y: integer route counts chosen greedily instead of rounding fractions.
+        self.greedy_allocation = False
+        self._build_chunk: int | None = None
 
     def with_rank_order(self, order: list[int]) -> "Planner":
         """Use logical ranks internally, sharing only the physical network/route cache."""
@@ -646,13 +860,23 @@ class Planner:
         mapped._allocations, mapped._allocation_keys, mapped._integer_times = {}, {}, {}
         return mapped
 
+    def network_rank_orders(self) -> dict[str, dict[str, Any]]:
+        if self._rank_orders is None:
+            self._rank_orders = self.network.rank_orders()
+        return self._rank_orders
+
     def mapping_candidates(self, config: dict[str, Any]) -> list[dict[str, Any]]:
         """Cheap path-work screening; these scores are not Replay predictions."""
 
         if self._rank_orders is None:
             self._rank_orders = self.network.rank_orders()
-        split, h = config["split"], config["rs_dims"]
-        weights = [split >> position for position in range(h)] + [split >> h] * (len(self.steps) - h)
+        if config["algorithm"] == "doubling" and self.operator == "all-gather":
+            # 0.2.11y: AllGather payload doubles every round and the agent puts the
+            # costliest dimension first, so the cheapest dimension carries the most.
+            weights = [1 << position for position in reversed(range(len(self.steps)))]
+        else:
+            split, h = config["split"], config["rs_dims"]
+            weights = [split >> position for position in range(h)] + [split >> h] * (len(self.steps) - h)
         candidates = []
         for name, info in self._rank_orders.items():
             original = sorted(info["original_mean"])
@@ -668,34 +892,50 @@ class Planner:
     def exchange_pairs(self, step: int) -> list[tuple[int, int]]:
         return [(index, index ^ step) for index in range(self.rank_count)]
 
-    def round_plan(self, key: tuple, pairs: list[tuple[int, int]], width: int) -> RoundPlan:
+    def round_plan(self, key: tuple, pairs: list[tuple[int, int]], width: int,
+                   iterations: int = OPTIMIZER_ITERATIONS, quick: bool = False) -> RoundPlan:
         cache_key = key + (width,)
         plan = self._plans.get(cache_key)
         if plan is None:
             physical_pairs = [(self.rank_order[src], self.rank_order[dst]) for src, dst in pairs]
-            plan = optimize_round(self.network, physical_pairs, width)
+            plan = optimize_round(self.network, physical_pairs, width, iterations, quick)
             self._plans[cache_key] = plan
         return plan
 
     def exchange_plan(self, step: int, width: int) -> RoundPlan:
         return self.round_plan(("xor", step), self.exchange_pairs(step), width)
 
-    def integer_allocation(self, plan: RoundPlan, units: int) -> np.ndarray:
-        """The same integer route counts are used for prediction and emission."""
+    def integer_allocation(self, plan: RoundPlan, units: int, chunk_bytes: int | None = None) -> np.ndarray:
+        """The same integer route counts are used for prediction and emission.
 
-        key = (id(plan), units)
+        In greedy mode the greedy counts replace the rounded fractional ones only where
+        that round's split-aware cost (fixed per-path overheads included, 0.2.21y) is
+        lower; emission uses the chunk size of the schedule being built.
+        """
+
+        chunk = chunk_bytes if chunk_bytes is not None else self._build_chunk
+        key = (id(plan), units, self.greedy_allocation, chunk if self.greedy_allocation else None)
         counts = self._allocations.get(key)
         if counts is None:
             counts = _discretize(plan.fractions, units)
+            if self.greedy_allocation and units > 0:
+                inv = self.network.element_inv
+                greedy = _greedy_counts(plan, inv, units)
+                if chunk:
+                    better = _split_aware_cost(plan, inv, greedy, chunk) < _split_aware_cost(plan, inv, counts, chunk)
+                else:
+                    better = _per_byte_round_cost(plan, inv, greedy) < _per_byte_round_cost(plan, inv, counts)
+                if better:
+                    counts = greedy
             self._allocations[key] = counts
         return counts
 
     def integer_round_time_us(self, plan: RoundPlan, units: int, chunk_bytes: int) -> float:
         """Replay cost of the emitted integer allocation, without chunk expressions."""
 
-        key = (id(plan), units, chunk_bytes)
+        key = (id(plan), units, chunk_bytes, self.greedy_allocation)
         if key not in self._integer_times:
-            counts = self.integer_allocation(plan, units)
+            counts = self.integer_allocation(plan, units, chunk_bytes)
             sizes = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]) * chunk_bytes
             active = sizes > 0
             loads = np.bincount(
@@ -731,9 +971,17 @@ class Planner:
     def round_count(self, config: dict[str, Any]) -> int:
         dims = len(self.steps)
         if config["algorithm"] == "rs_ag":
-            return 2 * config["rs_dims"] + dims - config["rs_dims"]
+            if config.get("hb_rs") is not None:
+                costly = dims - config["rs_dims"] - config["hb_k"]
+                cross = (1 if costly else 0) if config["hb_cross"] == "block" else costly
+                return 2 * len(config["hb_rs"]) + (2 if config["hb_k"] else 0) + cross
+            if config.get("rs_blocks") is not None:
+                return 2 * len(config["rs_blocks"]) + len(config["mid_blocks"])
+            return 2 * config["rs_dims"] + dims - config["rs_dims"] + config.get("hier_k", 0)
         if config["algorithm"] == "tree":
             return 2 * dims
+        if config.get("blocks"):
+            return len(config["blocks"])
         return dims
 
     @staticmethod
@@ -790,6 +1038,67 @@ class Planner:
                 raise AgentCCError(f"order must be 'auto' or a permutation of {self.steps}")
             config["order"] = [int(step) for step in order]
             config["order_source"] = "proposed"
+        blocks = raw.get("blocks")
+        if blocks is not None:
+            if self.operator != "all-gather" or algorithm != "doubling":
+                raise AgentCCError("blocks apply to all-gather doubling only")
+            if (not isinstance(blocks, list) or not blocks
+                    or any(not isinstance(block, list) or not 1 <= len(block) <= MAX_BLOCK_DIMS for block in blocks)
+                    or any(isinstance(step, bool) or not isinstance(step, int) for block in blocks for step in block)
+                    or sorted(step for block in blocks for step in block) != self.steps):
+                raise AgentCCError(f"blocks must partition {self.steps} into lists of 1-{MAX_BLOCK_DIMS} steps")
+            config["blocks"] = [[int(step) for step in block] for block in blocks]
+            config["order"] = [step for block in config["blocks"] for step in block]
+            config["order_source"] = "blocks"
+        rs_blocks, mid_blocks = raw.get("rs_blocks"), raw.get("mid_blocks")
+        if rs_blocks is not None or mid_blocks is not None:
+            if algorithm != "rs_ag":
+                raise AgentCCError("rs_blocks and mid_blocks apply to rs_ag only")
+            for name, value in (("rs_blocks", rs_blocks), ("mid_blocks", mid_blocks)):
+                if (not isinstance(value, list)
+                        or any(not isinstance(block, list) or not 1 <= len(block) <= MAX_BLOCK_DIMS for block in value)
+                        or any(isinstance(step, bool) or not isinstance(step, int) for block in value for step in block)):
+                    raise AgentCCError(f"{name} must be a list of lists of 1-{MAX_BLOCK_DIMS} steps")
+            rs_order = [int(step) for block in rs_blocks for step in block]
+            mid_order = [int(step) for block in mid_blocks for step in block]
+            if sorted(rs_order + mid_order) != self.steps or not rs_order:
+                raise AgentCCError(f"rs_blocks and mid_blocks must together partition {self.steps}")
+            if len(rs_order) > split.bit_length() - 1:
+                raise AgentCCError(f"rs_blocks cover more dimensions than split {split} can halve")
+            config["rs_blocks"] = [[int(step) for step in block] for block in rs_blocks]
+            config["mid_blocks"] = [[int(step) for step in block] for block in mid_blocks]
+            config["rs_dims"] = len(rs_order)
+            config["order"] = rs_order + mid_order
+            config["order_source"] = "blocks"
+        hb_rs = raw.get("hb_rs")
+        if hb_rs is not None:
+            if algorithm != "rs_ag" or "rs_blocks" in config or raw.get("hier_k") is not None:
+                raise AgentCCError("hb_rs applies to rs_ag without rs_blocks or hier_k")
+            if (not isinstance(hb_rs, list) or not hb_rs
+                    or any(not isinstance(block, list) or not 1 <= len(block) <= HB_MAX_BLOCK for block in hb_rs)
+                    or any(isinstance(step, bool) or not isinstance(step, int) for block in hb_rs for step in block)):
+                raise AgentCCError(f"hb_rs must be a list of lists of 1-{HB_MAX_BLOCK} steps")
+            rs_order = [int(step) for block in hb_rs for step in block]
+            if len(set(rs_order)) != len(rs_order) or not set(rs_order) <= set(self.steps):
+                raise AgentCCError("hb_rs steps must be distinct XOR steps")
+            if len(rs_order) > split.bit_length() - 1:
+                raise AgentCCError(f"hb_rs covers more dimensions than split {split} can halve")
+            rest = [step for step in config["order"] if step not in rs_order]
+            hb_k, cross = raw.get("hb_k", 0), raw.get("hb_cross", "doubling")
+            if isinstance(hb_k, bool) or not isinstance(hb_k, int) or not 0 <= hb_k <= min(len(rest), HB_MAX_BLOCK):
+                raise AgentCCError(f"hb_k must be an integer in [0, {min(len(rest), HB_MAX_BLOCK)}]")
+            if cross not in ("doubling", "block") or (cross == "block" and len(rest) - hb_k > HB_MAX_BLOCK):
+                raise AgentCCError("hb_cross must be 'doubling' or 'block' (at most HB_MAX_BLOCK costly steps)")
+            config.update(hb_rs=[[int(step) for step in block] for block in hb_rs], hb_k=hb_k, hb_cross=cross,
+                          rs_dims=len(rs_order), order=rs_order + rest, order_source="hb")
+        hier_k = raw.get("hier_k")
+        if hier_k is not None:
+            if algorithm != "rs_ag" or "rs_blocks" in config:
+                raise AgentCCError("hier_k applies to rs_ag without blocks only")
+            middle = len(self.steps) - config["rs_dims"]
+            if isinstance(hier_k, bool) or not isinstance(hier_k, int) or not 1 <= hier_k <= middle:
+                raise AgentCCError(f"hier_k must be an integer in [1, {middle}]")
+            config["hier_k"] = hier_k
         rounds = self.round_count(config)
         if rounds > self.max_rounds:
             raise AgentCCError(
@@ -818,6 +1127,70 @@ class Planner:
                 group = n if action == "copy" else 1 << index
                 specs.append({"plan": plan, "pairs": len(pairs), "chunks": split, "group": group,
                               "complete": action == "copy"})
+            return specs
+        if config["algorithm"] == "rs_ag" and config.get("hb_rs") is not None:
+            prior, ag_specs = 0, []
+            for index, block in enumerate(config["hb_rs"]):
+                plan = self.block_plan(block, self.round_width(config, index))
+                units = split >> (prior + len(block))
+                specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": units, "group": 1 << prior,
+                              "complete": False})
+                ag_specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": units, "group": n,
+                                 "complete": True, "_block": block})
+                prior += len(block)
+            for key, pairs, action, group, quick in self.hb_stages(config):
+                plan = self.round_plan(key, pairs, self.round_width(config, len(specs)),
+                                       HB_ITERATIONS if quick else OPTIMIZER_ITERATIONS, quick=quick)
+                specs.append({"plan": plan, "pairs": len(pairs), "chunks": split >> prior, "group": group,
+                              "complete": action == "copy"})
+            for spec in reversed(ag_specs):
+                block = spec.pop("_block")
+                specs.append({**spec, "plan": self.block_plan(block, self.round_width(config, len(specs)))})
+            return specs
+        if config["algorithm"] == "rs_ag" and config.get("hier_k"):
+            h = config["rs_dims"]
+            index = 0
+            for position in range(h):
+                specs.append({"plan": self.exchange_plan(order[position], self.round_width(config, index)),
+                              "pairs": n, "chunks": split >> (position + 1), "group": 1 << position,
+                              "complete": False})
+                index += 1
+            for key, pairs, action, group in self.hier_stages(config):
+                plan = self.round_plan(key, pairs, self.round_width(config, index))
+                specs.append({"plan": plan, "pairs": len(pairs), "chunks": split >> h, "group": group,
+                              "complete": action == "copy"})
+                index += 1
+            for position in reversed(range(h)):
+                specs.append({"plan": self.exchange_plan(order[position], self.round_width(config, index)),
+                              "pairs": n, "chunks": split >> (position + 1), "group": n, "complete": True})
+                index += 1
+            return specs
+        if config["algorithm"] == "rs_ag" and config.get("rs_blocks") is not None:
+            prior, ag_specs = 0, []
+            for index, block in enumerate(config["rs_blocks"]):
+                plan = self.block_plan(block, self.round_width(config, index))
+                specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": split >> (prior + len(block)),
+                              "group": 1 << prior, "complete": False})
+                ag_specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": split >> (prior + len(block)),
+                                 "group": n, "complete": True})
+                prior += len(block)
+            for block in config["mid_blocks"]:
+                plan = self.block_plan(block, self.round_width(config, len(specs)))
+                specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": split >> config["rs_dims"],
+                              "group": 1 << prior, "complete": False})
+                prior += len(block)
+            for offset, spec in enumerate(reversed(ag_specs)):
+                plan = self.block_plan(config["rs_blocks"][len(ag_specs) - 1 - offset],
+                                       self.round_width(config, len(specs)))
+                specs.append({**spec, "plan": plan})
+            return specs
+        if self.operator == "all-gather" and config.get("blocks"):
+            held = split
+            for index, block in enumerate(config["blocks"]):
+                plan = self.block_plan(block, self.round_width(config, index))
+                specs.append({"plan": plan, "pairs": len(plan.routes), "chunks": held, "group": 1,
+                              "complete": False})
+                held <<= len(block)
             return specs
         for index, (step, chunks) in enumerate(self.round_payloads(config)):
             plan = self.exchange_plan(step, self.round_width(config, index))
@@ -856,18 +1229,24 @@ class Planner:
         rounds = []
         for spec in self.round_specs(config):
             plan = spec["plan"]
-            key = (id(plan), spec["chunks"])
+            key = (id(plan), spec["chunks"], self.greedy_allocation)
             allocation_key = self._allocation_keys.get(key)
             if allocation_key is None:
-                counts = self.integer_allocation(plan, spec["chunks"])
+                counts = self.integer_allocation(plan, spec["chunks"], self.data_size // config["split"])
                 allocation_key = tuple(
                     tuple((route.nodes, int(count)) for route, count in zip(routes, row) if count > 0)
                     for routes, row in zip(plan.routes, counts)
                 )
                 self._allocation_keys[key] = allocation_key
             rounds.append(allocation_key)
+        blocks = tuple(tuple(block) for block in config.get("blocks") or ())
+        blocks += (("hier", config.get("hier_k", 0)),)
+        if config.get("hb_rs") is not None:
+            blocks += (("hb", tuple(tuple(b) for b in config["hb_rs"]), config["hb_k"], config["hb_cross"]),)
+        blocks += tuple(("rs",) + tuple(block) for block in config.get("rs_blocks") or ())
+        blocks += tuple(("mid",) + tuple(block) for block in config.get("mid_blocks") or ())
         return (self.operator, config["algorithm"], config["split"], config.get("rs_dims"),
-                self.rank_order, tuple(config["order"]), tuple(rounds))
+                self.rank_order, tuple(config["order"]), blocks, tuple(rounds))
 
     def normalize_config_safe(self, raw: Any) -> dict[str, Any] | None:
         """normalize_config that returns None instead of raising."""
@@ -875,7 +1254,9 @@ class Planner:
         try:
             if not isinstance(raw, dict):
                 return None
-            clean = {key: raw[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths") if key in raw}
+            clean = {key: raw[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths", "blocks",
+                                               "rs_blocks", "mid_blocks", "hier_k", "hb_rs", "hb_k", "hb_cross")
+                     if key in raw}
             return self.normalize_config(clean)
         except (AgentCCError, TypeError, AttributeError):
             return None
@@ -927,6 +1308,7 @@ class Planner:
         return names
 
     def build(self, config: dict[str, Any]) -> dict[str, Any]:
+        self._build_chunk = self.data_size // config["split"]
         if self.operator == "all-gather":
             rounds = self._build_allgather(config)
         elif config["algorithm"] == "rs_ag":
@@ -978,6 +1360,8 @@ class Planner:
         return transfers
 
     def _build_allgather(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        if config.get("blocks"):
+            return self._build_allgather_blocks(config)
         split = config["split"]
         names = self.chunk_names(split)
         members = [[index] for index in range(self.rank_count)]
@@ -990,6 +1374,129 @@ class Planner:
             rounds.append(self._emit(plan, pairs, units, "copy", lambda _src, piece: piece))
             members = [sorted(members[index] + members[index ^ step]) for index in range(self.rank_count)]
         return rounds
+
+    def _build_allgather_blocks(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        """One round per block: every rank sends all it holds to each XOR combination of the block."""
+
+        names = self.chunk_names(config["split"])
+        members = [[index] for index in range(self.rank_count)]
+        rounds = []
+        for index_round, block in enumerate(config["blocks"]):
+            masks = block_masks(block)
+            pairs = self.block_pairs(block)
+            plan = self.block_plan(block, self.round_width(config, index_round))
+            held = [[name for member in group for name in names[member]] for group in members]
+            rounds.append(self._emit(plan, pairs, [held[src] for src, _ in pairs], "copy", lambda _src, piece: piece))
+            members = [sorted(set(members[index]).union(*(members[index ^ mask] for mask in masks)))
+                       for index in range(self.rank_count)]
+        return rounds
+
+    def block_pairs(self, block: list[int]) -> list[tuple[int, int]]:
+        """Pairs of a block round, ordered by the sorted block like its cached plan."""
+
+        return [(index, index ^ mask) for mask in block_masks(sorted(block)) for index in range(self.rank_count)]
+
+    def _block_cap(self, block: list[int], width: int) -> int:
+        return self._block_caps.get((tuple(sorted(block)), width), min(width, BLOCK_WIDTH_CAP))
+
+    def _block_plan_at(self, block: list[int], cap: int) -> RoundPlan:
+        return self.round_plan(("block", tuple(sorted(block))), self.block_pairs(block), cap,
+                               BLOCK_OPTIMIZER_ITERATIONS, quick=True)
+
+    def block_plan(self, block: list[int], width: int) -> RoundPlan:
+        """Round plan for one block; a single dimension reuses the plain XOR exchange plan."""
+
+        if len(block) == 1:
+            return self.exchange_plan(block[0], width)
+        return self._block_plan_at(block, self._block_cap(block, width))
+
+    def has_plan(self, block: list[int], width: int) -> bool:
+        if len(block) == 1:
+            return ("xor", block[0], width) in self._plans
+        return ("block", tuple(sorted(block)), self._block_cap(block, width)) in self._plans
+
+    def warm_blocks(self, spans: list[tuple[int, int]], order: list[int], width: int, deadline: float | None) -> None:
+        """Compute multi-dimension block plans in the given priority order until the deadline."""
+
+        for start, end in spans:
+            if deadline is not None and perf_counter() >= deadline:
+                return
+            self.block_plan(order[start:end], width)
+
+    def widen_blocks(self, spans: list[tuple[int, int]], order: list[int], width: int, units_of,
+                     chunk_bytes: int, deadline: float | None) -> None:
+        """0.2.18y: plan blocks again at the full path width, in priority order, until the
+        deadline; a block switches to the wide plan only if its split-aware integer cost
+        at that position is lower than the capped plan's."""
+
+        narrow = min(width, BLOCK_WIDTH_CAP)
+        if deadline is None or width <= narrow:
+            return
+        for start, end in spans:
+            if perf_counter() >= deadline:
+                return
+            block = order[start:end]
+            key = (tuple(sorted(block)), width)
+            if key in self._block_caps or not self.has_plan(block, width):
+                continue
+            units = units_of(start, end)
+            if units <= 0:
+                continue
+            wide = self.split_aware_round_us(self._block_plan_at(block, width), units, chunk_bytes)
+            capped = self.split_aware_round_us(self._block_plan_at(block, narrow), units, chunk_bytes)
+            self._block_caps[key] = width if wide < capped else narrow
+
+    def split_aware_round_us(self, plan: RoundPlan, units: int, chunk_bytes: int) -> float:
+        """Integer round cost once path-bound transfers are split (see split_path_bound_transfers)."""
+
+        counts = self.integer_allocation(plan, units, chunk_bytes)
+        sizes = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]) * chunk_bytes
+        active = sizes > 0
+        loads = np.bincount(plan.entry_element, weights=sizes[plan.entry_path], minlength=len(self.network.element_inv))
+        overhead = float(plan.path_overhead_us[active].max(initial=0.0))
+        single = (plan.path_overhead_us[active] + chunk_bytes * plan.path_per_byte_us[active]).max(initial=0.0)
+        return float(max(single, overhead + float((loads * self.network.element_inv).max(initial=0.0))))
+
+    def allgather_blocks(self, config: dict[str, Any], max_block: int = MAX_BLOCK_DIMS,
+                         deadline: float | None = None,
+                         wide_deadline: float | None = None) -> tuple[list[list[int]], float, float]:
+        """Best partition of the AllGather order into consecutive blocks (dynamic programme).
+
+        Keeps the configured dimension order (costliest first, smallest payload)
+        and only decides which neighbouring dimensions share a round.  Returns
+        (blocks, predicted us, predicted us with one dimension per round), both
+        priced with split-aware integer round costs.
+        """
+
+        order, width = config["order"], config["path_width"]
+        chunk_bytes = self.data_size // config["split"]
+        count = len(order)
+        # The last rounds carry the largest payloads, so their blocks are worth the most.
+        spans = sorted(((start, end) for start in range(count)
+                        for end in range(start + 2, min(count, start + max_block) + 1)),
+                       key=lambda span: (-span[0], span[1]))
+        self.warm_blocks(spans, order, width, deadline)
+        self.widen_blocks(spans, order, width, lambda start, _end: config["split"] << start, chunk_bytes,
+                          wide_deadline)
+        best = [math.inf] * (count + 1)
+        choice = [0] * (count + 1)
+        best[0] = 0.0
+        singles = 0.0
+        for start in range(count):
+            units = config["split"] << start
+            for end in range(start + 1, min(count, start + max_block) + 1):
+                if end > start + 1 and not self.has_plan(order[start:end], width):
+                    continue
+                cost = self.split_aware_round_us(self.block_plan(order[start:end], width), units, chunk_bytes)
+                if end == start + 1:
+                    singles += cost
+                if best[start] + cost < best[end]:
+                    best[end], choice[end] = best[start] + cost, start
+        blocks, end = [], count
+        while end:
+            blocks.append(order[choice[end]:end])
+            end = choice[end]
+        return blocks[::-1], best[count], singles
 
     def _complete(self, expression, complete: tuple[int, ...], slot: int) -> str:
         return f"c{slot}_sum" if self.sum_notation else expression(complete, slot)
@@ -1025,7 +1532,329 @@ class Planner:
             groups = [tuple(sorted(groups[index] + groups[index ^ step])) for index in range(self.rank_count)]
         return rounds
 
+    def _build_rs_ag_blocks(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        """rs_ag with blocks: a block of b dimensions per round in each phase.
+
+        Reduce-scatter block: a rank keeps the 1/2^b of its slots picked by its
+        block coordinate and sends every partner the part that partner keeps;
+        the 2^b - 1 contributions to a slot have disjoint contributor sets.
+        Middle block: block members send each other their owned partial sums.
+        All-gather blocks mirror the reduce-scatter blocks with complete copies.
+        """
+
+        split, n = config["split"], self.rank_count
+        expression = self._expression_cache(split)
+        complete = tuple(range(n))
+        groups = [(index,) for index in range(n)]
+        owned = [list(range(split)) for _ in range(n)]
+        rounds = []
+
+        def coordinate(index: int, block: list[int]) -> int:
+            return sum(1 << bit for bit, step in enumerate(block) if index & step)
+
+        for block in config["rs_blocks"]:
+            masks = block_masks(block)
+            parts = 1 << len(block)
+            keep = []
+            for index in range(n):
+                size = len(owned[index]) // parts
+                start = coordinate(index, block) * size
+                keep.append(owned[index][start:start + size])
+            pairs = self.block_pairs(block)
+            plan = self.block_plan(block, self.round_width(config, len(rounds)))
+            current = groups
+            rounds.append(self._emit(plan, pairs, [keep[dst] for _, dst in pairs], "reduce",
+                                     lambda src, piece, current=current: [expression(current[src], s) for s in piece]))
+            owned = keep
+            groups = [tuple(sorted(set(groups[index]).union(*(groups[index ^ mask] for mask in masks))))
+                      for index in range(n)]
+        for block in config["mid_blocks"]:
+            masks = block_masks(block)
+            pairs = self.block_pairs(block)
+            plan = self.block_plan(block, self.round_width(config, len(rounds)))
+            current = groups
+            rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "reduce",
+                                     lambda src, piece, current=current: [expression(current[src], s) for s in piece]))
+            groups = [tuple(sorted(set(groups[index]).union(*(groups[index ^ mask] for mask in masks))))
+                      for index in range(n)]
+        if any(group != complete for group in groups):
+            raise AgentCCError("reduce phase did not cover every contributor")
+        for block in reversed(config["rs_blocks"]):
+            masks = block_masks(block)
+            pairs = self.block_pairs(block)
+            plan = self.block_plan(block, self.round_width(config, len(rounds)))
+            rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
+                                     lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
+            owned = [sorted(set(owned[index]).union(*(owned[index ^ mask] for mask in masks))) for index in range(n)]
+        return rounds
+
+    def allreduce_blocks(self, config: dict[str, Any], max_block: int = MAX_BLOCK_DIMS,
+                         deadline: float | None = None, wide_deadline: float | None = None,
+                         ) -> tuple[list[list[int]], list[list[int]], float, float]:
+        """Best rs_ag block partition: reduce-scatter blocks (priced with their mirrored
+        all-gather round) and middle blocks, each by dynamic programme over the order.
+
+        Returns (rs_blocks, mid_blocks, predicted us, predicted us with one dimension per round).
+        """
+
+        order, width, split, h = config["order"], config["path_width"], config["split"], config["rs_dims"]
+        chunk_bytes = self.data_size // split
+
+        def rs_cost(start: int, end: int) -> float:
+            plan = self.block_plan(order[start:end], width)
+            units = split >> end
+            return 2 * self.split_aware_round_us(plan, units, chunk_bytes) if units else math.inf
+
+        def mid_cost(start: int, end: int) -> float:
+            return self.split_aware_round_us(self.block_plan(order[start:end], width), split >> h, chunk_bytes)
+
+        # Reduce-scatter blocks at the start carry the most data; middle blocks come next.
+        spans = [(start, end) for start in range(h) for end in range(start + 2, min(h, start + max_block) + 1)]
+        spans += [(start, end) for start in range(h, len(order))
+                  for end in range(start + 2, min(len(order), start + max_block) + 1)]
+        self.warm_blocks(spans, order, width, deadline)
+        self.widen_blocks(spans, order, width, lambda start, end: split >> end if end <= h else split >> h,
+                          chunk_bytes, wide_deadline)
+
+        def partition(first: int, last: int, cost) -> tuple[list[list[int]], float, float]:
+            best = {first: (0.0, first)}
+            singles = 0.0
+            for start in range(first, last):
+                if start not in best:
+                    continue
+                for end in range(start + 1, min(last, start + max_block) + 1):
+                    if end > start + 1 and not self.has_plan(order[start:end], width):
+                        continue
+                    value = cost(start, end)
+                    if end == start + 1:
+                        singles += value
+                    total = best[start][0] + value
+                    if end not in best or total < best[end][0]:
+                        best[end] = (total, start)
+            blocks, end = [], last
+            while end != first:
+                start = best[end][1]
+                blocks.append(order[start:end])
+                end = start
+            return blocks[::-1], best[last][0], singles
+
+        rs_blocks, rs_us, rs_singles = partition(0, h, rs_cost)
+        mid_blocks, mid_us, mid_singles = partition(h, len(order), mid_cost)
+        return rs_blocks, mid_blocks, rs_us + mid_us, rs_singles + mid_singles
+
+    def hier_stages(self, config: dict[str, Any]) -> list[tuple[tuple, list[tuple[int, int]], str, int]]:
+        """Middle phase of hierarchical rs_ag: (plan key, pairs, action, sender group size).
+
+        The cheapest ``hier_k`` middle dimensions reduce the owned partial sums to one
+        representative per sub-cube, the representatives exchange on the remaining
+        dimensions, and the complete sums are copied back down the same tree.  Costly
+        links then carry 1/2^hier_k of the traffic of a full exchange.
+        """
+
+        h, k, order = config["rs_dims"], config["hier_k"], config["order"]
+        cheap, costly = order[h:h + k], order[h + k:]
+        active = set(range(self.rank_count))
+        up = []
+        for position, step in enumerate(cheap):
+            pairs = [(index, index ^ step) for index in sorted(active) if index & step]
+            up.append((("hier-up", tuple(cheap[:position + 1])), pairs, "reduce", (1 << h) << position))
+            active.difference_update(src for src, _ in pairs)
+        reps = sorted(active)
+        middle = [(("hier-mid", tuple(cheap), step), [(index, index ^ step) for index in reps], "reduce",
+                   (1 << h) << (k + position)) for position, step in enumerate(costly)]
+        down = [(("hier-down", key[1]), [(dst, src) for src, dst in pairs], "copy", self.rank_count)
+                for key, pairs, _, _ in reversed(up)]
+        return up + middle + down
+
+    def split_aware_us(self, config: dict[str, Any]) -> float:
+        """Split-aware integer Replay cost of a whole configuration (no build)."""
+
+        chunk_bytes = self.data_size // config["split"]
+        return sum(self.split_aware_round_us(spec["plan"], spec["chunks"], chunk_bytes)
+                   for spec in self.round_specs(config))
+
+    def _build_rs_ag_hier(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        split, h, order = config["split"], config["rs_dims"], config["order"]
+        n = self.rank_count
+        expression = self._expression_cache(split)
+        complete = tuple(range(n))
+        groups = [(index,) for index in range(n)]
+        owned = [list(range(split)) for _ in range(n)]
+        rounds = []
+        for step in order[:h]:
+            pairs = self.exchange_pairs(step)
+            plan = self.exchange_plan(step, self.round_width(config, len(rounds)))
+            keep, give = [], []
+            for index in range(n):
+                half = len(owned[index]) // 2
+                low, high = owned[index][:half], owned[index][half:]
+                keep.append(high if index & step else low)
+                give.append(low if index & step else high)
+            current = groups
+            rounds.append(self._emit(plan, pairs, give, "reduce",
+                                     lambda src, piece, current=current: [expression(current[src], s) for s in piece]))
+            owned = keep
+            groups = [tuple(sorted(groups[index] + groups[index ^ step])) for index in range(n)]
+        for key, pairs, action, _ in self.hier_stages(config):
+            plan = self.round_plan(key, pairs, self.round_width(config, len(rounds)))
+            if action == "reduce":
+                current = list(groups)
+                rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "reduce",
+                                         lambda src, piece, current=current: [expression(current[src], s)
+                                                                              for s in piece]))
+                for src, dst in pairs:
+                    groups[dst] = tuple(sorted(set(groups[dst]) | set(current[src])))
+            else:
+                rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
+                                         lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
+                for src, dst in pairs:
+                    groups[dst] = complete
+        if any(group != complete for group in groups):
+            raise AgentCCError("hierarchical reduce did not cover every contributor")
+        for step in reversed(order[:h]):
+            pairs = self.exchange_pairs(step)
+            plan = self.exchange_plan(step, self.round_width(config, len(rounds)))
+            rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
+                                     lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
+            owned = [sorted(owned[index] + owned[index ^ step]) for index in range(n)]
+        return rounds
+
+    def hb_stages(self, config: dict[str, Any]) -> list[tuple[tuple, list[tuple[int, int]], str, int, bool]]:
+        """Middle phase of the blocked hierarchical rs_ag: (key, pairs, action, sender group, quick routes).
+
+        One round reduces the owned partial sums of each sub-cube of the next ``hb_k``
+        steps to its representative, representatives exchange over the remaining
+        (costly) steps by doubling or in one block round, and one round copies the
+        complete slots back.  Cross rounds use full route generation.
+        """
+
+        h, k, order, n = config["rs_dims"], config["hb_k"], config["order"], self.rank_count
+        cheap, costly = order[h:h + k], order[h + k:]
+        mask = sum(cheap)
+        stages = []
+        up = [(index, index & ~mask) for index in range(n) if index & mask]
+        if up:
+            stages.append((("hb-up", tuple(sorted(cheap))), up, "reduce", 1 << h, True))
+        reps = [index for index in range(n) if not index & mask]
+        if costly:
+            groups = [costly] if config["hb_cross"] == "block" else [[step] for step in costly]
+            for position, block in enumerate(groups):
+                pairs = [(index, index ^ m) for m in block_masks(sorted(block)) for index in reps]
+                sender = (1 << h) << k << (0 if config["hb_cross"] == "block" else position)
+                stages.append((("hb-x", tuple(sorted(cheap)), tuple(sorted(block))), pairs, "reduce", sender, False))
+        if up:
+            stages.append((("hb-down", tuple(sorted(cheap))), [(dst, src) for src, dst in up], "copy", n, True))
+        return stages
+
+    def hb_search(self, split: int, width: int, rs_dims: int,
+                  deadline: float | None = None) -> tuple[dict[str, Any] | None, float]:
+        """Best blocked hierarchical rs_ag for one split/width/rs_dims (split-aware integer cost).
+
+        Reduce-scatter blocks are chosen by dynamic programme over consecutive steps of the
+        auto order (each block priced twice: reduce-scatter and mirrored all-gather); the
+        middle phase (hb_k, hb_cross) is then chosen by full evaluation.  Uses whatever
+        allocation mode the planner is in.
+        """
+
+        base = self.normalize_config({"algorithm": "rs_ag", "split": split, "path_width": width, "rs_dims": rs_dims})
+        order, h, chunk = base["order"], rs_dims, self.data_size // split
+        best = {0: (0.0, 0)}
+        for start in range(h):
+            if start not in best:
+                continue
+            for end in range(start + 1, min(h, start + HB_MAX_BLOCK) + 1):
+                if deadline is not None and perf_counter() >= deadline and end > start + 1:
+                    continue
+                cost = 2 * self.split_aware_round_us(self.block_plan(order[start:end], width), split >> end, chunk)
+                total = best[start][0] + cost
+                if end not in best or total < best[end][0]:
+                    best[end] = (total, start)
+        blocks, end = [], h
+        while end:
+            start = best[end][1]
+            blocks.append(order[start:end])
+            end = start
+        blocks.reverse()
+        choice, choice_us = None, math.inf
+        # A one-round "block" exchange among representatives needs routes for XOR
+        # combinations of the costly steps; it never won on the public examples or the
+        # perturbed suite and costs route generation, so the search uses doubling only.
+        for k in range(0, min(HB_MAX_BLOCK, len(order) - h) + 1):
+            for cross in ("doubling",):
+                if deadline is not None and perf_counter() >= deadline and choice is not None:
+                    return choice, choice_us
+                try:
+                    config = self.normalize_config({"algorithm": "rs_ag", "split": split, "path_width": width,
+                                                    "hb_rs": blocks, "hb_k": k, "hb_cross": cross})
+                except AgentCCError:
+                    continue
+                cost = self.split_aware_us(config)
+                if cost < choice_us:
+                    choice, choice_us = config, cost
+        return choice, choice_us
+
+    def _build_rs_ag_hb(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        split, n = config["split"], self.rank_count
+        expression = self._expression_cache(split)
+        complete = tuple(range(n))
+        groups = [(index,) for index in range(n)]
+        owned = [list(range(split)) for _ in range(n)]
+        rounds = []
+
+        def coordinate(index: int, block: list[int]) -> int:
+            return sum(1 << bit for bit, step in enumerate(block) if index & step)
+
+        for block in config["hb_rs"]:
+            masks = block_masks(block)
+            parts = 1 << len(block)
+            keep = []
+            for index in range(n):
+                size = len(owned[index]) // parts
+                start = coordinate(index, block) * size
+                keep.append(owned[index][start:start + size])
+            pairs = self.block_pairs(block)
+            plan = self.block_plan(block, self.round_width(config, len(rounds)))
+            current = groups
+            rounds.append(self._emit(plan, pairs, [keep[dst] for _, dst in pairs], "reduce",
+                                     lambda src, piece, current=current: [expression(current[src], s) for s in piece]))
+            owned = keep
+            groups = [tuple(sorted(set(groups[index]).union(*(groups[index ^ m] for m in masks)))) for index in range(n)]
+        for key, pairs, action, _, quick in self.hb_stages(config):
+            plan = self.round_plan(key, pairs, self.round_width(config, len(rounds)),
+                                   HB_ITERATIONS if quick else OPTIMIZER_ITERATIONS, quick=quick)
+            if action == "reduce":
+                current = list(groups)
+                rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "reduce",
+                                         lambda src, piece, current=current: [expression(current[src], s)
+                                                                              for s in piece]))
+                incoming: dict[int, set] = {}
+                for src, dst in pairs:
+                    incoming.setdefault(dst, set(current[dst])).update(current[src])
+                for dst, members in incoming.items():
+                    groups[dst] = tuple(sorted(members))
+            else:
+                rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
+                                         lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
+                for _, dst in pairs:
+                    groups[dst] = complete
+        if any(group != complete for group in groups):
+            raise AgentCCError("blocked hierarchical reduce did not cover every contributor")
+        for block in reversed(config["hb_rs"]):
+            masks = block_masks(block)
+            pairs = self.block_pairs(block)
+            plan = self.block_plan(block, self.round_width(config, len(rounds)))
+            rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
+                                     lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
+            owned = [sorted(set(owned[index]).union(*(owned[index ^ m] for m in masks))) for index in range(n)]
+        return rounds
+
     def _build_rs_ag(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        if config.get("hb_rs") is not None:
+            return self._build_rs_ag_hb(config)
+        if config.get("rs_blocks") is not None:
+            return self._build_rs_ag_blocks(config)
+        if config.get("hier_k"):
+            return self._build_rs_ag_hier(config)
         split, h = config["split"], config["rs_dims"]
         order = config["order"]
         expression = self._expression_cache(split)
@@ -1101,6 +1930,12 @@ class Planner:
         if groups[0] != complete:
             raise AgentCCError("tree reduction did not reach rank 0 with every contributor")
         return rounds
+
+
+def block_masks(block: list[int]) -> list[int]:
+    """Every non-empty XOR combination of the block's dimensions."""
+
+    return [sum(step for bit, step in enumerate(block) if mask >> bit & 1) for mask in range(1, 1 << len(block))]
 
 
 def prepare_dual_tree(planner: Planner) -> dict[str, Any]:
@@ -1353,7 +2188,7 @@ def repair_round_routes(
 
 def refine_schedule_routes(
     planner: Planner, config: dict[str, Any], answer: dict[str, Any], estimate: dict[str, Any],
-    *, size_weight: float = 0.10, budget_seconds: float = 0.1,
+    *, size_weight: float = 0.10, budget_seconds: float = 0.1, validate: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Repair up to three slow rounds; validate and adopt only a better complete schedule."""
 
@@ -1383,7 +2218,8 @@ def refine_schedule_routes(
     if info["accepted_moves"]:
         candidate = {**answer, "rounds": rounds}
         measured = replay_estimate(planner.task, planner.topology, candidate, planner.network.raw)
-        validate_answer(planner.task, planner.topology, candidate, planner.network.raw)
+        if validate:
+            validate_answer(planner.task, planner.topology, candidate, planner.network.raw)
         candidate_mb = answer_size_estimate(candidate) / 1e6
         before_cost = math.log(estimate["total_us"]) + size_weight * info["before_response_mb"]
         candidate_cost = math.log(measured["total_us"]) + size_weight * candidate_mb
@@ -1398,6 +2234,99 @@ def refine_schedule_routes(
     info["after_response_mb"] = answer_size_estimate(result) / 1e6
     info["elapsed_ms"] = (perf_counter() - started) * 1000
     return result, result_estimate, info
+
+
+def split_path_bound_transfers(
+    network: Network, answer: dict[str, Any], chunk_bytes: int, *, size_weight: float = 0.10,
+    max_targets: int = 24,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split transfers whose own path time is above the round's contention time.
+
+    Replay charges a transfer its path time, startup + switch overhead + bytes
+    times the sum of per-edge times, while edge and resource busy times depend
+    only on the total bytes on each element.  Sending a pair's chunks as several
+    transfers on the same path therefore leaves every load unchanged and only
+    shortens the longest path time.  Each round is split down to the target
+    time that minimises ln(total Replay time) + size_weight * response MB, so
+    rounds where the saving is small next to the extra transfer records stay as
+    they are.  Chunk lists stay in order and no chunk is sent twice.
+    """
+
+    started = perf_counter()
+    plans = []
+    for round_data in answer["rounds"]:
+        transfers = round_data["transfers"]
+        if not transfers:
+            plans.append(None)
+            continue
+        routes = [network._route(tuple(transfer["path"])) for transfer in transfers]
+        counts = np.array([len(transfer["chunk_ranges"]) for transfer in transfers], dtype=np.int64)
+        overhead = np.array([route.overhead_us for route in routes])
+        unit = np.array([route.per_byte_us for route in routes]) * chunk_bytes
+        lengths = [len(route.elements) for route in routes]
+        load = np.bincount(np.concatenate([route.elements for route in routes]),
+                           weights=np.repeat(counts * chunk_bytes, lengths), minlength=len(network.element_inv))
+        contention = float(overhead.max() + (load * network.element_inv).max())
+        path = overhead + counts * unit
+        record = 80 + np.array([sum(len(node) + 3 for node in transfer["path"]) for transfer in transfers])
+        plans.append({"contention": contention, "path": path, "counts": counts, "overhead": overhead,
+                      "unit": unit, "record": record, "time": float(max(contention, path.max()))})
+    total = sum(plan["time"] for plan in plans if plan is not None)
+
+    def pieces_for(plan: dict[str, Any], target: float) -> np.ndarray:
+        room = target - plan["overhead"]
+        per_piece = np.where(room > plan["unit"], np.floor(room / plan["unit"]), 1).astype(np.int64)
+        return np.where(plan["path"] > target, -(-plan["counts"] // np.maximum(per_piece, 1)), 1)
+
+    def evaluate(plan: dict[str, Any], target: float) -> tuple[float, float, np.ndarray]:
+        pieces = pieces_for(plan, target)
+        size = -(-plan["counts"] // pieces)
+        time = float(max(plan["contention"], (plan["overhead"] + size * plan["unit"]).max()))
+        extra_mb = float(((pieces - 1) * plan["record"]).sum()) / 1e6
+        return time, extra_mb, pieces
+
+    info: dict[str, Any] = {"before_us": total, "rounds": []}
+    chosen: list[np.ndarray | None] = []
+    current = total
+    for index, plan in enumerate(plans):
+        if plan is None or plan["path"].max() <= plan["contention"] * (1 + 1e-12):
+            chosen.append(None)
+            continue
+        above = np.unique(plan["path"][plan["path"] > plan["contention"]])[::-1]
+        targets = [plan["contention"]] + list(above[1:max_targets])
+        best = (0.0, plan["time"], 0.0, None)
+        for target in targets:
+            time, extra_mb, pieces = evaluate(plan, float(target))
+            gain = math.log((current - plan["time"] + time) / current) + size_weight * extra_mb
+            if gain < best[0]:
+                best = (gain, time, extra_mb, pieces)
+        if best[3] is None:
+            chosen.append(None)
+            continue
+        info["rounds"].append({"round": index + 1, "before_us": plan["time"], "after_us": best[1],
+                               "extra_transfers": int((best[3] - 1).sum()), "extra_mb": best[2]})
+        current += best[1] - plan["time"]
+        chosen.append(best[3])
+    info.update(after_us=current, extra_transfers=sum(row["extra_transfers"] for row in info["rounds"]),
+                elapsed_ms=(perf_counter() - started) * 1000)
+    if not info["rounds"]:
+        return answer, info
+    rounds = []
+    for round_data, pieces in zip(answer["rounds"], chosen):
+        if pieces is None:
+            rounds.append(round_data)
+            continue
+        transfers = []
+        for transfer, count in zip(round_data["transfers"], pieces.tolist()):
+            items = transfer["chunk_ranges"]
+            if count <= 1:
+                transfers.append(transfer)
+                continue
+            step = -(-len(items) // count)
+            transfers.extend({**transfer, "chunk_ranges": items[start:start + step]}
+                             for start in range(0, len(items), step))
+        rounds.append({**round_data, "transfers": transfers})
+    return {**answer, "rounds": rounds}, info
 
 
 def replay_estimate(
@@ -1797,12 +2726,12 @@ class StrategyAPI:
 def answer_size_estimate(answer: dict[str, Any]) -> int:
     """Approximate serialized size in bytes without building the JSON string."""
 
-    total = 0
+    total = 16 * len(answer["chunks"])
     for round_data in answer["rounds"]:
         for transfer in round_data["transfers"]:
-            total += 80 + sum(len(item) + 3 for item in transfer["chunk_ranges"])
-            total += sum(len(node) + 3 for node in transfer["path"])
-    return total + 16 * len(answer["chunks"])
+            items, path = transfer["chunk_ranges"], transfer["path"]
+            total += 80 + 3 * (len(items) + len(path)) + sum(map(len, items)) + sum(map(len, path))
+    return total
 
 
 def portfolio_configs(planner: Planner) -> list[dict[str, Any]]:

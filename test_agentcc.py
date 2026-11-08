@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import unittest
 from copy import deepcopy
@@ -26,6 +27,7 @@ from agentcc_solver import (
     replay_estimate,
     refine_schedule_routes,
     solve_request,
+    split_path_bound_transfers,
     validate_answer,
 )
 
@@ -383,6 +385,20 @@ def strategy_code(reply: str) -> str:
 
 
 class RankMappingTests(unittest.TestCase):
+    def test_allgather_mapping_candidates_and_mapped_build(self):
+        task, topology = public_case("uneven_pods", "ag")
+        planner = Planner(task, topology, sum_notation=True)
+        config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 2})
+        candidates = planner.mapping_candidates(config)
+        self.assertEqual({item["mapping"] for item in candidates}, {"locality", "resource"})
+        best = max((item for item in candidates if item["reachable"]), key=lambda item: item["proxy_gain"])
+        self.assertGreater(best["proxy_gain"], 0)
+        mapped = planner.with_rank_order(best["rank_order"])
+        answer = mapped.build(mapped.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 2}))
+        validate_answer(task, topology, answer, planner.network.raw)
+        baseline = replay_estimate(task, topology, planner.build(config), planner.network.raw)["total_us"]
+        self.assertLess(replay_estimate(task, topology, answer, planner.network.raw)["total_us"], baseline)
+
     def test_logical_order_preserves_physical_data_and_round_semantics(self):
         order = [0, 2, 4, 7, 1, 6, 3, 5]
         configurations = [
@@ -551,6 +567,302 @@ class DualTreeTests(unittest.TestCase):
         for changed in results[1:]:
             self.assertNotEqual(changed, results[0])
         self.assertEqual(original, original_snapshot)
+
+
+def single_switch_input(operator="all-gather", ranks=4, candidates=(1, 2, 4, 8)):
+    """Every rank has one link to one switch: every transfer is path-time bound."""
+
+    names = [f"r{index}" for index in range(ranks)]
+    data = two_plane_input(operator, ranks, candidates)
+    data["topology"]["switches"] = ["A"]
+    data["topology"]["edges"] = [{"src": rank, "dst": "A", "bw": "10GB/s", "bidirectional": True} for rank in names]
+    data["topology"]["resources"] = []
+    return data
+
+
+class AllGatherBlockTests(unittest.TestCase):
+    def test_blocks_validate_and_match_prediction(self):
+        data = two_plane_input("all-gather", ranks=8)
+        planner = Planner(data["task"], data["topology"], sum_notation=True)
+        for blocks in ([[1, 2, 4]], [[4], [1, 2]], [[2, 4], [1]], [[1], [2], [4]]):
+            with self.subTest(blocks=blocks):
+                config = planner.normalize_config({"algorithm": "doubling", "split": 2, "path_width": 2, "blocks": blocks})
+                self.assertEqual(planner.round_count(config), len(blocks))
+                answer = planner.build(config)
+                validate_answer(data["task"], data["topology"], answer)
+                self.assertEqual(answer["round_count"], len(blocks))
+                actual = replay_estimate(data["task"], data["topology"], answer)["total_us"]
+                self.assertAlmostEqual(planner.predict(config)["us"], actual, places=6)
+
+    def test_bad_blocks_are_rejected(self):
+        data = two_plane_input("all-gather", ranks=8)
+        planner = Planner(data["task"], data["topology"])
+        for blocks in ([[1, 2]], [[1, 2, 4, 4]], [[1], [1, 2, 4]], [[]], "x", [[1, 2, True]]):
+            with self.subTest(blocks=blocks), self.assertRaises(AgentCCError):
+                planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 1, "blocks": blocks})
+        reduce = two_plane_input("all-reduce", ranks=8)
+        planner = Planner(reduce["task"], reduce["topology"])
+        with self.assertRaises(AgentCCError):
+            planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 1, "blocks": [[1, 2, 4]]})
+
+    def test_block_search_returns_a_partition_and_singletons_match_plain_schedule(self):
+        data = two_plane_input("all-gather", ranks=8)
+        planner = Planner(data["task"], data["topology"], sum_notation=True)
+        config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 2})
+        blocks, predicted, singles = planner.allgather_blocks(config)
+        self.assertEqual([step for block in blocks for step in block], config["order"])
+        self.assertLessEqual(predicted, singles + 1e-9)
+        split, _ = split_path_bound_transfers(planner.network, planner.build(config), planner.data_size)
+        self.assertAlmostEqual(replay_estimate(data["task"], data["topology"], split)["total_us"], singles, places=6)
+
+    def test_public_mesh2d_allgather_blocks_are_faster(self):
+        task, topology = public_case("mesh2d", "ag")
+        planner = Planner(task, topology, sum_notation=True)
+        config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 16})
+        blocks, predicted, singles = planner.allgather_blocks(config)
+        self.assertLess(predicted, 0.6 * singles)
+        answer = planner.build(planner.normalize_config({**{k: config[k] for k in ("algorithm", "split", "path_width")},
+                                                         "blocks": blocks}))
+        split, _ = split_path_bound_transfers(planner.network, answer, planner.data_size)
+        validate_answer(task, topology, split, planner.network.raw)
+        self.assertAlmostEqual(replay_estimate(task, topology, split, planner.network.raw)["total_us"], predicted, places=3)
+
+
+class WideBlockTests(unittest.TestCase):
+    def test_block_order_inside_a_block_does_not_change_pairs(self):
+        data = two_plane_input("all-gather", ranks=8)
+        planner = Planner(data["task"], data["topology"])
+        for blocks in ([[1, 2], [4]], [[2, 1], [4]], [[4, 1, 2]], [[2, 4, 1]]):
+            with self.subTest(blocks=blocks):
+                config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 2,
+                                                   "blocks": blocks})
+                validate_answer(data["task"], data["topology"], planner.build(config))
+
+    def test_wide_block_plans_only_lower_the_prediction_and_match_replay(self):
+        task, topology = public_case("mesh2d", "ag")
+        results = {}
+        for wide in (False, True):
+            planner = Planner(task, topology, sum_notation=True)
+            config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 16})
+            blocks, predicted, singles = planner.allgather_blocks(
+                config, wide_deadline=time.perf_counter() + 60 if wide else None)
+            results[wide] = predicted
+            blocked = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 16,
+                                                "blocks": blocks})
+            answer, _ = split_path_bound_transfers(planner.network, planner.build(blocked), planner.data_size)
+            validate_answer(task, topology, answer, planner.network.raw)
+            self.assertAlmostEqual(replay_estimate(task, topology, answer, planner.network.raw)["total_us"],
+                                   predicted, delta=predicted * 1e-6)
+        self.assertLess(results[True], 0.8 * results[False])
+
+
+class AllReduceBlockTests(unittest.TestCase):
+    def test_rs_ag_blocks_validate_and_match_prediction(self):
+        data = two_plane_input("all-reduce", ranks=8)
+        for short in (False, True):
+            planner = Planner(data["task"], data["topology"], sum_notation=short)
+            for rs_blocks, mid_blocks in (([[1, 2, 4]], []), ([[1, 2]], [[4]]), ([[1]], [[2, 4]]), ([[4], [2]], [[1]])):
+                with self.subTest(sum_notation=short, rs=rs_blocks, mid=mid_blocks):
+                    config = planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 2,
+                                                       "rs_blocks": rs_blocks, "mid_blocks": mid_blocks})
+                    answer = planner.build(config)
+                    validate_answer(data["task"], data["topology"], answer)
+                    self.assertEqual(answer["round_count"], 2 * len(rs_blocks) + len(mid_blocks))
+                    actual = replay_estimate(data["task"], data["topology"], answer)["total_us"]
+                    self.assertAlmostEqual(planner.predict(config)["us"], actual, places=6)
+
+    def test_bad_rs_ag_blocks_are_rejected(self):
+        data = two_plane_input("all-reduce", ranks=8)
+        planner = Planner(data["task"], data["topology"])
+        for rs_blocks, mid_blocks, split in (([[1, 2, 4]], [], 4), ([[1, 2]], [[2, 4]], 8), ([], [[1, 2, 4]], 8),
+                                             ([[1, 2]], [[4, 4]], 8), ("x", [], 8)):
+            with self.subTest(rs=rs_blocks, mid=mid_blocks, split=split), self.assertRaises(AgentCCError):
+                planner.normalize_config({"algorithm": "rs_ag", "split": split, "path_width": 1,
+                                          "rs_blocks": rs_blocks, "mid_blocks": mid_blocks})
+        with self.assertRaises(AgentCCError):
+            planner.normalize_config({"algorithm": "tree", "split": 8, "path_width": 1,
+                                      "rs_blocks": [[1]], "mid_blocks": [[2, 4]]})
+
+    def test_block_search_and_public_mesh2d_gain(self):
+        task, topology = public_case("mesh2d", "ar")
+        planner = Planner(task, topology, sum_notation=True)
+        config = planner.normalize_config({"algorithm": "rs_ag", "split": 16, "path_width": 16, "rs_dims": 4})
+        rs_blocks, mid_blocks, predicted, singles = planner.allreduce_blocks(config)
+        self.assertEqual([s for block in rs_blocks + mid_blocks for s in block], config["order"])
+        self.assertLess(predicted, 0.8 * singles)
+        blocked = planner.normalize_config({"algorithm": "rs_ag", "split": 16, "path_width": 16,
+                                            "rs_blocks": rs_blocks, "mid_blocks": mid_blocks})
+        split, _ = split_path_bound_transfers(planner.network, planner.build(blocked), planner.data_size // 16)
+        validate_answer(task, topology, split, planner.network.raw)
+        self.assertAlmostEqual(replay_estimate(task, topology, split, planner.network.raw)["total_us"], predicted,
+                               places=3)
+        plain, _ = split_path_bound_transfers(planner.network, planner.build(config), planner.data_size // 16)
+        self.assertAlmostEqual(replay_estimate(task, topology, plain, planner.network.raw)["total_us"], singles,
+                               places=3)
+
+
+class HierarchicalAllReduceTests(unittest.TestCase):
+    def test_hierarchical_rs_ag_validates_and_matches_prediction(self):
+        data = two_plane_input("all-reduce", ranks=8)
+        for short in (False, True):
+            planner = Planner(data["task"], data["topology"], sum_notation=short)
+            for rs_dims, hier_k in ((1, 1), (1, 2), (2, 1)):
+                with self.subTest(sum_notation=short, rs_dims=rs_dims, hier_k=hier_k):
+                    config = planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 2,
+                                                       "rs_dims": rs_dims, "hier_k": hier_k})
+                    answer = planner.build(config)
+                    validate_answer(data["task"], data["topology"], answer)
+                    self.assertEqual(answer["round_count"], 2 * rs_dims + 3 - rs_dims + hier_k)
+                    actual = replay_estimate(data["task"], data["topology"], answer)["total_us"]
+                    self.assertAlmostEqual(planner.predict(config)["us"], actual, places=6)
+
+    def test_bad_hier_k_is_rejected(self):
+        data = two_plane_input("all-reduce", ranks=8)
+        planner = Planner(data["task"], data["topology"])
+        for raw in ({"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 1, "hier_k": 0},
+                    {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 1, "hier_k": 3},
+                    {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 1, "hier_k": True},
+                    {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 1, "hier_k": "1"},
+                    {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_blocks": [[1]], "mid_blocks": [[2, 4]],
+                     "hier_k": 1},
+                    {"algorithm": "tree", "split": 8, "path_width": 1, "hier_k": 1}):
+            with self.subTest(raw=raw), self.assertRaises(AgentCCError):
+                planner.normalize_config(raw)
+
+    def test_public_directed_ring_split_prediction_and_gain(self):
+        task, topology = public_case("directed_ring", "ar")
+        planner = Planner(task, topology, sum_notation=True)
+        split = planner.splits[-1]
+        h = split.bit_length() - 1
+        plain = planner.normalize_config({"algorithm": "rs_ag", "split": split, "path_width": 2, "rs_dims": h})
+        hier = planner.normalize_config({"algorithm": "rs_ag", "split": split, "path_width": 2, "rs_dims": h,
+                                         "hier_k": 2})
+        results = {}
+        for name, config in (("plain", plain), ("hier", hier)):
+            answer, _ = split_path_bound_transfers(planner.network, planner.build(config), planner.data_size // split)
+            validate_answer(task, topology, answer, planner.network.raw)
+            results[name] = replay_estimate(task, topology, answer, planner.network.raw)["total_us"]
+            self.assertAlmostEqual(planner.split_aware_us(config), results[name], delta=results[name] * 1e-6)
+        self.assertLess(results["hier"], 0.85 * results["plain"])
+
+
+class GreedyAllocationTests(unittest.TestCase):
+    def test_greedy_counts_match_replay_and_never_lose_a_round(self):
+        for family, short, raw in (("mesh2d", "ar", {"algorithm": "rs_ag", "split": 16, "path_width": 8, "rs_dims": 4}),
+                                   ("uneven_pods", "ag", {"algorithm": "doubling", "split": 1, "path_width": 8})):
+            with self.subTest(family=family):
+                task, topology = public_case(family, short)
+                planner = Planner(task, topology, sum_notation=True)
+                config = planner.normalize_config(raw)
+                chunk = planner.data_size // config["split"]
+                specs = planner.round_specs(config)
+                before = [planner.split_aware_round_us(spec["plan"], spec["chunks"], chunk) for spec in specs]
+                planner.greedy_allocation = True
+                after = [planner.split_aware_round_us(spec["plan"], spec["chunks"], chunk) for spec in specs]
+                self.assertTrue(all(a <= b * (1 + 1e-12) for a, b in zip(after, before)))  # exact per-round choice (0.2.21y)
+                self.assertLess(sum(after), sum(before))
+                answer, _ = split_path_bound_transfers(planner.network, planner.build(config), chunk)
+                validate_answer(task, topology, answer, planner.network.raw)
+                self.assertAlmostEqual(replay_estimate(task, topology, answer, planner.network.raw)["total_us"],
+                                       planner.split_aware_us(config), delta=1e-6 * sum(after))
+
+
+class HierBlocksTests(unittest.TestCase):
+    def test_hier_blocks_validate_and_match_prediction(self):
+        data = two_plane_input("all-reduce", ranks=16, candidates=(1, 2, 4, 8))
+        for short in (False, True):
+            planner = Planner(data["task"], data["topology"], sum_notation=short)
+            order = planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 2, "rs_dims": 3})["order"]
+            for hb_rs, k, cross in (([order[:3]], 1, "doubling"), ([order[:2], order[2:3]], 0, "doubling"),
+                                    ([order[:1], order[1:3]], 1, "block"), ([order[:3]], 0, "block")):
+                with self.subTest(sum_notation=short, hb_rs=hb_rs, k=k, cross=cross):
+                    config = planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 2,
+                                                       "hb_rs": hb_rs, "hb_k": k, "hb_cross": cross})
+                    answer = planner.build(config)
+                    validate_answer(data["task"], data["topology"], answer)
+                    self.assertEqual(answer["round_count"], planner.round_count(config))
+                    self.assertAlmostEqual(planner.predict(config)["us"],
+                                           replay_estimate(data["task"], data["topology"], answer)["total_us"], places=6)
+
+    def test_bad_hier_blocks_are_rejected(self):
+        data = two_plane_input("all-reduce", ranks=16, candidates=(1, 2, 4, 8))
+        planner = Planner(data["task"], data["topology"])
+        for raw in ({"hb_rs": [[1, 2, 4, 8]]}, {"hb_rs": [[1], [1]]}, {"hb_rs": [[1]], "hb_k": 4},
+                    {"hb_rs": [[1]], "hb_cross": "ring"}, {"hb_rs": [], "hb_k": 0},
+                    {"hb_rs": [[1]], "hier_k": 1}):
+            with self.subTest(raw=raw), self.assertRaises(AgentCCError):
+                planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 1, **raw})
+
+    def test_search_finds_public_mesh2d_gain(self):
+        task, topology = public_case("mesh2d", "ar")
+        planner = Planner(task, topology, sum_notation=True)
+        plain = planner.normalize_config({"algorithm": "rs_ag", "split": 16, "path_width": 8, "rs_dims": 4})
+        before = planner.split_aware_us(plain)
+        planner.greedy_allocation = True
+        config, predicted = planner.hb_search(16, 8, 4)
+        self.assertLess(predicted, 0.7 * before)
+        answer, _ = split_path_bound_transfers(planner.network, planner.build(config), planner.data_size // 16)
+        validate_answer(task, topology, answer, planner.network.raw)
+        self.assertAlmostEqual(replay_estimate(task, topology, answer, planner.network.raw)["total_us"], predicted,
+                               delta=1e-6 * predicted)
+
+
+class TransferSplitTests(unittest.TestCase):
+    @staticmethod
+    def _loads(answer, planner):
+        chunk = planner.data_size // answer["split"]
+        rounds = []
+        for round_data in answer["rounds"]:
+            load = {}
+            for transfer in round_data["transfers"]:
+                for edge in zip(transfer["path"], transfer["path"][1:]):
+                    load[edge] = load.get(edge, 0) + chunk * len(transfer["chunk_ranges"])
+            rounds.append(load)
+        return rounds
+
+    @staticmethod
+    def _sent(answer):
+        return [sorted((t["src"], t["dst"], item) for t in r["transfers"] for item in t["chunk_ranges"])
+                for r in answer["rounds"]]
+
+    def test_split_keeps_loads_and_chunks_and_lowers_replay(self):
+        for operator, raw in (("all-gather", {"algorithm": "doubling", "split": 8, "path_width": 1}),
+                              ("all-reduce", {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 2})):
+            data = single_switch_input(operator)
+            planner = Planner(data["task"], data["topology"], sum_notation=True)
+            answer = planner.build(planner.normalize_config(raw))
+            before = replay_estimate(data["task"], data["topology"], answer)
+            split, info = split_path_bound_transfers(planner.network, answer, planner.data_size // 8, size_weight=0.0)
+            after = replay_estimate(data["task"], data["topology"], split)
+            with self.subTest(operator=operator):
+                validate_answer(data["task"], data["topology"], split)
+                self.assertLess(after["total_us"], before["total_us"])
+                self.assertAlmostEqual(after["total_us"], info["after_us"], places=6)
+                self.assertEqual(self._loads(split, planner), self._loads(answer, planner))
+                self.assertEqual(self._sent(split), self._sent(answer))
+                self.assertGreater(info["extra_transfers"], 0)
+                for round_before, round_after in zip(before["rounds"], after["rounds"]):
+                    self.assertLessEqual(round_after["time_us"], round_before["time_us"] + 1e-9)
+
+    def test_no_split_when_size_cost_dominates_or_nothing_is_path_bound(self):
+        data = single_switch_input()
+        planner = Planner(data["task"], data["topology"], sum_notation=True)
+        answer = planner.build(planner.normalize_config({"algorithm": "doubling", "split": 8, "path_width": 1}))
+        same, info = split_path_bound_transfers(planner.network, answer, planner.data_size // 8, size_weight=1e9)
+        self.assertIs(same, answer)
+        self.assertEqual(info["extra_transfers"], 0)
+        once, _ = split_path_bound_transfers(planner.network, answer, planner.data_size // 8, size_weight=0.0)
+        twice, info = split_path_bound_transfers(planner.network, once, planner.data_size // 8, size_weight=0.0)
+        self.assertIs(twice, once)
+
+    def test_public_directed_ring_allgather_gets_faster(self):
+        task, topology = public_case("directed_ring", "ag")
+        planner = Planner(task, topology, sum_notation=True)
+        answer = planner.build(planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 2}))
+        before = replay_estimate(task, topology, answer, planner.network.raw)["total_us"]
+        split, _ = split_path_bound_transfers(planner.network, answer, planner.data_size)
+        validate_answer(task, topology, split, planner.network.raw)
+        self.assertLess(replay_estimate(task, topology, split, planner.network.raw)["total_us"], 0.95 * before)
 
 
 class RouteRefinementTests(unittest.TestCase):
@@ -835,9 +1147,9 @@ class AgentLoopTests(unittest.TestCase):
         request = events["requests"][0]
         prompt = request["messages"][-1]["content"]
         self.assertIn("plane-A-ingress", prompt)
-        self.assertIn("agent_predicted", prompt)
-        self.assertLess(len(prompt), 2000)
-        self.assertEqual(request["max_tokens"], 120)
+        self.assertIn("dims_us_per_MiB", prompt)
+        self.assertLess(len(prompt) + len(request["messages"][0]["content"]), 1400)
+        self.assertEqual(request["max_tokens"], 48)
         changed = deepcopy(data)
         changed["topology"]["resources"][0]["capacity"] = "1GB/s"
         _, _, events_changed = self._run(['{"c":[]}'], task_input=changed)
@@ -887,12 +1199,11 @@ class AgentLoopTests(unittest.TestCase):
                 self.assertEqual(len(events["requests"]), 1)
                 self.assertNotIn("portfolio_error", audit)
                 self.assertNotIn("model_error", {key: value for key, value in audit.items() if value})
-                self.assertEqual(audit["initial_candidate_count"], 3)
                 self.assertEqual(set(audit["timings_ms"]), {
-                    "parse", "dimension_profiles", "seed_predictions", "portfolio_rank", "portfolio_build",
+                    "parse", "portfolio_rank", "portfolio_build",
                     "model", "portfolio_join", "model_candidates", "select_validate", "refine_validate",
                     "mapping_generation", "mapping_prepare", "rank_mapping",
-                    "tree_prepare", "dual_tree_validate",
+                    "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate", "final_validate", "speculative_finalize", "hier_validate", "hier_blocks_validate", "greedy_validate",
                 })
 
     def test_initial_predictions_obey_current_task_constraints(self):
@@ -907,20 +1218,14 @@ class AgentLoopTests(unittest.TestCase):
                 validate_answer(data["task"], data["topology"], result["answer"])
                 prompt = events["requests"][0]["messages"][-1]["content"]
                 payload, _ = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])
-                self.assertEqual(payload["prediction_scope"], "initial_single_path_seeds")
+                self.assertIn("before routing", payload["dims_scope"])
                 self.assertEqual(payload["bytes_per_rank"], data["task"]["data_size"]["per_rank_bytes"])
                 self.assertEqual(payload["alignment_bytes"], data["task"]["split_policy"]["alignment_bytes"])
-                self.assertEqual(len(payload["agent_predicted"]), audit["initial_candidate_count"])
-                self.assertGreater(audit["initial_candidate_count"], 0)
-                self.assertLessEqual(audit["initial_candidate_count"], 3)
                 planner = Planner(data["task"], data["topology"], sum_notation=True)
-                for algorithm, split, width, rs_dims, us, mb in payload["agent_predicted"]:
-                    config = planner.normalize_config({"algorithm": algorithm, "split": split,
-                                                       "path_width": width, "rs_dims": rs_dims})
-                    self.assertEqual(width, 1)
-                    predicted = planner.predict(config)
-                    self.assertEqual(us, round(predicted["us"], 1))
-                    self.assertEqual(mb, round(predicted["mb"], 2))
+                self.assertEqual([row[0] for row in payload["dims_us_per_MiB"]], planner.steps)
+                self.assertTrue(all(row[1] > 0 for row in payload["dims_us_per_MiB"]))
+                # The model request is sent before any route is generated.
+                self.assertEqual(audit["planning_ms"] < audit["solve_ms"], True)
 
     def test_initial_prompt_exposes_reverse_bandwidth_changes_off_single_path(self):
         data = two_plane_input("all-reduce")
@@ -934,8 +1239,6 @@ class AgentLoopTests(unittest.TestCase):
             payload, _ = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])
             payloads.append(payload)
         original, modified = payloads
-        self.assertEqual(original["dims_us_per_MiB_w1"], modified["dims_us_per_MiB_w1"])
-        self.assertEqual(original["agent_predicted"], modified["agent_predicted"])
         self.assertEqual(original["links"]["unequal_reverse"], 0)
         self.assertEqual(modified["links"]["unequal_reverse"], 1)
         self.assertEqual(modified["links"]["one_way"], 0)
@@ -950,25 +1253,28 @@ class AgentLoopTests(unittest.TestCase):
         costs = [cost for cost, _, _ in ranked]
         self.assertEqual(costs, sorted(costs))
 
-    def test_model_mapping_choice_changes_the_current_instance_schedule(self):
+    def test_model_mapping_and_tree_choices_are_recorded_but_ignored(self):
         task, topology = public_case("uneven_pods", "ar")
         outputs = []
-        for choice in (0, 1):
-            result, audit, events = self._run([json.dumps({"c": [], "m": choice})],
-                                               task_input={"task": task, "topology": topology})
+        for reply in ({"c": []}, {"c": [], "m": 1}, {"c": [], "m": 0, "t": 1}):
+            result, audit, events = self._run([json.dumps(reply)], task_input={"task": task, "topology": topology})
             validate_answer(task, topology, result["answer"])
-            self.assertIsNone(audit["model_error"])
             self.assertEqual(len(events["requests"]), 1)
-            self.assertEqual(audit["model_mapping_choice"], choice)
+            self.assertTrue(audit["speculative_reuse"])
+            self.assertEqual(audit["dual_tree"]["reason"], "model_did_not_ask")
+            self.assertNotIn("model_mapping", audit["selected"]["sources"])
             outputs.append((result, audit))
-        self.assertEqual(outputs[0][1]["rank_mapping"]["reason"], "model_kept_original")
-        mapped = outputs[1][1]["rank_mapping"]
-        self.assertTrue(mapped["adopted"])
-        self.assertLess(mapped["after_us"], mapped["before_us"] * .97)
-        self.assertEqual(outputs[1][1]["selected"]["config"]["mapping"], "locality")
-        self.assertIn("model_mapping", outputs[1][1]["selected"]["sources"])
-        self.assertEqual(sorted(mapped["rank_order"]), list(range(256)))
+        self.assertNotIn("model_overrides_ignored", outputs[0][1])
+        self.assertEqual(outputs[1][1]["model_overrides_ignored"], {"m": 1, "t": None})
+        self.assertEqual(outputs[2][1]["model_overrides_ignored"], {"m": 0, "t": 1})
+        self.assertEqual(outputs[0][0]["answer"]["rounds"], outputs[1][0]["answer"]["rounds"])
+        prompt = self._run(['{"c":[]}'], task_input={"task": task, "topology": topology})[2]["requests"][0]["messages"]
+        self.assertNotIn('"m"', prompt[0]["content"])
+        self.assertNotIn('"t"', prompt[0]["content"])
+        self.assertNotIn("dual_tree", prompt[1]["content"])
+        self.assertNotIn("rank_mapping", prompt[1]["content"])
 
+    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_mapping_tool_keeps_model_link_and_original_candidate(self):
         events = {"tools": [], "recovery": []}
         module = self._load_agent_module(events)
@@ -993,6 +1299,7 @@ class AgentLoopTests(unittest.TestCase):
         validate_answer(task, topology, refined["_answer"])
         self.assertIsNot(mapped["_planner"], planner)
 
+    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_mapping_screen_rejects_a_slower_schedule_without_building_it(self):
         module = self._load_agent_module({"tools": [], "recovery": []})
         task, topology = public_case("mesh2d", "ar")
@@ -1005,15 +1312,35 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(detail["reason"], "integer_replay_screen")
         self.assertNotIn("candidate", detail)
 
-    def test_mapping_validation_errors_propagate(self):
+    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
+    def test_mapping_defers_validation_to_the_final_answer(self):
         module = self._load_agent_module({"tools": [], "recovery": []})
         task, topology = public_case("uneven_pods", "ar")
         evaluator = module.Evaluator(Planner(task, topology, sum_notation=True))
         evaluator.run_portfolio()
         best = evaluator.select()
-        with patch.object(module, "validate_answer", side_effect=RuntimeError("mapping validation failed")):
-            with self.assertRaisesRegex(RuntimeError, "mapping validation failed"):
-                evaluator.remap(best, 1, None)
+        with patch.object(module, "validate_answer", side_effect=AssertionError("remap must not validate")):
+            result, _ = evaluator.remap(best, 1, None)
+        validate_answer(task, topology, result["_answer"])
+
+    def test_final_validation_failure_falls_back_to_the_validated_selection(self):
+        task, topology = public_case("uneven_pods", "ar")
+        calls = []
+        module_validate = validate_answer
+
+        def second_call_fails(*args, **kwargs):  # 0.2.21y: the first call is the final validation
+            calls.append(1)
+            if len(calls) == 1:
+                raise AgentCCError("final validation failed")
+            return module_validate(*args, **kwargs)
+
+        events = {"requests": [], "tools": [], "recovery": []}
+        module = self._load_agent_module(events)
+        with patch.object(module, "validate_answer", side_effect=second_call_fails),                 patch.object(AgentLoopTests, "_load_agent_module", staticmethod(lambda _events: module)):
+            result, audit, _ = self._run(['{"c":[]}'], task_input={"task": task, "topology": topology})
+        self.assertEqual(audit.get("final_validation_error"), "AgentCCError: final validation failed")
+        validate_answer(task, topology, result["answer"])
+        self.assertEqual(result["answer"]["round_count"], len(result["answer"]["rounds"]))
 
     def test_equivalent_widths_share_build_and_keep_model_evidence(self):
         events = {"tools": [], "recovery": []}
@@ -1023,10 +1350,11 @@ class AgentLoopTests(unittest.TestCase):
         data["topology"]["edges"] = [edge for edge in data["topology"]["edges"] if edge["dst"] == "A"]
         planner = Planner(data["task"], data["topology"])
         evaluator = module.Evaluator(planner)
-        with patch.object(planner, "build", wraps=planner.build) as build:
+        # The dedupe is tested with two builds (the agent builds one since 0.2.21y).
+        with patch.object(planner, "build", wraps=planner.build) as build,                 patch.object(module, "PORTFOLIO_BUILDS", 2):
             rows, _ = evaluator.run_portfolio()
             self.assertEqual(build.call_count, 2)
-            self.assertEqual(sum(row["status"] == "duplicate" for row in rows), 6)
+            self.assertGreaterEqual(sum(row["status"] == "duplicate" for row in rows), 1)  # stops after two builds
             duplicate = evaluator.evaluate({"algorithm": "doubling", "split": 1, "path_width": 16},
                                            "model", "model-call-123")
             self.assertEqual(duplicate["status"], "duplicate")
@@ -1081,7 +1409,9 @@ class AgentLoopTests(unittest.TestCase):
             result, audit, events = self._run([], **kwargs)
             with self.subTest(reason=reason):
                 self.assertEqual(audit["model_error"], reason)
-                self.assertEqual(audit["selected"]["sources"], ["agent"])
+                # Agent-side steps (e.g. agent_blocks) may refine the pick; no model source may appear.
+                self.assertIn("agent", audit["selected"]["sources"])
+                self.assertFalse([s for s in audit["selected"]["sources"] if s.startswith("model")])
                 self.assertIn("use_agent_portfolio", events["recovery"])
                 data = two_plane_input("all-reduce")
                 validate_answer(data["task"], data["topology"], result["answer"])
@@ -1100,6 +1430,95 @@ class AgentLoopTests(unittest.TestCase):
             evaluator.select()
         emergency = evaluator.emergency()
         validate_answer(data["task"], data["topology"], emergency["_answer"])
+
+    def test_rank_mapping_only_uses_idle_time(self):
+        module = self._load_agent_module({"tools": [], "recovery": []})
+        task, topology = public_case("uneven_pods", "ar")
+        evaluator = module.Evaluator(Planner(task, topology, sum_notation=True))
+        evaluator.idle_until = time.perf_counter() - 1.0
+        evaluator.run_portfolio()
+        self.assertEqual(evaluator.prepared_mapping["reason"], "no_idle_time")
+        best = evaluator.select()
+        result, detail = evaluator.remap(best, None, None)
+        self.assertIs(result, best)
+        self.assertEqual(detail["reason"], "no_idle_time")
+
+    def test_rank_mapping_can_be_switched_off(self):
+        data = two_plane_input("all-reduce")
+        result, audit, events = self._run(['{"c":[],"m":1}'], task_input=data,
+                                           environment={"AGENTCC_RANK_MAPPING": "0"})
+        validate_answer(data["task"], data["topology"], result["answer"])
+        self.assertEqual(audit["rank_mapping"]["reason"], "disabled")
+        self.assertNotIn("mapping", audit["selected"]["config"])
+        request = events["requests"][0]["messages"]
+        self.assertNotIn('"m"', request[0]["content"])
+        self.assertNotIn("rank_mapping", request[1]["content"])
+        module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
+        reduce = module.Planner(**{k: v for k, v in zip(("task", "topology"), data.values())})
+        with patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "0"}):
+            self.assertFalse(module.mappable(reduce, {"algorithm": "rs_ag"}))
+        self.assertTrue(module.mappable(reduce, {"algorithm": "rs_ag"}))
+
+    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
+    def test_mappable_schedules(self):
+        module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
+        gather = module.Planner(**{k: v for k, v in zip(("task", "topology"), two_plane_input("all-gather").values())})
+        reduce = module.Planner(**{k: v for k, v in zip(("task", "topology"), two_plane_input("all-reduce").values())})
+        self.assertTrue(module.mappable(gather, {"algorithm": "doubling"}))
+        self.assertTrue(module.mappable(reduce, {"algorithm": "rs_ag"}))
+        self.assertFalse(module.mappable(reduce, {"algorithm": "doubling"}))
+        self.assertFalse(module.mappable(reduce, {"algorithm": "tree"}))
+
+    def test_speculative_result_is_reused_unless_the_model_pick_wins(self):
+        task, topology = public_case("uneven_pods", "ar")
+        data = {"task": task, "topology": topology}
+        reused, audit, _ = self._run(['{"c":[]}'], task_input=data)
+        self.assertTrue(audit["speculative_reuse"])
+        validate_answer(task, topology, reused["answer"])
+        rerun, audit_m, _ = self._run(['{"c":[],"m":0}'], task_input=data)
+        self.assertTrue(audit_m["speculative_reuse"])
+        self.assertEqual(rerun["answer"]["rounds"], reused["answer"]["rounds"])
+
+    def test_default_model_budget_is_two_seconds_up_to_three_while_searching(self):
+        module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
+        self.assertEqual(module.DEFAULT_MODEL_BUDGET_SECONDS, 2.0)
+        self.assertEqual(module.DEFAULT_MODEL_BUDGET_SECONDS * module.MODEL_HARD_FACTOR, 3.0)
+
+    def test_model_may_answer_after_soft_budget_while_search_runs(self):
+        data = two_plane_input("all-reduce")
+        loader = AgentLoopTests._load_agent_module
+
+        def slow_search(events):
+            module = loader(events)
+            original = module.Evaluator.portfolio_and_speculate
+
+            def delayed(self):
+                result = original(self)
+                time.sleep(0.6)
+                return result
+
+            module.Evaluator.portfolio_and_speculate = delayed
+            return module
+
+        with patch.object(AgentLoopTests, "_load_agent_module", staticmethod(slow_search)):
+            result, audit, _ = self._run(['{"c":[["rs_ag",8,2,3]]}'], task_input=data, delay=0.3,
+                                         environment={"AGENT_LLM_BUDGET_SECONDS": "0.1", "AGENT_LLM_HARD_SECONDS": "1.0"})
+        self.assertEqual(audit["model_wait"], "search")
+        self.assertIsNone(audit["model_error"])
+        self.assertIn("model=ok", result["answer"]["strategy"])
+        validate_answer(data["task"], data["topology"], result["answer"])
+
+    def test_answer_records_model_outcome(self):
+        data = two_plane_input("all-reduce")
+        result, _, _ = self._run(['{"c":[["rs_ag",8,2,3]]}'], task_input=data)
+        self.assertIn("model=ok", result["answer"]["strategy"])
+        self.assertIn("llm_ms=", result["answer"]["strategy"])
+        late, audit, events = self._run(
+            [], task_input=data, delay=0.5, environment={"AGENT_LLM_BUDGET_SECONDS": "0.2"})
+        self.assertIn("model=model_timeout", late["answer"]["strategy"])
+        self.assertEqual(audit["model_error"], "model_timeout")
+        self.assertEqual(len(events["requests"]), 1)
+        validate_answer(data["task"], data["topology"], late["answer"])
 
     def test_sum_notation_switch(self):
         data = two_plane_input("all-reduce")
@@ -1132,27 +1551,39 @@ class AgentLoopTests(unittest.TestCase):
         for choice in (4, -1, True, "equal", None):
             self.assertEqual(module.parse_proposals(json.dumps({"c": [], "t": choice}))[3], "model_tree_error")
 
-    def test_model_tree_choice_changes_adoption_with_one_call_and_keeps_original(self):
+    def test_tree_trial_still_works_when_requested_directly(self):
+        events = {"tools": [], "recovery": []}
+        module = self._load_agent_module(events)
         task, topology = public_case("fullmesh_clos", "ar")
-        results = []
-        for choice in (0, 1):
-            result, audit, events = self._run([json.dumps({"c": [], "m": 0, "t": choice})],
-                                               task_input={"task": task, "topology": topology})
-            validate_answer(task, topology, result["answer"])
-            self.assertEqual(len(events["requests"]), 1)
-            self.assertEqual(audit["model_tree_choice"], choice)
-            results.append((result, audit, events))
-        self.assertEqual(results[0][1]["dual_tree"]["reason"], "model_disabled")
-        detail = results[1][1]["dual_tree"]
-        self.assertTrue(detail["adopted"])
-        self.assertLess(detail["after_us"], detail["before_us"] * .97)
-        self.assertLessEqual(detail["candidate_cost"], detail["before_cost"])
-        self.assertEqual(results[1][1]["selected"]["config"]["algorithm"], "dual_tree")
-        self.assertIn("model_dual_tree", results[1][1]["selected"]["sources"])
-        self.assertEqual(results[0][2]["requests"][0], results[1][2]["requests"][0])
-        self.assertIn("parent_llm_call_id", results[1][2]["tools"][-1])
+        evaluator = module.Evaluator(Planner(task, topology, sum_notation=True))
+        evaluator.run_portfolio()
+        best = evaluator.select()
+        disabled, detail = evaluator.try_dual_tree(best, 0, "model-tree-123")
+        self.assertIs(disabled, best)
+        self.assertEqual(detail["reason"], "model_disabled")
+        tried, detail = evaluator.try_dual_tree(best, 1, "model-tree-123")
+        self.assertIn("predicted", detail)
+        if detail["adopted"]:
+            validate_answer(task, topology, tried["_answer"])
+            self.assertEqual(tried["config"]["algorithm"], "dual_tree")
+        self.assertTrue(any(tool["name"] == "prepare_dual_tree" for tool in events["tools"]))
 
-    def test_tree_prediction_gate_and_validation_errors_propagate(self):
+    def test_hier_blocks_are_adopted_on_public_allreduce_and_validated(self):
+        task, topology = public_case("nvlink_like", "ar")
+        result, audit, events = self._run([json.dumps({"c": [], "m": 0, "t": 0})],
+                                           task_input={"task": task, "topology": topology})
+        validate_answer(task, topology, result["answer"])
+        detail = audit["hier_blocks"]
+        self.assertTrue(detail["adopted"])
+        self.assertLess(detail["after_us"], detail["before_us"])
+        self.assertAlmostEqual(detail["predicted_us"],
+                               replay_estimate(task, topology, result["answer"])["total_us"], delta=0.01)  # audit rounds to 3 decimals
+        self.assertIn("hb_rs", audit["selected"]["config"])
+        self.assertIn("agent_hier_blocks", audit["selected"]["sources"])
+        self.assertIn("hb_rs=", result["answer"]["strategy"])
+        self.assertTrue(any(tool["name"] == "search_hier_blocks" for tool in events["tools"]))
+
+    def test_tree_prediction_gate_and_deferred_validation(self):
         events = {"tools": [], "recovery": []}
         module = self._load_agent_module(events)
         task, topology = public_case("fullmesh_clos", "ar")
@@ -1164,11 +1595,9 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIs(result, original)
         self.assertEqual(detail["reason"], "integer_replay_screen")
         original["estimate_us"] = 1000
-        with patch.object(module, "validate_answer", side_effect=RuntimeError("tree validation failed")):
-            with self.assertRaisesRegex(RuntimeError, "tree validation failed"):
-                evaluator.try_dual_tree(original, 1, "model-tree-123")
+        with patch.object(module, "validate_answer", side_effect=AssertionError("dual tree must not validate")):
+            result, detail = evaluator.try_dual_tree(original, 1, "model-tree-123")
         self.assertEqual(events["tools"][-1]["parent_llm_call_id"], "model-tree-123")
-        result, detail = evaluator.try_dual_tree(original, 1, "model-tree-123")
         self.assertIs(result, original)
         self.assertEqual(detail["reason"], "complete_schedule_cost")
 
