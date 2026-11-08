@@ -672,6 +672,51 @@ class AllReduceBlockTests(unittest.TestCase):
                                places=3)
 
 
+class HierarchicalAllReduceTests(unittest.TestCase):
+    def test_hierarchical_rs_ag_validates_and_matches_prediction(self):
+        data = two_plane_input("all-reduce", ranks=8)
+        for short in (False, True):
+            planner = Planner(data["task"], data["topology"], sum_notation=short)
+            for rs_dims, hier_k in ((1, 1), (1, 2), (2, 1)):
+                with self.subTest(sum_notation=short, rs_dims=rs_dims, hier_k=hier_k):
+                    config = planner.normalize_config({"algorithm": "rs_ag", "split": 8, "path_width": 2,
+                                                       "rs_dims": rs_dims, "hier_k": hier_k})
+                    answer = planner.build(config)
+                    validate_answer(data["task"], data["topology"], answer)
+                    self.assertEqual(answer["round_count"], 2 * rs_dims + 3 - rs_dims + hier_k)
+                    actual = replay_estimate(data["task"], data["topology"], answer)["total_us"]
+                    self.assertAlmostEqual(planner.predict(config)["us"], actual, places=6)
+
+    def test_bad_hier_k_is_rejected(self):
+        data = two_plane_input("all-reduce", ranks=8)
+        planner = Planner(data["task"], data["topology"])
+        for raw in ({"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 1, "hier_k": 0},
+                    {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 1, "hier_k": 3},
+                    {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 1, "hier_k": True},
+                    {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_dims": 1, "hier_k": "1"},
+                    {"algorithm": "rs_ag", "split": 8, "path_width": 1, "rs_blocks": [[1]], "mid_blocks": [[2, 4]],
+                     "hier_k": 1},
+                    {"algorithm": "tree", "split": 8, "path_width": 1, "hier_k": 1}):
+            with self.subTest(raw=raw), self.assertRaises(AgentCCError):
+                planner.normalize_config(raw)
+
+    def test_public_directed_ring_split_prediction_and_gain(self):
+        task, topology = public_case("directed_ring", "ar")
+        planner = Planner(task, topology, sum_notation=True)
+        split = planner.splits[-1]
+        h = split.bit_length() - 1
+        plain = planner.normalize_config({"algorithm": "rs_ag", "split": split, "path_width": 2, "rs_dims": h})
+        hier = planner.normalize_config({"algorithm": "rs_ag", "split": split, "path_width": 2, "rs_dims": h,
+                                         "hier_k": 2})
+        results = {}
+        for name, config in (("plain", plain), ("hier", hier)):
+            answer, _ = split_path_bound_transfers(planner.network, planner.build(config), planner.data_size // split)
+            validate_answer(task, topology, answer, planner.network.raw)
+            results[name] = replay_estimate(task, topology, answer, planner.network.raw)["total_us"]
+            self.assertAlmostEqual(planner.split_aware_us(config), results[name], delta=results[name] * 1e-6)
+        self.assertLess(results["hier"], 0.85 * results["plain"])
+
+
 class TransferSplitTests(unittest.TestCase):
     @staticmethod
     def _loads(answer, planner):
@@ -1068,7 +1113,7 @@ class AgentLoopTests(unittest.TestCase):
                     "parse", "portfolio_rank", "portfolio_build",
                     "model", "portfolio_join", "model_candidates", "select_validate", "refine_validate",
                     "mapping_generation", "mapping_prepare", "rank_mapping",
-                    "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate", "final_validate", "speculative_finalize",
+                    "tree_prepare", "dual_tree_validate", "transfer_split", "blocks_prepare", "blocks_validate", "final_validate", "speculative_finalize", "hier_validate",
                 })
 
     def test_initial_predictions_obey_current_task_constraints(self):
@@ -1360,9 +1405,17 @@ class AgentLoopTests(unittest.TestCase):
     def test_model_tree_choice_changes_adoption_with_one_call_and_keeps_original(self):
         task, topology = public_case("fullmesh_clos", "ar")
         results = []
+        loader = AgentLoopTests._load_agent_module
+
+        def without_hierarchy(events):
+            module = loader(events)
+            module.Evaluator.try_hierarchy = lambda _self, best, _call: (best, {"adopted": False})
+            return module
+
         for choice in (0, 1):
-            result, audit, events = self._run([json.dumps({"c": [], "m": 0, "t": choice})],
-                                               task_input={"task": task, "topology": topology})
+            with patch.object(AgentLoopTests, "_load_agent_module", staticmethod(without_hierarchy)):
+                result, audit, events = self._run([json.dumps({"c": [], "m": 0, "t": choice})],
+                                                   task_input={"task": task, "topology": topology})
             validate_answer(task, topology, result["answer"])
             self.assertEqual(len(events["requests"]), 1)
             self.assertEqual(audit["model_tree_choice"], choice)
@@ -1376,6 +1429,19 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("model_dual_tree", results[1][1]["selected"]["sources"])
         self.assertEqual(results[0][2]["requests"][0], results[1][2]["requests"][0])
         self.assertIn("parent_llm_call_id", results[1][2]["tools"][-1])
+
+    def test_hierarchy_is_adopted_on_public_allreduce_and_validated(self):
+        task, topology = public_case("nvlink_like", "ar")
+        result, audit, events = self._run([json.dumps({"c": [], "m": 0, "t": 0})],
+                                           task_input={"task": task, "topology": topology})
+        validate_answer(task, topology, result["answer"])
+        detail = audit["hierarchy"]
+        self.assertTrue(detail["adopted"])
+        self.assertLess(detail["after_us"], detail["before_us"])
+        self.assertIn("hier_k", audit["selected"]["config"])
+        self.assertIn("agent_hierarchy", audit["selected"]["sources"])
+        self.assertIn("hier_k=", result["answer"]["strategy"])
+        self.assertTrue(any(tool["name"] == "search_hierarchy" for tool in events["tools"]))
 
     def test_tree_prediction_gate_and_deferred_validation(self):
         events = {"tools": [], "recovery": []}

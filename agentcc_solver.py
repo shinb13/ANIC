@@ -873,7 +873,7 @@ class Planner:
         if config["algorithm"] == "rs_ag":
             if config.get("rs_blocks") is not None:
                 return 2 * len(config["rs_blocks"]) + len(config["mid_blocks"])
-            return 2 * config["rs_dims"] + dims - config["rs_dims"]
+            return 2 * config["rs_dims"] + dims - config["rs_dims"] + config.get("hier_k", 0)
         if config["algorithm"] == "tree":
             return 2 * dims
         if config.get("blocks"):
@@ -966,6 +966,14 @@ class Planner:
             config["rs_dims"] = len(rs_order)
             config["order"] = rs_order + mid_order
             config["order_source"] = "blocks"
+        hier_k = raw.get("hier_k")
+        if hier_k is not None:
+            if algorithm != "rs_ag" or "rs_blocks" in config:
+                raise AgentCCError("hier_k applies to rs_ag without blocks only")
+            middle = len(self.steps) - config["rs_dims"]
+            if isinstance(hier_k, bool) or not isinstance(hier_k, int) or not 1 <= hier_k <= middle:
+                raise AgentCCError(f"hier_k must be an integer in [1, {middle}]")
+            config["hier_k"] = hier_k
         rounds = self.round_count(config)
         if rounds > self.max_rounds:
             raise AgentCCError(
@@ -994,6 +1002,24 @@ class Planner:
                 group = n if action == "copy" else 1 << index
                 specs.append({"plan": plan, "pairs": len(pairs), "chunks": split, "group": group,
                               "complete": action == "copy"})
+            return specs
+        if config["algorithm"] == "rs_ag" and config.get("hier_k"):
+            h = config["rs_dims"]
+            index = 0
+            for position in range(h):
+                specs.append({"plan": self.exchange_plan(order[position], self.round_width(config, index)),
+                              "pairs": n, "chunks": split >> (position + 1), "group": 1 << position,
+                              "complete": False})
+                index += 1
+            for key, pairs, action, group in self.hier_stages(config):
+                plan = self.round_plan(key, pairs, self.round_width(config, index))
+                specs.append({"plan": plan, "pairs": len(pairs), "chunks": split >> h, "group": group,
+                              "complete": action == "copy"})
+                index += 1
+            for position in reversed(range(h)):
+                specs.append({"plan": self.exchange_plan(order[position], self.round_width(config, index)),
+                              "pairs": n, "chunks": split >> (position + 1), "group": n, "complete": True})
+                index += 1
             return specs
         if config["algorithm"] == "rs_ag" and config.get("rs_blocks") is not None:
             prior, ag_specs = 0, []
@@ -1070,6 +1096,7 @@ class Planner:
                 self._allocation_keys[key] = allocation_key
             rounds.append(allocation_key)
         blocks = tuple(tuple(block) for block in config.get("blocks") or ())
+        blocks += (("hier", config.get("hier_k", 0)),)
         blocks += tuple(("rs",) + tuple(block) for block in config.get("rs_blocks") or ())
         blocks += tuple(("mid",) + tuple(block) for block in config.get("mid_blocks") or ())
         return (self.operator, config["algorithm"], config["split"], config.get("rs_dims"),
@@ -1082,7 +1109,7 @@ class Planner:
             if not isinstance(raw, dict):
                 return None
             clean = {key: raw[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths", "blocks",
-                                               "rs_blocks", "mid_blocks") if key in raw}
+                                               "rs_blocks", "mid_blocks", "hier_k") if key in raw}
             return self.normalize_config(clean)
         except (AgentCCError, TypeError, AttributeError):
             return None
@@ -1429,9 +1456,88 @@ class Planner:
         mid_blocks, mid_us, mid_singles = partition(h, len(order), mid_cost)
         return rs_blocks, mid_blocks, rs_us + mid_us, rs_singles + mid_singles
 
+    def hier_stages(self, config: dict[str, Any]) -> list[tuple[tuple, list[tuple[int, int]], str, int]]:
+        """Middle phase of hierarchical rs_ag: (plan key, pairs, action, sender group size).
+
+        The cheapest ``hier_k`` middle dimensions reduce the owned partial sums to one
+        representative per sub-cube, the representatives exchange on the remaining
+        dimensions, and the complete sums are copied back down the same tree.  Costly
+        links then carry 1/2^hier_k of the traffic of a full exchange.
+        """
+
+        h, k, order = config["rs_dims"], config["hier_k"], config["order"]
+        cheap, costly = order[h:h + k], order[h + k:]
+        active = set(range(self.rank_count))
+        up = []
+        for position, step in enumerate(cheap):
+            pairs = [(index, index ^ step) for index in sorted(active) if index & step]
+            up.append((("hier-up", tuple(cheap[:position + 1])), pairs, "reduce", (1 << h) << position))
+            active.difference_update(src for src, _ in pairs)
+        reps = sorted(active)
+        middle = [(("hier-mid", tuple(cheap), step), [(index, index ^ step) for index in reps], "reduce",
+                   (1 << h) << (k + position)) for position, step in enumerate(costly)]
+        down = [(("hier-down", key[1]), [(dst, src) for src, dst in pairs], "copy", self.rank_count)
+                for key, pairs, _, _ in reversed(up)]
+        return up + middle + down
+
+    def split_aware_us(self, config: dict[str, Any]) -> float:
+        """Split-aware integer Replay cost of a whole configuration (no build)."""
+
+        chunk_bytes = self.data_size // config["split"]
+        return sum(self.split_aware_round_us(spec["plan"], spec["chunks"], chunk_bytes)
+                   for spec in self.round_specs(config))
+
+    def _build_rs_ag_hier(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
+        split, h, order = config["split"], config["rs_dims"], config["order"]
+        n = self.rank_count
+        expression = self._expression_cache(split)
+        complete = tuple(range(n))
+        groups = [(index,) for index in range(n)]
+        owned = [list(range(split)) for _ in range(n)]
+        rounds = []
+        for step in order[:h]:
+            pairs = self.exchange_pairs(step)
+            plan = self.exchange_plan(step, self.round_width(config, len(rounds)))
+            keep, give = [], []
+            for index in range(n):
+                half = len(owned[index]) // 2
+                low, high = owned[index][:half], owned[index][half:]
+                keep.append(high if index & step else low)
+                give.append(low if index & step else high)
+            current = groups
+            rounds.append(self._emit(plan, pairs, give, "reduce",
+                                     lambda src, piece, current=current: [expression(current[src], s) for s in piece]))
+            owned = keep
+            groups = [tuple(sorted(groups[index] + groups[index ^ step])) for index in range(n)]
+        for key, pairs, action, _ in self.hier_stages(config):
+            plan = self.round_plan(key, pairs, self.round_width(config, len(rounds)))
+            if action == "reduce":
+                current = list(groups)
+                rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "reduce",
+                                         lambda src, piece, current=current: [expression(current[src], s)
+                                                                              for s in piece]))
+                for src, dst in pairs:
+                    groups[dst] = tuple(sorted(set(groups[dst]) | set(current[src])))
+            else:
+                rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
+                                         lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
+                for src, dst in pairs:
+                    groups[dst] = complete
+        if any(group != complete for group in groups):
+            raise AgentCCError("hierarchical reduce did not cover every contributor")
+        for step in reversed(order[:h]):
+            pairs = self.exchange_pairs(step)
+            plan = self.exchange_plan(step, self.round_width(config, len(rounds)))
+            rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
+                                     lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
+            owned = [sorted(owned[index] + owned[index ^ step]) for index in range(n)]
+        return rounds
+
     def _build_rs_ag(self, config: dict[str, Any]) -> list[list[dict[str, Any]]]:
         if config.get("rs_blocks") is not None:
             return self._build_rs_ag_blocks(config)
+        if config.get("hier_k"):
+            return self._build_rs_ag_hier(config)
         split, h = config["split"], config["rs_dims"]
         order = config["order"]
         expression = self._expression_cache(split)

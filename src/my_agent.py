@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.17y).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.18y).
 
 Per request, every value comes from the current task and topology:
 
@@ -61,7 +61,7 @@ DEFAULT_MAX_OUTPUT_TOKENS = 120
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.17y"
+TOOL_VERSION = "2.18y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
@@ -506,6 +506,12 @@ class Evaluator:
             details["allgather_blocks"] = {"error": f"{type(exc).__name__}: {exc}"}
         timings["blocks_validate"] = round((perf_counter() - started) * 1000, 3)
         started = perf_counter()
+        try:
+            best, details["hierarchy"] = self.try_hierarchy(best, call_id)
+        except Exception as exc:  # noqa: BLE001 - the current schedule is already valid
+            details["hierarchy"] = {"error": f"{type(exc).__name__}: {exc}"}
+        timings["hier_validate"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
         best, details["route_refinement"] = self.refine(best, call_id)
         timings["refine_validate"] = round((perf_counter() - started) * 1000, 3)
         started = perf_counter()
@@ -740,6 +746,56 @@ class Evaluator:
             call.result({key: value for key, value in detail.items() if key != "rounds"})
         return best, detail
 
+    def try_hierarchy(self, best: dict[str, Any], call_id: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+        """0.2.18y: rs_ag whose middle phase reduces to representatives on the cheapest
+        middle dimensions; adopted only if its split-aware integer Replay cost is lower."""
+
+        planner = best["_planner"]
+        info: dict[str, Any] = {"adopted": False, "before_us": best["estimate_us"]}
+        if best["config"]["algorithm"] != "rs_ag" or planner.operator != "all-reduce":
+            info["reason"] = "not_rs_ag"
+            return best, info
+        with tool_call("search_hierarchy", "function", arguments={"config": best["config"]},
+                       tool_version=TOOL_VERSION, parent_llm_call_id=call_id) as call:
+            split, width = best["config"]["split"], best["config"]["path_width"]
+            baseline = planner.split_aware_us(best["config"])
+            top = split.bit_length() - 1
+            options = []
+            for rs_dims in sorted({top, max(1, top - 1)}, reverse=True):
+                for hier_k in range(1, len(planner.steps) - rs_dims + 1):
+                    raw = {"algorithm": "rs_ag", "split": split, "path_width": width, "rs_dims": rs_dims,
+                           "hier_k": hier_k}
+                    try:
+                        config = planner.normalize_config(raw)
+                    except AgentCCError:
+                        continue
+                    options.append((planner.split_aware_us(config), rs_dims, hier_k, config))
+            info["baseline_us"] = baseline
+            if not options:
+                info["reason"] = "no_option"
+            else:
+                predicted, rs_dims, hier_k, config = min(options, key=lambda item: item[0])
+                info["chosen"] = {"rs_dims": rs_dims, "hier_k": hier_k, "predicted_us": predicted}
+                new_cost = math.log(predicted) + SIZE_WEIGHT * planner.predict(config)["mb"]
+                old_cost = math.log(baseline) + SIZE_WEIGHT * best["response_mb"]
+                if predicted > baseline * 0.97:
+                    info["reason"] = "integer_replay_screen"
+                elif new_cost >= old_cost:
+                    info["reason"] = "complete_schedule_cost"
+                else:
+                    answer = planner.build(config)
+                    estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
+                    size_mb = answer_size_estimate(answer) / 1e6
+                    if "mapping" in best["config"]:
+                        config["mapping"] = best["config"]["mapping"]
+                    best = {**best, "config": config, "_answer": answer, "_estimate": estimate,
+                            "estimate_us": estimate["total_us"], "response_mb": round(size_mb, 2),
+                            "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb,
+                            "sources": best["sources"] | {"agent_hierarchy"}}
+                    info.update(adopted=True, after_us=estimate["total_us"])
+            call.result(info)
+        return best, info
+
     def try_dual_tree(self, best: dict[str, Any], choice: int | None, call_id: str | None
                       ) -> tuple[dict[str, Any], dict[str, Any]]:
         info: dict[str, Any] = {"model_choice": choice, "before_us": best["estimate_us"], "adopted": False}
@@ -902,6 +958,7 @@ class AgentCCAgent(BaseAgent):
                     + (f" blocks={config['blocks']}" if "blocks" in config else "")
                     + (f" rs_blocks={config['rs_blocks']} mid_blocks={config['mid_blocks']}"
                        if "rs_blocks" in config else "")
+                    + (f" hier_k={config['hier_k']}" if "hier_k" in config else "")
                     + f" from {'+'.join(sorted(best['sources']))}"
                     # The platform returns no logs, so the answer itself carries the evidence.
                     + f" llm_ms={round(audit['llm_ms'])} model={parse_error or 'ok'}"
