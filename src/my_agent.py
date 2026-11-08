@@ -105,8 +105,10 @@ def system_prompt() -> str:
         + "Optional t, AllReduce two-tree trial: 0 off, 1 equal slots, 2 first tree 1/4, 3 first 3/4. "
         + ("Omit m/t for agent choice. Gains shown are rough screens, not Replay times. " if mapping
            else "Omit t for agent choice. ")
-        + 'Reply JSON only: {"c":[[algorithm,split,width,rs_dims]],' + ('"m":2,' if mapping else "")
-        + '"t":1} (rs_dims 0 unless rs_ag).'
+        # 0.2.19y: the example carries no m/t, so a copied example does not force a
+        # re-run of the agent's finished pipeline after the reply.
+        + 'Reply JSON only: {"c":[[algorithm,split,width,rs_dims]]} (rs_dims 0 unless rs_ag); '
+        + ('add "m" or "t" only to override the agent.' if mapping else 'add "t" only to override the agent.')
     )
 
 
