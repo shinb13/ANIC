@@ -32,6 +32,7 @@ import re
 from time import perf_counter
 from typing import Any
 
+import numpy as np
 import openai
 from agenthack import BaseAgent, recovery, state, tool_call, turn
 
@@ -98,20 +99,18 @@ def rank_mapping_enabled() -> bool:
 
 
 def system_prompt() -> str:
-    mapping = rank_mapping_enabled()
+    """0.2.21y: the model picks one configuration; rank mapping and the two-tree trial are
+    agent decisions.  On the platform a model-chosen mapping re-ran the agent's finished
+    pipeline (blocks, routes) on a remapped planner: 0.2.20y AllGather solves took up to
+    5 s longer, and a platform-speed emulation reproduced +0.3-1.7 s per case with a
+    slightly worse average Replay."""
+
     return (
         "Pick one collective schedule. The agent builds, routes, validates and Replay-measures your pick "
         "next to its own; lowest cost = ln(Replay us) + 0.1*response_MB wins. rs_ag: reduce-scatter on "
         "rs_dims dims then all-gather (response grows with split); tree: tiny response, more rounds; "
         "width: switch paths per pair. "
-        + ("Optional m remaps the best schedule: 0 off, 1 locality, 2 resource. " if mapping else "")
-        + "Optional t, AllReduce two-tree trial: 0 off, 1 equal slots, 2 first tree 1/4, 3 first 3/4. "
-        + ("Omit m/t for agent choice. Gains shown are rough screens, not Replay times. " if mapping
-           else "Omit t for agent choice. ")
-        # 0.2.19y: the example carries no m/t, so a copied example does not force a
-        # re-run of the agent's finished pipeline after the reply.
-        + 'Reply JSON only: {"c":[[algorithm,split,width,rs_dims]]} (rs_dims 0 unless rs_ag); '
-        + ('add "m" or "t" only to override the agent.' if mapping else 'add "t" only to override the agent.')
+        'Reply JSON only: {"c":[[algorithm,split,width,rs_dims]]} (rs_dims 0 unless rs_ag).'
     )
 
 
@@ -212,12 +211,16 @@ def rank_portfolio(
 def path_work_dims(planner: Planner) -> list[list[Any]]:
     """Per XOR dimension: mean shortest-path work per MiB, priced with shared resources.
 
-    0.2.16y: these come from the rank cost matrix that rank mapping computes anyway,
-    so the model request needs no route generation.
+    0.2.21y: only the resource-priced rank cost matrix is computed before the model
+    request (the rank-order grouping for mapping is left to idle time).
     """
 
-    info = planner.network_rank_orders()["resource"]
-    return [[step, round(cost * PROFILE_MIB, 1)] for step, cost in zip(planner.steps, info["original_mean"])]
+    network = planner.network
+    directed = network.rank_costs(network.static_cost)
+    costs = np.maximum(directed, directed.T)
+    n = len(costs)
+    return [[step, round(float(costs[np.arange(n), np.arange(n) ^ step].mean()) * PROFILE_MIB, 1)]
+            for step in planner.steps]
 
 
 def build_prompt(planner: Planner, dims: list[list[Any]], mappings: list) -> str:
@@ -246,16 +249,6 @@ def build_prompt(planner: Planner, dims: list[list[Any]], mappings: list) -> str
         "tight_resources_GBps": [[name, round(capacity / 1e9, 2)] for name, capacity in tight],
         "dims_us_per_MiB": dims,
     }
-    if mappings:
-        payload["rank_mapping_path_work_gain_pct"] = [
-            [index, option["mapping"], round(option["proxy_gain"] * 100, 2) if option["reachable"] else "unreachable"]
-            for index, option in enumerate(mappings, 1)
-        ]
-    tree_rounds = 2 * ((len(planner.steps) + 1) // 2)
-    if (planner.operator == "all-reduce" and planner.allow_copy and planner.splits[-1] >= 4
-            and tree_rounds <= planner.max_rounds):
-        split = planner.splits[-1]
-        payload["dual_tree_trial"] = {"split": split, "rounds": tree_rounds}
     return ("dims_us_per_MiB rows = [XOR step, us per MiB]. The agent measures while you decide:\n"
             + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             + "\nOne pick most likely to lower the cost.")
@@ -997,12 +990,9 @@ class AgentCCAgent(BaseAgent):
                 phase_started = perf_counter()
                 # 0.2.16y: the model is asked before any routing; the portfolio worker
                 # generates routes while the model is thinking.
-                mapping_seed = mapping_seed_config(planner)
-                mappings = (await asyncio.to_thread(planner.mapping_candidates, mapping_seed)
-                            if mapping_seed is not None else [])
                 dims = await asyncio.to_thread(path_work_dims, planner)
                 timings["mapping_generation"] = round((perf_counter() - phase_started) * 1000, 3)
-                prompt = build_prompt(planner, dims, mappings)
+                prompt = build_prompt(planner, dims, [])
                 audit["planning_ms"] = round((perf_counter() - started) * 1000, 3)
                 audit["prompt_bytes"] = len(prompt.encode())
 
@@ -1042,6 +1032,11 @@ class AgentCCAgent(BaseAgent):
                 audit.update(model_content=content if isinstance(content, str) else None,
                              model_metadata=metadata, model_error=parse_error, model_mapping_choice=mapping_choice,
                              model_tree_choice=tree_choice)
+                # 0.2.21y: mapping and tree trials are agent decisions; a reply that still
+                # names them is recorded but does not re-run the finished pipeline.
+                if mapping_choice is not None or tree_choice is not None:
+                    audit["model_overrides_ignored"] = {"m": mapping_choice, "t": tree_choice}
+                mapping_choice = tree_choice = None
             with state("tool_execution"):
                 phase_started = perf_counter()
                 try:

@@ -1253,25 +1253,26 @@ class AgentLoopTests(unittest.TestCase):
         costs = [cost for cost, _, _ in ranked]
         self.assertEqual(costs, sorted(costs))
 
-    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
-    def test_model_mapping_choice_changes_the_current_instance_schedule(self):
+    def test_model_mapping_and_tree_choices_are_recorded_but_ignored(self):
         task, topology = public_case("uneven_pods", "ar")
         outputs = []
-        for choice in (0, 1):
-            result, audit, events = self._run([json.dumps({"c": [], "m": choice})],
-                                               task_input={"task": task, "topology": topology})
+        for reply in ({"c": []}, {"c": [], "m": 1}, {"c": [], "m": 0, "t": 1}):
+            result, audit, events = self._run([json.dumps(reply)], task_input={"task": task, "topology": topology})
             validate_answer(task, topology, result["answer"])
-            self.assertIsNone(audit["model_error"])
             self.assertEqual(len(events["requests"]), 1)
-            self.assertEqual(audit["model_mapping_choice"], choice)
+            self.assertTrue(audit["speculative_reuse"])
+            self.assertEqual(audit["dual_tree"]["reason"], "model_did_not_ask")
+            self.assertNotIn("model_mapping", audit["selected"]["sources"])
             outputs.append((result, audit))
-        self.assertEqual(outputs[0][1]["rank_mapping"]["reason"], "model_kept_original")
-        mapped = outputs[1][1]["rank_mapping"]
-        self.assertTrue(mapped["adopted"])
-        self.assertLess(mapped["after_us"], mapped["before_us"] * .97)
-        self.assertEqual(outputs[1][1]["selected"]["config"]["mapping"], "locality")
-        self.assertIn("model_mapping", outputs[1][1]["selected"]["sources"])
-        self.assertEqual(sorted(mapped["rank_order"]), list(range(256)))
+        self.assertNotIn("model_overrides_ignored", outputs[0][1])
+        self.assertEqual(outputs[1][1]["model_overrides_ignored"], {"m": 1, "t": None})
+        self.assertEqual(outputs[2][1]["model_overrides_ignored"], {"m": 0, "t": 1})
+        self.assertEqual(outputs[0][0]["answer"]["rounds"], outputs[1][0]["answer"]["rounds"])
+        prompt = self._run(['{"c":[]}'], task_input={"task": task, "topology": topology})[2]["requests"][0]["messages"]
+        self.assertNotIn('"m"', prompt[0]["content"])
+        self.assertNotIn('"t"', prompt[0]["content"])
+        self.assertNotIn("dual_tree", prompt[1]["content"])
+        self.assertNotIn("rank_mapping", prompt[1]["content"])
 
     @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_mapping_tool_keeps_model_link_and_original_candidate(self):
@@ -1467,17 +1468,15 @@ class AgentLoopTests(unittest.TestCase):
         self.assertFalse(module.mappable(reduce, {"algorithm": "doubling"}))
         self.assertFalse(module.mappable(reduce, {"algorithm": "tree"}))
 
-    @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
-    def test_speculative_result_is_reused_only_without_model_choices(self):
+    def test_speculative_result_is_reused_unless_the_model_pick_wins(self):
         task, topology = public_case("uneven_pods", "ar")
         data = {"task": task, "topology": topology}
         reused, audit, _ = self._run(['{"c":[]}'], task_input=data)
         self.assertTrue(audit["speculative_reuse"])
         validate_answer(task, topology, reused["answer"])
         rerun, audit_m, _ = self._run(['{"c":[],"m":0}'], task_input=data)
-        self.assertFalse(audit_m["speculative_reuse"])
-        self.assertEqual(audit_m["rank_mapping"]["reason"], "model_kept_original")
-        validate_answer(task, topology, rerun["answer"])
+        self.assertTrue(audit_m["speculative_reuse"])
+        self.assertEqual(rerun["answer"]["rounds"], reused["answer"]["rounds"])
 
     def test_default_model_budget_is_two_seconds_up_to_three_while_searching(self):
         module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
@@ -1551,35 +1550,22 @@ class AgentLoopTests(unittest.TestCase):
         for choice in (4, -1, True, "equal", None):
             self.assertEqual(module.parse_proposals(json.dumps({"c": [], "t": choice}))[3], "model_tree_error")
 
-    def test_model_tree_choice_changes_adoption_with_one_call_and_keeps_original(self):
+    def test_tree_trial_still_works_when_requested_directly(self):
+        events = {"tools": [], "recovery": []}
+        module = self._load_agent_module(events)
         task, topology = public_case("fullmesh_clos", "ar")
-        results = []
-        loader = AgentLoopTests._load_agent_module
-
-        def without_hierarchy(events):
-            module = loader(events)
-            module.Evaluator.try_hierarchy = lambda _self, best, _call: (best, {"adopted": False})
-            module.Evaluator.try_hier_blocks = lambda _self, best, _call: (best, {"adopted": False})
-            module.Evaluator.try_greedy = lambda _self, best, _call: (best, {"adopted": False})
-            return module
-
-        for choice in (0, 1):
-            with patch.object(AgentLoopTests, "_load_agent_module", staticmethod(without_hierarchy)):
-                result, audit, events = self._run([json.dumps({"c": [], "m": 0, "t": choice})],
-                                                   task_input={"task": task, "topology": topology})
-            validate_answer(task, topology, result["answer"])
-            self.assertEqual(len(events["requests"]), 1)
-            self.assertEqual(audit["model_tree_choice"], choice)
-            results.append((result, audit, events))
-        self.assertEqual(results[0][1]["dual_tree"]["reason"], "model_disabled")
-        detail = results[1][1]["dual_tree"]
-        self.assertTrue(detail["adopted"])
-        self.assertLess(detail["after_us"], detail["before_us"] * .97)
-        self.assertLessEqual(detail["candidate_cost"], detail["before_cost"])
-        self.assertEqual(results[1][1]["selected"]["config"]["algorithm"], "dual_tree")
-        self.assertIn("model_dual_tree", results[1][1]["selected"]["sources"])
-        self.assertEqual(results[0][2]["requests"][0], results[1][2]["requests"][0])
-        self.assertIn("parent_llm_call_id", results[1][2]["tools"][-1])
+        evaluator = module.Evaluator(Planner(task, topology, sum_notation=True))
+        evaluator.run_portfolio()
+        best = evaluator.select()
+        disabled, detail = evaluator.try_dual_tree(best, 0, "model-tree-123")
+        self.assertIs(disabled, best)
+        self.assertEqual(detail["reason"], "model_disabled")
+        tried, detail = evaluator.try_dual_tree(best, 1, "model-tree-123")
+        self.assertIn("predicted", detail)
+        if detail["adopted"]:
+            validate_answer(task, topology, tried["_answer"])
+            self.assertEqual(tried["config"]["algorithm"], "dual_tree")
+        self.assertTrue(any(tool["name"] == "prepare_dual_tree" for tool in events["tools"]))
 
     def test_hier_blocks_are_adopted_on_public_allreduce_and_validated(self):
         task, topology = public_case("nvlink_like", "ar")
