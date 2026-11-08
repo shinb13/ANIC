@@ -83,7 +83,10 @@ BLOCK_WIDTHS = (16, 8)
 BLOCK_EXTRA_WIDTHS = 0
 
 def rank_mapping_enabled() -> bool:
-    """0.2.19y: rank mapping is off unless AGENTCC_RANK_MAPPING is set.
+    """Rank mapping on unless AGENTCC_RANK_MAPPING=0.
+
+    0.2.20y: it runs only while the agent would wait for the model anyway (see
+    Evaluator.idle_until).  0.2.19y had switched it off entirely:
 
     On a 70-instance perturbed local suite (platform-speed emulation) mapping changed
     the communication score by -0.01 on average while its preparation cost 0.1-0.6 s
@@ -91,7 +94,7 @@ def rank_mapping_enabled() -> bool:
     points overall.
     """
 
-    return os.environ.get("AGENTCC_RANK_MAPPING", "0").strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get("AGENTCC_RANK_MAPPING", "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def system_prompt() -> str:
@@ -376,6 +379,9 @@ class Evaluator:
         self.timings_ms: dict[str, float] = {}
         self.mapping_planners: dict[tuple[int, ...], Planner] = {}
         self.prepared_mapping: dict[str, Any] | None = None
+        # 0.2.20y: the agent waits for the model until about this time anyway; rank
+        # mapping (useful on few topologies, costly on large ones) only uses that time.
+        self.idle_until: float | None = None
         self.prepared_tree: dict[str, Any] = {"reason": "ineligible"}
         self.prepared_blocks: dict[tuple[int, int], dict[str, Any]] = {}
         self.speculative: dict[str, Any] | None = None
@@ -460,7 +466,10 @@ class Evaluator:
         prepare_started = perf_counter()
         if built:
             best = min(self.results.values(), key=lambda row: row["score"])
-            if mappable(self.planner, best["config"]):
+            estimate = self.timings_ms["portfolio_rank"] / 1000 / max(1, len({c["path_width"] for _, c, _ in ranked}))
+            if mappable(self.planner, best["config"]) and not self.idle_for(estimate):
+                self.prepared_mapping = {"reason": "no_idle_time", "estimate_s": round(estimate, 3)}
+            elif mappable(self.planner, best["config"]):
                 with tool_call("prepare_rank_mapping", "function", arguments={"config": best["config"]},
                                tool_version=TOOL_VERSION) as call:
                     self.prepared_mapping = self.public(self.mapping_trial(best["config"], None))
@@ -686,9 +695,16 @@ class Evaluator:
         return {**info, "mapping": option["mapping"], "rank_order": option["rank_order"],
                 "predicted": prediction, "config": config, "_planner": mapped}
 
+    def idle_for(self, seconds: float) -> bool:
+        return self.idle_until is None or perf_counter() + seconds <= self.idle_until
+
     def remap(self, best: dict[str, Any], choice: int | None, call_id: str | None
               ) -> tuple[dict[str, Any], dict[str, Any]]:
         info: dict[str, Any] = {"model_choice": choice, "adopted": False, "before_us": best["estimate_us"]}
+        skipped = (self.prepared_mapping or {}).get("reason") == "no_idle_time"
+        if choice is None and (skipped or not self.idle_for(0.0)) and rank_mapping_enabled():
+            info["reason"] = "no_idle_time"
+            return best, info
         if not rank_mapping_enabled():
             info["reason"] = "disabled"
             return best, info
@@ -989,6 +1005,7 @@ class AgentCCAgent(BaseAgent):
                 audit["prompt_bytes"] = len(prompt.encode())
 
             evaluator = Evaluator(planner)
+            evaluator.idle_until = perf_counter() + model_budget
             with state("tool_execution"):
                 # One worker owns planning caches until the portfolio has completed.
                 portfolio = asyncio.ensure_future(asyncio.to_thread(evaluator.portfolio_and_speculate))

@@ -1429,9 +1429,22 @@ class AgentLoopTests(unittest.TestCase):
         emergency = evaluator.emergency()
         validate_answer(data["task"], data["topology"], emergency["_answer"])
 
-    def test_rank_mapping_is_off_by_default(self):
+    def test_rank_mapping_only_uses_idle_time(self):
+        module = self._load_agent_module({"tools": [], "recovery": []})
+        task, topology = public_case("uneven_pods", "ar")
+        evaluator = module.Evaluator(Planner(task, topology, sum_notation=True))
+        evaluator.idle_until = time.perf_counter() - 1.0
+        evaluator.run_portfolio()
+        self.assertEqual(evaluator.prepared_mapping["reason"], "no_idle_time")
+        best = evaluator.select()
+        result, detail = evaluator.remap(best, None, None)
+        self.assertIs(result, best)
+        self.assertEqual(detail["reason"], "no_idle_time")
+
+    def test_rank_mapping_can_be_switched_off(self):
         data = two_plane_input("all-reduce")
-        result, audit, events = self._run(['{"c":[],"m":1}'], task_input=data)
+        result, audit, events = self._run(['{"c":[],"m":1}'], task_input=data,
+                                           environment={"AGENTCC_RANK_MAPPING": "0"})
         validate_answer(data["task"], data["topology"], result["answer"])
         self.assertEqual(audit["rank_mapping"]["reason"], "disabled")
         self.assertNotIn("mapping", audit["selected"]["config"])
@@ -1440,7 +1453,9 @@ class AgentLoopTests(unittest.TestCase):
         self.assertNotIn("rank_mapping", request[1]["content"])
         module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
         reduce = module.Planner(**{k: v for k, v in zip(("task", "topology"), data.values())})
-        self.assertFalse(module.mappable(reduce, {"algorithm": "rs_ag"}))
+        with patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "0"}):
+            self.assertFalse(module.mappable(reduce, {"algorithm": "rs_ag"}))
+        self.assertTrue(module.mappable(reduce, {"algorithm": "rs_ag"}))
 
     @patch.dict(os.environ, {"AGENTCC_RANK_MAPPING": "1"})
     def test_mappable_schedules(self):
