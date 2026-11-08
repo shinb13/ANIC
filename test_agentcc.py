@@ -628,6 +628,34 @@ class AllGatherBlockTests(unittest.TestCase):
         self.assertAlmostEqual(replay_estimate(task, topology, split, planner.network.raw)["total_us"], predicted, places=3)
 
 
+class WideBlockTests(unittest.TestCase):
+    def test_block_order_inside_a_block_does_not_change_pairs(self):
+        data = two_plane_input("all-gather", ranks=8)
+        planner = Planner(data["task"], data["topology"])
+        for blocks in ([[1, 2], [4]], [[2, 1], [4]], [[4, 1, 2]], [[2, 4, 1]]):
+            with self.subTest(blocks=blocks):
+                config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 2,
+                                                   "blocks": blocks})
+                validate_answer(data["task"], data["topology"], planner.build(config))
+
+    def test_wide_block_plans_only_lower_the_prediction_and_match_replay(self):
+        task, topology = public_case("mesh2d", "ag")
+        results = {}
+        for wide in (False, True):
+            planner = Planner(task, topology, sum_notation=True)
+            config = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 16})
+            blocks, predicted, singles = planner.allgather_blocks(
+                config, wide_deadline=time.perf_counter() + 60 if wide else None)
+            results[wide] = predicted
+            blocked = planner.normalize_config({"algorithm": "doubling", "split": 1, "path_width": 16,
+                                                "blocks": blocks})
+            answer, _ = split_path_bound_transfers(planner.network, planner.build(blocked), planner.data_size)
+            validate_answer(task, topology, answer, planner.network.raw)
+            self.assertAlmostEqual(replay_estimate(task, topology, answer, planner.network.raw)["total_us"],
+                                   predicted, delta=predicted * 1e-6)
+        self.assertLess(results[True], 0.8 * results[False])
+
+
 class AllReduceBlockTests(unittest.TestCase):
     def test_rs_ag_blocks_validate_and_match_prediction(self):
         data = two_plane_input("all-reduce", ranks=8)

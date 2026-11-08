@@ -75,6 +75,10 @@ PROFILE_MIB = 1 << 20
 # 0.2.14y: the platform ran the 0.2.12y search about 5x slower than local tests,
 # so the budget is a hard deadline checked between block plans.
 BLOCK_SEARCH_BUDGET_SECONDS = 0.8
+# 0.2.18y: extra time to re-plan key AllGather blocks at the full path width (capped
+# plans lost most of the 0.2.12y mesh2d gain); only blocks whose split-aware cost drops
+# switch.  AllReduce blocks gained nothing from it on the public examples.
+BLOCK_WIDE_BUDGET_SECONDS = 0.6
 BLOCK_WIDTHS = (16, 8)
 BLOCK_EXTRA_WIDTHS = 0
 
@@ -524,6 +528,7 @@ class Evaluator:
         """Block search at the config's width first, then wider widths while the budget lasts."""
 
         deadline = perf_counter() + BLOCK_SEARCH_BUDGET_SECONDS
+        wide_deadline = deadline + BLOCK_WIDE_BUDGET_SECONDS
         widths = [config["path_width"]] + [width for width in BLOCK_WIDTHS if width != config["path_width"]][
             :BLOCK_EXTRA_WIDTHS]
         done = []
@@ -541,7 +546,7 @@ class Evaluator:
                     fields = {"rs_blocks": rs_blocks, "mid_blocks": mid_blocks}
                 else:
                     base = planner.normalize_config(raw)
-                    blocks, predicted, singles = planner.allgather_blocks(base, deadline=deadline)
+                    blocks, predicted, singles = planner.allgather_blocks(base, deadline=deadline, wide_deadline=wide_deadline)
                     fields = {"blocks": blocks}
                 self.prepared_blocks[key] = {"width": width, **fields, "predicted_us": predicted,
                                              "single_dims_us": singles,

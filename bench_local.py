@@ -179,6 +179,10 @@ def run_one(src: str, family: str, short: str, delay: float, reply: str = "") ->
         "planning_s": (audit.get("planning_ms") or 0) / 1000,
         "selected_sources": (audit.get("selected") or {}).get("sources"),
         "model_late": audit.get("model_late"),
+        "model_wait": audit.get("model_wait"),
+        "blocks_audit": audit.get("allgather_blocks"),
+        "hier_audit": audit.get("hierarchy"),
+        "timings_ms": audit.get("timings_ms"),
     }
 
 

@@ -759,6 +759,8 @@ class Planner:
         self.max_rounds = int(task["max_nonempty_rounds"])
         self.allow_copy = bool(task.get("allow_copy", True))
         self._plans: dict[tuple, RoundPlan] = {}
+        # (sorted block, path width) -> width cap of the block plan in use (0.2.18y).
+        self._block_caps: dict[tuple[tuple[int, ...], int], int] = {}
         self._names: dict[int, list[list[str]]] = {}
         self._allocations: dict[tuple[int, int], np.ndarray] = {}
         self._allocation_keys: dict[tuple[int, int], tuple] = {}
@@ -1235,7 +1237,7 @@ class Planner:
         rounds = []
         for index_round, block in enumerate(config["blocks"]):
             masks = block_masks(block)
-            pairs = [(index, index ^ mask) for mask in masks for index in range(self.rank_count)]
+            pairs = self.block_pairs(block)
             plan = self.block_plan(block, self.round_width(config, index_round))
             held = [[name for member in group for name in names[member]] for group in members]
             rounds.append(self._emit(plan, pairs, [held[src] for src, _ in pairs], "copy", lambda _src, piece: piece))
@@ -1243,20 +1245,29 @@ class Planner:
                        for index in range(self.rank_count)]
         return rounds
 
+    def block_pairs(self, block: list[int]) -> list[tuple[int, int]]:
+        """Pairs of a block round, ordered by the sorted block like its cached plan."""
+
+        return [(index, index ^ mask) for mask in block_masks(sorted(block)) for index in range(self.rank_count)]
+
+    def _block_cap(self, block: list[int], width: int) -> int:
+        return self._block_caps.get((tuple(sorted(block)), width), min(width, BLOCK_WIDTH_CAP))
+
+    def _block_plan_at(self, block: list[int], cap: int) -> RoundPlan:
+        return self.round_plan(("block", tuple(sorted(block))), self.block_pairs(block), cap,
+                               BLOCK_OPTIMIZER_ITERATIONS, quick=True)
+
     def block_plan(self, block: list[int], width: int) -> RoundPlan:
         """Round plan for one block; a single dimension reuses the plain XOR exchange plan."""
 
         if len(block) == 1:
             return self.exchange_plan(block[0], width)
-        masks = block_masks(block)
-        pairs = [(index, index ^ mask) for mask in masks for index in range(self.rank_count)]
-        return self.round_plan(("block", tuple(sorted(block))), pairs, min(width, BLOCK_WIDTH_CAP),
-                               BLOCK_OPTIMIZER_ITERATIONS, quick=True)
+        return self._block_plan_at(block, self._block_cap(block, width))
 
     def has_plan(self, block: list[int], width: int) -> bool:
         if len(block) == 1:
             return ("xor", block[0], width) in self._plans
-        return ("block", tuple(sorted(block)), min(width, BLOCK_WIDTH_CAP)) in self._plans
+        return ("block", tuple(sorted(block)), self._block_cap(block, width)) in self._plans
 
     def warm_blocks(self, spans: list[tuple[int, int]], order: list[int], width: int, deadline: float | None) -> None:
         """Compute multi-dimension block plans in the given priority order until the deadline."""
@@ -1265,6 +1276,29 @@ class Planner:
             if deadline is not None and perf_counter() >= deadline:
                 return
             self.block_plan(order[start:end], width)
+
+    def widen_blocks(self, spans: list[tuple[int, int]], order: list[int], width: int, units_of,
+                     chunk_bytes: int, deadline: float | None) -> None:
+        """0.2.18y: plan blocks again at the full path width, in priority order, until the
+        deadline; a block switches to the wide plan only if its split-aware integer cost
+        at that position is lower than the capped plan's."""
+
+        narrow = min(width, BLOCK_WIDTH_CAP)
+        if deadline is None or width <= narrow:
+            return
+        for start, end in spans:
+            if perf_counter() >= deadline:
+                return
+            block = order[start:end]
+            key = (tuple(sorted(block)), width)
+            if key in self._block_caps or not self.has_plan(block, width):
+                continue
+            units = units_of(start, end)
+            if units <= 0:
+                continue
+            wide = self.split_aware_round_us(self._block_plan_at(block, width), units, chunk_bytes)
+            capped = self.split_aware_round_us(self._block_plan_at(block, narrow), units, chunk_bytes)
+            self._block_caps[key] = width if wide < capped else narrow
 
     def split_aware_round_us(self, plan: RoundPlan, units: int, chunk_bytes: int) -> float:
         """Integer round cost once path-bound transfers are split (see split_path_bound_transfers)."""
@@ -1278,7 +1312,8 @@ class Planner:
         return float(max(single, overhead + float((loads * self.network.element_inv).max(initial=0.0))))
 
     def allgather_blocks(self, config: dict[str, Any], max_block: int = MAX_BLOCK_DIMS,
-                         deadline: float | None = None) -> tuple[list[list[int]], float, float]:
+                         deadline: float | None = None,
+                         wide_deadline: float | None = None) -> tuple[list[list[int]], float, float]:
         """Best partition of the AllGather order into consecutive blocks (dynamic programme).
 
         Keeps the configured dimension order (costliest first, smallest payload)
@@ -1295,6 +1330,8 @@ class Planner:
                         for end in range(start + 2, min(count, start + max_block) + 1)),
                        key=lambda span: (-span[0], span[1]))
         self.warm_blocks(spans, order, width, deadline)
+        self.widen_blocks(spans, order, width, lambda start, _end: config["split"] << start, chunk_bytes,
+                          wide_deadline)
         best = [math.inf] * (count + 1)
         choice = [0] * (count + 1)
         best[0] = 0.0
@@ -1377,7 +1414,7 @@ class Planner:
                 size = len(owned[index]) // parts
                 start = coordinate(index, block) * size
                 keep.append(owned[index][start:start + size])
-            pairs = [(index, index ^ mask) for mask in masks for index in range(n)]
+            pairs = self.block_pairs(block)
             plan = self.block_plan(block, self.round_width(config, len(rounds)))
             current = groups
             rounds.append(self._emit(plan, pairs, [keep[dst] for _, dst in pairs], "reduce",
@@ -1387,7 +1424,7 @@ class Planner:
                       for index in range(n)]
         for block in config["mid_blocks"]:
             masks = block_masks(block)
-            pairs = [(index, index ^ mask) for mask in masks for index in range(n)]
+            pairs = self.block_pairs(block)
             plan = self.block_plan(block, self.round_width(config, len(rounds)))
             current = groups
             rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "reduce",
@@ -1398,7 +1435,7 @@ class Planner:
             raise AgentCCError("reduce phase did not cover every contributor")
         for block in reversed(config["rs_blocks"]):
             masks = block_masks(block)
-            pairs = [(index, index ^ mask) for mask in masks for index in range(n)]
+            pairs = self.block_pairs(block)
             plan = self.block_plan(block, self.round_width(config, len(rounds)))
             rounds.append(self._emit(plan, pairs, [list(owned[src]) for src, _ in pairs], "copy",
                                      lambda _src, piece: [self._complete(expression, complete, s) for s in piece]))
@@ -1406,7 +1443,8 @@ class Planner:
         return rounds
 
     def allreduce_blocks(self, config: dict[str, Any], max_block: int = MAX_BLOCK_DIMS,
-                         deadline: float | None = None) -> tuple[list[list[int]], list[list[int]], float, float]:
+                         deadline: float | None = None, wide_deadline: float | None = None,
+                         ) -> tuple[list[list[int]], list[list[int]], float, float]:
         """Best rs_ag block partition: reduce-scatter blocks (priced with their mirrored
         all-gather round) and middle blocks, each by dynamic programme over the order.
 
@@ -1429,6 +1467,8 @@ class Planner:
         spans += [(start, end) for start in range(h, len(order))
                   for end in range(start + 2, min(len(order), start + max_block) + 1)]
         self.warm_blocks(spans, order, width, deadline)
+        self.widen_blocks(spans, order, width, lambda start, end: split >> end if end <= h else split >> h,
+                          chunk_bytes, wide_deadline)
 
         def partition(first: int, last: int, cost) -> tuple[list[list[int]], float, float]:
             best = {first: (0.0, first)}
