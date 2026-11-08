@@ -64,7 +64,9 @@ DEFAULT_MODEL_BUDGET_SECONDS = 2.0
 MODEL_HARD_FACTOR = 1.5
 DEFAULT_MAX_OUTPUT_TOKENS = 48
 MAX_PROPOSALS = 3
-PORTFOLIO_BUILDS = 4
+# 0.2.21y: predictions are exact for the emitted schedule, so only the best predicted
+# candidate is built (4 builds cost time and changed no selection on the perturbed suite).
+PORTFOLIO_BUILDS = 1
 TOOL_NAME = "evaluate_schedule"
 TOOL_VERSION = "2.20y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the

@@ -1350,7 +1350,8 @@ class AgentLoopTests(unittest.TestCase):
         data["topology"]["edges"] = [edge for edge in data["topology"]["edges"] if edge["dst"] == "A"]
         planner = Planner(data["task"], data["topology"])
         evaluator = module.Evaluator(planner)
-        with patch.object(planner, "build", wraps=planner.build) as build:
+        # The dedupe is tested with two builds (the agent builds one since 0.2.21y).
+        with patch.object(planner, "build", wraps=planner.build) as build,                 patch.object(module, "PORTFOLIO_BUILDS", 2):
             rows, _ = evaluator.run_portfolio()
             self.assertEqual(build.call_count, 2)
             self.assertEqual(sum(row["status"] == "duplicate" for row in rows), 2)  # 2 splits x widths (8, 16)
