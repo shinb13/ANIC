@@ -863,14 +863,32 @@ class Evaluator:
             previous = planner.greedy_allocation
             planner.greedy_allocation = True
             try:
-                baseline = planner.split_aware_us(best["config"]) if best["config"]["algorithm"] == "rs_ag" else None
+                # 0.2.21y: the same split-aware greedy measure for any current AllReduce shape.
+                try:
+                    baseline = planner.split_aware_us(best["config"])
+                except Exception:  # noqa: BLE001 - shapes without round specs fall back below
+                    baseline = None
                 found = []
                 rs_dims = best["config"].get("rs_dims", top) if best["config"]["algorithm"] == "rs_ag" else top
-                for rs_dims in (rs_dims,):
-                    config, predicted = planner.hb_search(split, width, rs_dims)
+                started = perf_counter()
+                config, predicted = planner.hb_search(split, width, rs_dims)
+                first_s = perf_counter() - started
+                if config is not None:
+                    found.append((predicted, config))
+                # 0.2.21y: the other rs_dims and width only while the agent would wait for
+                # the model anyway (they found 3-14% more on some public/perturbed cases).
+                both = sorted({top, max(1, top - 1)}, reverse=True)
+                extras = [(width, h) for h in both if h != rs_dims] + [
+                    (other, h) for other in (4, 8) if other != width for h in both]
+                searched = [(width, rs_dims)]
+                for other_width, other_dims in extras:
+                    if not self.idle_for(first_s):
+                        break
+                    config, predicted = planner.hb_search(split, other_width, other_dims)
+                    searched.append((other_width, other_dims))
                     if config is not None:
                         found.append((predicted, config))
-                info["baseline_greedy_us"] = baseline
+                info.update(baseline_greedy_us=baseline, searched=searched)
                 if not found:
                     info["reason"] = "no_option"
                 else:

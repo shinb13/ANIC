@@ -759,7 +759,7 @@ class GreedyAllocationTests(unittest.TestCase):
                 before = [planner.split_aware_round_us(spec["plan"], spec["chunks"], chunk) for spec in specs]
                 planner.greedy_allocation = True
                 after = [planner.split_aware_round_us(spec["plan"], spec["chunks"], chunk) for spec in specs]
-                self.assertTrue(all(a <= b * (1 + 1e-9) + 0.5 for a, b in zip(after, before)))
+                self.assertTrue(all(a <= b * (1 + 1e-12) for a, b in zip(after, before)))  # exact per-round choice (0.2.21y)
                 self.assertLess(sum(after), sum(before))
                 answer, _ = split_path_bound_transfers(planner.network, planner.build(config), chunk)
                 validate_answer(task, topology, answer, planner.network.raw)

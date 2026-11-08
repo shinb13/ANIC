@@ -782,6 +782,17 @@ def _per_byte_round_cost(plan: RoundPlan, element_inv: np.ndarray, counts: np.nd
     return float(max(single, (loads * element_inv).max(initial=0.0)))
 
 
+def _split_aware_cost(plan: RoundPlan, element_inv: np.ndarray, counts: np.ndarray, chunk_bytes: int) -> float:
+    """Split-aware integer round cost (us) of integer counts, overheads included."""
+
+    flat = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]).astype(float)
+    active = flat > 0
+    loads = np.bincount(plan.entry_element, weights=flat[plan.entry_path] * chunk_bytes, minlength=len(element_inv))
+    overhead = float(plan.path_overhead_us[active].max(initial=0.0))
+    single = float((plan.path_overhead_us[active] + chunk_bytes * plan.path_per_byte_us[active]).max(initial=0.0))
+    return max(single, overhead + float((loads * element_inv).max(initial=0.0)))
+
+
 def _discretize(fractions: np.ndarray, units: int) -> np.ndarray:
     """Round each row to ``units`` integer pieces with per-row offsets.
 
@@ -837,6 +848,7 @@ class Planner:
         self._rank_orders: dict[str, dict[str, Any]] | None = None
         # 0.2.20y: integer route counts chosen greedily instead of rounding fractions.
         self.greedy_allocation = False
+        self._build_chunk: int | None = None
 
     def with_rank_order(self, order: list[int]) -> "Planner":
         """Use logical ranks internally, sharing only the physical network/route cache."""
@@ -893,16 +905,27 @@ class Planner:
     def exchange_plan(self, step: int, width: int) -> RoundPlan:
         return self.round_plan(("xor", step), self.exchange_pairs(step), width)
 
-    def integer_allocation(self, plan: RoundPlan, units: int) -> np.ndarray:
-        """The same integer route counts are used for prediction and emission."""
+    def integer_allocation(self, plan: RoundPlan, units: int, chunk_bytes: int | None = None) -> np.ndarray:
+        """The same integer route counts are used for prediction and emission.
 
-        key = (id(plan), units, self.greedy_allocation)
+        In greedy mode the greedy counts replace the rounded fractional ones only where
+        that round's split-aware cost (fixed per-path overheads included, 0.2.21y) is
+        lower; emission uses the chunk size of the schedule being built.
+        """
+
+        chunk = chunk_bytes if chunk_bytes is not None else self._build_chunk
+        key = (id(plan), units, self.greedy_allocation, chunk if self.greedy_allocation else None)
         counts = self._allocations.get(key)
         if counts is None:
             counts = _discretize(plan.fractions, units)
             if self.greedy_allocation and units > 0:
-                greedy = _greedy_counts(plan, self.network.element_inv, units)
-                if _per_byte_round_cost(plan, self.network.element_inv, greedy) <                         _per_byte_round_cost(plan, self.network.element_inv, counts):
+                inv = self.network.element_inv
+                greedy = _greedy_counts(plan, inv, units)
+                if chunk:
+                    better = _split_aware_cost(plan, inv, greedy, chunk) < _split_aware_cost(plan, inv, counts, chunk)
+                else:
+                    better = _per_byte_round_cost(plan, inv, greedy) < _per_byte_round_cost(plan, inv, counts)
+                if better:
                     counts = greedy
             self._allocations[key] = counts
         return counts
@@ -912,7 +935,7 @@ class Planner:
 
         key = (id(plan), units, chunk_bytes, self.greedy_allocation)
         if key not in self._integer_times:
-            counts = self.integer_allocation(plan, units)
+            counts = self.integer_allocation(plan, units, chunk_bytes)
             sizes = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]) * chunk_bytes
             active = sizes > 0
             loads = np.bincount(
@@ -1209,7 +1232,7 @@ class Planner:
             key = (id(plan), spec["chunks"], self.greedy_allocation)
             allocation_key = self._allocation_keys.get(key)
             if allocation_key is None:
-                counts = self.integer_allocation(plan, spec["chunks"])
+                counts = self.integer_allocation(plan, spec["chunks"], self.data_size // config["split"])
                 allocation_key = tuple(
                     tuple((route.nodes, int(count)) for route, count in zip(routes, row) if count > 0)
                     for routes, row in zip(plan.routes, counts)
@@ -1285,6 +1308,7 @@ class Planner:
         return names
 
     def build(self, config: dict[str, Any]) -> dict[str, Any]:
+        self._build_chunk = self.data_size // config["split"]
         if self.operator == "all-gather":
             rounds = self._build_allgather(config)
         elif config["algorithm"] == "rs_ag":
@@ -1425,7 +1449,7 @@ class Planner:
     def split_aware_round_us(self, plan: RoundPlan, units: int, chunk_bytes: int) -> float:
         """Integer round cost once path-bound transfers are split (see split_path_bound_transfers)."""
 
-        counts = self.integer_allocation(plan, units)
+        counts = self.integer_allocation(plan, units, chunk_bytes)
         sizes = np.concatenate([row[:len(routes)] for row, routes in zip(counts, plan.routes)]) * chunk_bytes
         active = sizes > 0
         loads = np.bincount(plan.entry_element, weights=sizes[plan.entry_path], minlength=len(self.network.element_inv))
