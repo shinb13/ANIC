@@ -38,8 +38,6 @@ BLOCK_OPTIMIZER_ITERATIONS = 24
 # A block round already spreads a rank's traffic over several partners; four routes per
 # pair kept most of the gain on the public examples at about 40% of the search time.
 BLOCK_WIDTH_CAP = 4
-# Optimizer iterations of the cheap screening plans (quick routes) used by screen_us.
-SCREEN_ITERATIONS = 12
 OPTIMIZER_ITERATIONS = 48
 PROFILE_BYTES = 1 << 20
 
@@ -768,7 +766,6 @@ class Planner:
         self._allocation_keys: dict[tuple[int, int], tuple] = {}
         self._integer_times: dict[tuple[int, int, int], float] = {}
         self._rank_orders: dict[str, dict[str, Any]] | None = None
-        self._screening = False
 
     def with_rank_order(self, order: list[int]) -> "Planner":
         """Use logical ranks internally, sharing only the physical network/route cache."""
@@ -823,27 +820,7 @@ class Planner:
         return plan
 
     def exchange_plan(self, step: int, width: int) -> RoundPlan:
-        if self._screening:
-            return self.round_plan(("xor-screen", step), self.exchange_pairs(step), width, SCREEN_ITERATIONS,
-                                   quick=True)
         return self.round_plan(("xor", step), self.exchange_pairs(step), width)
-
-    def screen_us(self, raw: dict[str, Any]) -> float:
-        """Integer Replay cost with cheap plans (cheapest-cost routes, few iterations).
-
-        Used only to compare two rank orders under the same routing model before paying
-        for full route generation; it is not a prediction of the final schedule.  The
-        dimension order is chosen from the same cheap plans, so no full plan is built.
-        """
-
-        self._screening = True
-        try:
-            config = self.normalize_config({key: value for key, value in raw.items() if key != "order"})
-            chunk = self.data_size // config["split"]
-            return sum(self.integer_round_time_us(spec["plan"], spec["chunks"], chunk)
-                       for spec in self.round_specs(config))
-        finally:
-            self._screening = False
 
     def integer_allocation(self, plan: RoundPlan, units: int) -> np.ndarray:
         """The same integer route counts are used for prediction and emission."""
