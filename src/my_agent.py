@@ -1,4 +1,4 @@
-"""Model-in-the-loop AgentCC scheduling agent (0.2.8).
+"""Model-in-the-loop AgentCC scheduling agent (0.2.19y).
 
 Per request, every value comes from the current task and topology:
 
@@ -47,36 +47,72 @@ from agentcc_solver import (
     reference_config,
     refine_schedule_routes,
     replay_estimate,
+    split_path_bound_transfers,
     validate_answer,
 )
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_MODEL_BUDGET_SECONDS = 6.0
-DEFAULT_MAX_OUTPUT_TOKENS = 120
+# 0.2.9y: 3 s instead of 6 s.  On the platform 0.2.4y (3 s cap) scored 24.3/25 on
+# solve time against 24.1 for 0.2.8s (6 s cap); a late reply is dropped and the
+# agent's own candidates are used, recorded as a recovery.
+# 0.2.18y: the model is always given DEFAULT_MODEL_BUDGET_SECONDS; while the agent's own
+# search is still running it may answer until MODEL_HARD_FACTOR times that (waiting then
+# costs no solve time).  The request asks for one pick, so the reply is ~25 tokens.
+DEFAULT_MODEL_BUDGET_SECONDS = 2.0
+MODEL_HARD_FACTOR = 1.5
+DEFAULT_MAX_OUTPUT_TOKENS = 48
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
-TOOL_VERSION = "2.8"
+TOOL_VERSION = "2.19y"
 # Selection cost = ln(Replay us) + SIZE_WEIGHT * response MB.  Derived from the
 # 0.2.1 platform run (1.46 s/MB) and the new scoring curve; a sweep over slope
 # assumptions 0.7-2.0 s/MB showed gains for weights 0.08-0.15.
 SIZE_WEIGHT = 0.10
+PROFILE_MIB = 1 << 20
+# 0.2.12y: wall-clock budget for the AllGather block search (dynamic programme per width).
+# 0.2.14y: the platform ran the 0.2.12y search about 5x slower than local tests,
+# so the budget is a hard deadline checked between block plans.
+BLOCK_SEARCH_BUDGET_SECONDS = 0.8
+# 0.2.18y: extra time to re-plan key AllGather blocks at the full path width (capped
+# plans lost most of the 0.2.12y mesh2d gain); only blocks whose split-aware cost drops
+# switch.  AllReduce blocks gained nothing from it on the public examples.
+BLOCK_WIDE_BUDGET_SECONDS = 0.6
+BLOCK_WIDTHS = (16, 8)
+BLOCK_EXTRA_WIDTHS = 0
 
-SYSTEM_PROMPT = (
-    "You pick collective-communication schedule parameters. A tool builds each pick on the "
-    "current topology, checks it and measures Replay time; the lowest cost valid one is used. "
-    "cost = ln(Replay us) + 0.1*response_MB (big responses add solve time). "
-    "Algorithms: all-gather 'doubling'. all-reduce 'rs_ag' (reduce-scatter on rs_dims dims then "
-    "all-gather; ~2x data instead of 8x; response MB grows with split), 'tree' (tiny response, "
-    "more rounds), 'doubling'. width = parallel switch paths per pair. "
-    'Reply JSON only: {"c":[[algorithm,split,width,rs_dims],...],"m":2,"t":1} (rs_dims 0 unless rs_ag). '
-    "Optional m controls remapping the best rs_ag candidate: 0 original, 1 locality, 2 resource-aware; "
-    "omit for agent choice. Mapping path-work gains are rough screening, not Replay times. "
-    "Optional t controls a separate two-tree AllReduce trial: 0 disable, 1 split slots equally, "
-    "2 first tree gets 1/4, 3 first gets 3/4; omit for agent choice. Both are four-way trees "
-    "generated from current resource prices; integer Replay and full validation gate adoption."
-)
+def rank_mapping_enabled() -> bool:
+    """0.2.19y: rank mapping is off unless AGENTCC_RANK_MAPPING is set.
+
+    On a 70-instance perturbed local suite (platform-speed emulation) mapping changed
+    the communication score by -0.01 on average while its preparation cost 0.1-0.6 s
+    of local compute per case (about 4.5x that on the platform), an estimated -0.24
+    points overall.
+    """
+
+    return os.environ.get("AGENTCC_RANK_MAPPING", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def system_prompt() -> str:
+    mapping = rank_mapping_enabled()
+    return (
+        "Pick one collective schedule. The agent builds, routes, validates and Replay-measures your pick "
+        "next to its own; lowest cost = ln(Replay us) + 0.1*response_MB wins. rs_ag: reduce-scatter on "
+        "rs_dims dims then all-gather (response grows with split); tree: tiny response, more rounds; "
+        "width: switch paths per pair. "
+        + ("Optional m remaps the best schedule: 0 off, 1 locality, 2 resource. " if mapping else "")
+        + "Optional t, AllReduce two-tree trial: 0 off, 1 equal slots, 2 first tree 1/4, 3 first 3/4. "
+        + ("Omit m/t for agent choice. Gains shown are rough screens, not Replay times. " if mapping
+           else "Omit t for agent choice. ")
+        # 0.2.19y: the example carries no m/t, so a copied example does not force a
+        # re-run of the agent's finished pipeline after the reply.
+        + 'Reply JSON only: {"c":[[algorithm,split,width,rs_dims]]} (rs_dims 0 unless rs_ag); '
+        + ('add "m" or "t" only to override the agent.' if mapping else 'add "t" only to override the agent.')
+    )
+
+
+SYSTEM_PROMPT = system_prompt()
 
 
 def _configured(name: str, default: float) -> float:
@@ -134,8 +170,10 @@ def portfolio_raw(planner: Planner) -> list[dict[str, Any]]:
 
     raws: list[dict[str, Any]] = []
     if planner.operator == "all-gather":
+        # 0.2.19y: widths 2 and 4 were rarely best on the local suite; dropping them saved
+        # route-plan time at no measurable communication cost.
         for split in planner.splits[:2]:
-            for width in (2, 4, 8, 16):
+            for width in (8, 16):
                 raws.append({"algorithm": "doubling", "split": split, "path_width": width})
         return raws
     algorithms = ALGORITHMS[planner.operator] if planner.allow_copy else ("doubling",)
@@ -168,13 +206,24 @@ def rank_portfolio(
     return ranked
 
 
-def build_prompt(planner: Planner, profiles: list[dict[str, Any]], seeds: list, mappings: list) -> str:
+def path_work_dims(planner: Planner) -> list[list[Any]]:
+    """Per XOR dimension: mean shortest-path work per MiB, priced with shared resources.
+
+    0.2.16y: these come from the rank cost matrix that rank mapping computes anyway,
+    so the model request needs no route generation.
+    """
+
+    info = planner.network_rank_orders()["resource"]
+    return [[step, round(cost * PROFILE_MIB, 1)] for step, cost in zip(planner.steps, info["original_mean"])]
+
+
+def build_prompt(planner: Planner, dims: list[list[Any]], mappings: list) -> str:
     network = planner.network
     capacity = network.raw[0]
     algorithms = list(ALGORITHMS[planner.operator])
     if planner.operator == "all-reduce" and not planner.allow_copy:
         algorithms = ["doubling"]
-    tight = sorted(zip(network.resource_names, network.resource_capacity.tolist()), key=lambda item: item[1])[:3]
+    tight = sorted(zip(network.resource_names, network.resource_capacity.tolist()), key=lambda item: item[1])[:2]
     payload = {
         "op": planner.operator,
         "ranks": planner.rank_count,
@@ -184,19 +233,15 @@ def build_prompt(planner: Planner, profiles: list[dict[str, Any]], seeds: list, 
         "max_rounds": planner.max_rounds,
         "algorithms": algorithms,
         "max_width": MAX_PATH_WIDTH,
-        "prediction_scope": "initial_single_path_seeds",
+        "dims_scope": "path work per MiB before routing",
         "links": {
-            "directed": network.edge_count,
             "one_way": sum((dst, src) not in capacity for src, dst in capacity),
             "unequal_reverse": sum(capacity[(dst, src)] < bw for (src, dst), bw in capacity.items()
                                    if (dst, src) in capacity),
             "GBps_range": [float(network.edge_capacity.min()) / 1e9, float(network.edge_capacity.max()) / 1e9],
         },
         "tight_resources_GBps": [[name, round(capacity / 1e9, 2)] for name, capacity in tight],
-        "dims_us_per_MiB_w1": [[row["step"], round(row["us_per_MiB_single_path"], 1),
-                                _label(row["single_path_bottleneck"])] for row in profiles],
-        "agent_predicted": [_cfg_row(config) + [round(pred["us"], 1), round(pred["mb"], 2)]
-                            for _, config, pred in seeds],
+        "dims_us_per_MiB": dims,
     }
     if mappings:
         payload["rank_mapping_path_work_gain_pct"] = [
@@ -207,20 +252,10 @@ def build_prompt(planner: Planner, profiles: list[dict[str, Any]], seeds: list, 
     if (planner.operator == "all-reduce" and planner.allow_copy and planner.splits[-1] >= 4
             and tree_rounds <= planner.max_rounds):
         split = planner.splits[-1]
-        payload["dual_tree_trial"] = {
-            "split": split, "width": 4, "rounds": tree_rounds,
-            "slot_partitions": [[split // 2, split // 2], [split // 4, 3 * split // 4],
-                                [3 * split // 4, split // 4]],
-            "prediction_scope": "not_yet_measured",
-        }
-    return (
-        "agent_predicted rows = [algorithm,split,width,rs_dims,integer_Replay_us,approx_response_MB]. "
-        "Initial single-path seeds on this topology, not a full search. "
-        "The agent searches other widths while you decide:\n"
-        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        + f"\nGive up to {MAX_PROPOSALS} picks likely to lower the cost, best first; you may add picks "
-        "the agent did not list."
-    )
+        payload["dual_tree_trial"] = {"split": split, "rounds": tree_rounds}
+    return ("dims_us_per_MiB rows = [XOR step, us per MiB]. The agent measures while you decide:\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\nOne pick most likely to lower the cost.")
 
 
 _ARRAY_ROW = re.compile(r"\[\s*\"(\w+)\"\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*)?\]")
@@ -302,6 +337,33 @@ async def ask_model(messages: list[dict[str, str]], timeout_seconds: float, max_
     return content, metadata, call_id, None
 
 
+def blockable(planner: Planner, config: dict[str, Any]) -> bool:
+    """Schedules whose XOR dimensions can share rounds (0.2.12y AllGather, 0.2.13y rs_ag)."""
+
+    if config["algorithm"] == "rs_ag":
+        return config.get("rs_blocks") is None
+    return planner.operator == "all-gather" and config["algorithm"] == "doubling" and not config.get("blocks")
+
+
+def mapping_seed_config(planner: Planner) -> dict[str, Any] | None:
+    """The schedule shape whose rank mapping is screened for the prompt (no routing needed)."""
+
+    if not rank_mapping_enabled():
+        return None
+    if planner.operator == "all-gather":
+        return {"algorithm": "doubling", "split": planner.splits[0]}
+    if planner.allow_copy and planner.splits[-1] >= 2:
+        return {"algorithm": "rs_ag", "split": planner.splits[-1], "rs_dims": planner.splits[-1].bit_length() - 1}
+    return None
+
+
+def mappable(planner: Planner, config: dict[str, Any]) -> bool:
+    """Schedules whose XOR dimensions can be re-paired by a logical rank order (0.2.11y adds AllGather)."""
+
+    return rank_mapping_enabled() and (
+        config["algorithm"] == "rs_ag" or (planner.operator == "all-gather" and config["algorithm"] == "doubling"))
+
+
 def _public_config(config: dict[str, Any]) -> dict[str, Any]:
     return {key: config[key] for key in ("algorithm", "split", "path_width", "rs_dims", "order", "widths") if key in config}
 
@@ -316,6 +378,8 @@ class Evaluator:
         self.mapping_planners: dict[tuple[int, ...], Planner] = {}
         self.prepared_mapping: dict[str, Any] | None = None
         self.prepared_tree: dict[str, Any] = {"reason": "ineligible"}
+        self.prepared_blocks: dict[tuple[int, int], dict[str, Any]] = {}
+        self.speculative: dict[str, Any] | None = None
 
     def evaluate(self, raw: Any, source: str, parent_llm_call_id: str | None = None) -> dict[str, Any]:
         try:
@@ -397,7 +461,7 @@ class Evaluator:
         prepare_started = perf_counter()
         if built:
             best = min(self.results.values(), key=lambda row: row["score"])
-            if best["config"]["algorithm"] == "rs_ag":
+            if mappable(self.planner, best["config"]):
                 with tool_call("prepare_rank_mapping", "function", arguments={"config": best["config"]},
                                tool_version=TOOL_VERSION) as call:
                     self.prepared_mapping = self.public(self.mapping_trial(best["config"], None))
@@ -413,7 +477,155 @@ class Evaluator:
                     self.prepared_tree = {"reason": "unroutable_tree", "error": str(exc)}
                 call.result(self.public(self.prepared_tree))
         self.timings_ms["tree_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
+        prepare_started = perf_counter()
+        if built:
+            best = min(self.results.values(), key=lambda row: row["score"])
+            if blockable(self.planner, best["config"]):
+                with tool_call("prepare_dimension_blocks", "function", arguments={"config": best["config"]},
+                               tool_version=TOOL_VERSION) as call:
+                    call.result(self.prepare_blocks(self.planner, best["config"]))
+        self.timings_ms["blocks_prepare"] = round((perf_counter() - prepare_started) * 1000, 3)
         return rows, ranked
+
+    def speculate(self) -> None:
+        """0.2.15y: finish the agent's own pick while the model is still thinking.
+
+        After the reply this result is reused only if the model neither changed the
+        pick nor gave a mapping or tree choice; otherwise the pipeline runs again with
+        the model's input, so the model's decisions keep their own evidence.
+        """
+
+        started = perf_counter()
+        if any(row.get("status") == "built" for row in self.results.values()):
+            try:
+                selected = self.select()
+                self.speculative = {"selected": selected, "result": self.finalize(selected, None, None, None)}
+            except Exception as exc:  # noqa: BLE001 - the regular path still runs after the reply
+                self.speculative = {"error": f"{type(exc).__name__}: {exc}"}
+        self.timings_ms["speculative_finalize"] = round((perf_counter() - started) * 1000, 3)
+
+    def portfolio_and_speculate(self) -> tuple[list[dict[str, Any]], list]:
+        result = self.run_portfolio()
+        self.speculate()
+        return result
+
+    def finalize(self, best: dict[str, Any], mapping_choice: int | None, tree_choice: int | None,
+                 call_id: str | None) -> tuple[dict[str, Any], dict[str, Any], dict[str, float]]:
+        """Mapping, blocks, route refinement, dual tree and transfer split for one pick."""
+
+        details: dict[str, Any] = {}
+        timings: dict[str, float] = {}
+        started = perf_counter()
+        best, details["rank_mapping"] = self.remap(best, mapping_choice, call_id)
+        timings["rank_mapping"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        try:
+            best, details["allgather_blocks"] = self.try_blocks(best, call_id)
+        except Exception as exc:  # noqa: BLE001 - the plain schedule is already valid
+            details["allgather_blocks"] = {"error": f"{type(exc).__name__}: {exc}"}
+        timings["blocks_validate"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        try:
+            best, details["hierarchy"] = self.try_hierarchy(best, call_id)
+        except Exception as exc:  # noqa: BLE001 - the current schedule is already valid
+            details["hierarchy"] = {"error": f"{type(exc).__name__}: {exc}"}
+        timings["hier_validate"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        best, details["route_refinement"] = self.refine(best, call_id)
+        timings["refine_validate"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        best, details["dual_tree"] = self.try_dual_tree(best, tree_choice, call_id)
+        timings["dual_tree_validate"] = round((perf_counter() - started) * 1000, 3)
+        started = perf_counter()
+        try:
+            best, details["transfer_split"] = self.split_transfers(best, call_id)
+        except Exception as exc:  # noqa: BLE001 - the unsplit schedule is already valid
+            details["transfer_split"] = {"error": f"{type(exc).__name__}: {exc}"}
+        timings["transfer_split"] = round((perf_counter() - started) * 1000, 3)
+        return best, details, timings
+
+    def reusable(self, selected: dict[str, Any], mapping_choice: int | None, tree_choice: int | None) -> bool:
+        """The speculative result stands only when the reply left every agent choice to the agent."""
+
+        spec = self.speculative
+        return (bool(spec) and "result" in spec and spec["selected"] is selected
+                and mapping_choice is None and tree_choice is None)
+
+    def prepare_blocks(self, planner: Planner, config: dict[str, Any]) -> dict[str, Any]:
+        """Block search at the config's width first, then wider widths while the budget lasts."""
+
+        deadline = perf_counter() + BLOCK_SEARCH_BUDGET_SECONDS
+        wide_deadline = deadline + BLOCK_WIDE_BUDGET_SECONDS
+        widths = [config["path_width"]] + [width for width in BLOCK_WIDTHS if width != config["path_width"]][
+            :BLOCK_EXTRA_WIDTHS]
+        done = []
+        for width in widths:
+            key = (id(planner), width, config.get("rs_dims", 0))
+            if key not in self.prepared_blocks:
+                if perf_counter() >= deadline:
+                    break
+                started = perf_counter()
+                raw = {"algorithm": config["algorithm"], "split": config["split"], "path_width": width}
+                if config["algorithm"] == "rs_ag":
+                    raw["rs_dims"] = config["rs_dims"]
+                    base = planner.normalize_config(raw)
+                    rs_blocks, mid_blocks, predicted, singles = planner.allreduce_blocks(base, deadline=deadline)
+                    fields = {"rs_blocks": rs_blocks, "mid_blocks": mid_blocks}
+                else:
+                    base = planner.normalize_config(raw)
+                    blocks, predicted, singles = planner.allgather_blocks(base, deadline=deadline, wide_deadline=wide_deadline)
+                    fields = {"blocks": blocks}
+                self.prepared_blocks[key] = {"width": width, **fields, "predicted_us": predicted,
+                                             "single_dims_us": singles,
+                                             "elapsed_ms": round((perf_counter() - started) * 1000, 3)}
+            done.append(self.prepared_blocks[key])
+        return {"options": done}
+
+    def try_blocks(self, best: dict[str, Any], call_id: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Adopt the best block partition only if it is validated and cheaper once split."""
+
+        planner = best["_planner"]
+        info: dict[str, Any] = {"adopted": False, "before_us": best["estimate_us"]}
+        if not blockable(planner, best["config"]):
+            info["reason"] = "not_blockable"
+            return best, info
+        with tool_call("search_dimension_blocks", "function", arguments={"config": best["config"]},
+                       tool_version=TOOL_VERSION, parent_llm_call_id=call_id) as call:
+            options = self.prepare_blocks(planner, best["config"])["options"]
+            baseline = next((row["single_dims_us"] for row in options if row["width"] == best["config"]["path_width"]),
+                            None)
+            option = min(options, key=lambda row: row["predicted_us"]) if options else None
+            info["options"] = options
+            if option is None or baseline is None:
+                info["reason"] = "no_search_result"
+            elif option["predicted_us"] > baseline * 0.97:
+                info["reason"] = "integer_replay_screen"
+            else:
+                raw = {"algorithm": best["config"]["algorithm"], "split": best["config"]["split"],
+                       "path_width": option["width"],
+                       **{key: option[key] for key in ("blocks", "rs_blocks", "mid_blocks") if key in option}}
+                config = planner.normalize_config(raw)
+                # Split-aware integer predictions equal the split Replay estimate, so the
+                # comparison needs no extra builds; the final split pass applies the split.
+                new_us, old_us = option["predicted_us"], baseline
+                new_cost = math.log(new_us) + SIZE_WEIGHT * planner.predict(config)["mb"]
+                old_cost = math.log(old_us) + SIZE_WEIGHT * best["response_mb"]
+                info.update(chosen=option, split_before_us=old_us, split_after_us=new_us)
+                if new_us < old_us and new_cost < old_cost:
+                    answer = planner.build(config)
+                    estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
+                    size_mb = answer_size_estimate(answer) / 1e6
+                    if "mapping" in best["config"]:
+                        config["mapping"] = best["config"]["mapping"]
+                    best = {**best, "config": config, "_answer": answer, "_estimate": estimate,
+                            "estimate_us": estimate["total_us"], "response_mb": round(size_mb, 2),
+                            "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb,
+                            "sources": best["sources"] | {"agent_blocks"}}
+                    info["adopted"] = True
+                else:
+                    info["reason"] = "complete_schedule_cost"
+            call.result(info)
+        return best, info
 
     def run_proposals(self, proposals: list[Any], call_id: str | None) -> list[dict[str, Any]]:
         return [self.evaluate(proposal, "model", call_id) for proposal in proposals]
@@ -422,6 +634,10 @@ class Evaluator:
         """Validate built candidates in score order; return the first that passes."""
 
         for row in sorted(self.results.values(), key=lambda item: item["score"]):
+            if row.get("status") == "valid":
+                return row
+            if row.get("status") == "invalid":
+                continue
             try:
                 validate_answer(self.planner.task, self.planner.topology, row["_answer"], self.planner.network.raw)
             except Exception as exc:  # noqa: BLE001
@@ -471,8 +687,11 @@ class Evaluator:
     def remap(self, best: dict[str, Any], choice: int | None, call_id: str | None
               ) -> tuple[dict[str, Any], dict[str, Any]]:
         info: dict[str, Any] = {"model_choice": choice, "adopted": False, "before_us": best["estimate_us"]}
-        if best["config"]["algorithm"] != "rs_ag" or choice == 0:
-            info["reason"] = "not_rs_ag" if best["config"]["algorithm"] != "rs_ag" else "model_kept_original"
+        if not rank_mapping_enabled():
+            info["reason"] = "disabled"
+            return best, info
+        if not mappable(self.planner, best["config"]) or choice == 0:
+            info["reason"] = "not_mappable" if not mappable(self.planner, best["config"]) else "model_kept_original"
             return best, info
         started = perf_counter()
         with tool_call(
@@ -494,7 +713,6 @@ class Evaluator:
                     if candidate["status"] != "built":
                         info["reason"] = "candidate_rejected"
                     else:
-                        validate_answer(mapped.task, mapped.topology, candidate["_answer"], mapped.network.raw)
                         if candidate["estimate_us"] < best["estimate_us"] and candidate["score"] <= best["score"]:
                             candidate["config"]["mapping"] = trial["mapping"]
                             candidate["sources"].update(best["sources"])
@@ -515,6 +733,7 @@ class Evaluator:
         ) as call:
             answer, estimate, detail = refine_schedule_routes(
                 best["_planner"], best["config"], best["_answer"], best["_estimate"], size_weight=SIZE_WEIGHT,
+                validate=False,
             )
             call.result(detail)
         if detail["adopted"]:
@@ -522,6 +741,83 @@ class Evaluator:
             best = {**best, "_answer": answer, "_estimate": estimate, "estimate_us": estimate["total_us"],
                     "response_mb": round(size_mb, 2), "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb}
         return best, detail
+
+    def split_transfers(self, best: dict[str, Any], call_id: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Final pass: split path-bound transfers; adopt only a validated, cheaper schedule."""
+
+        planner = best["_planner"]
+        with tool_call(
+            "split_path_bound_transfers", "function",
+            arguments={"config": best["config"], "size_weight": SIZE_WEIGHT},
+            tool_version=TOOL_VERSION, parent_llm_call_id=call_id,
+        ) as call:
+            chunk_bytes = planner.data_size // best["_answer"]["split"]
+            answer, detail = split_path_bound_transfers(planner.network, best["_answer"], chunk_bytes,
+                                                        size_weight=SIZE_WEIGHT)
+            detail["adopted"] = False
+            if answer is not best["_answer"]:
+                estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
+                size_mb = answer_size_estimate(answer) / 1e6
+                score = math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb
+                detail.update(measured_us=estimate["total_us"], response_mb=size_mb)
+                if estimate["total_us"] < best["estimate_us"] and score < best["score"]:
+                    best = {**best, "_answer": answer, "_estimate": estimate, "estimate_us": estimate["total_us"],
+                            "response_mb": round(size_mb, 2), "score": score}
+                    detail["adopted"] = True
+                else:
+                    detail["rejection"] = "complete_schedule_cost"
+            call.result({key: value for key, value in detail.items() if key != "rounds"})
+        return best, detail
+
+    def try_hierarchy(self, best: dict[str, Any], call_id: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+        """0.2.18y: rs_ag whose middle phase reduces to representatives on the cheapest
+        middle dimensions; adopted only if its split-aware integer Replay cost is lower."""
+
+        planner = best["_planner"]
+        info: dict[str, Any] = {"adopted": False, "before_us": best["estimate_us"]}
+        if best["config"]["algorithm"] != "rs_ag" or planner.operator != "all-reduce":
+            info["reason"] = "not_rs_ag"
+            return best, info
+        with tool_call("search_hierarchy", "function", arguments={"config": best["config"]},
+                       tool_version=TOOL_VERSION, parent_llm_call_id=call_id) as call:
+            split, width = best["config"]["split"], best["config"]["path_width"]
+            baseline = planner.split_aware_us(best["config"])
+            top = split.bit_length() - 1
+            options = []
+            for rs_dims in sorted({top, max(1, top - 1)}, reverse=True):
+                for hier_k in range(1, len(planner.steps) - rs_dims + 1):
+                    raw = {"algorithm": "rs_ag", "split": split, "path_width": width, "rs_dims": rs_dims,
+                           "hier_k": hier_k}
+                    try:
+                        config = planner.normalize_config(raw)
+                    except AgentCCError:
+                        continue
+                    options.append((planner.split_aware_us(config), rs_dims, hier_k, config))
+            info["baseline_us"] = baseline
+            if not options:
+                info["reason"] = "no_option"
+            else:
+                predicted, rs_dims, hier_k, config = min(options, key=lambda item: item[0])
+                info["chosen"] = {"rs_dims": rs_dims, "hier_k": hier_k, "predicted_us": predicted}
+                new_cost = math.log(predicted) + SIZE_WEIGHT * planner.predict(config)["mb"]
+                old_cost = math.log(baseline) + SIZE_WEIGHT * best["response_mb"]
+                if predicted > baseline * 0.97:
+                    info["reason"] = "integer_replay_screen"
+                elif new_cost >= old_cost:
+                    info["reason"] = "complete_schedule_cost"
+                else:
+                    answer = planner.build(config)
+                    estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
+                    size_mb = answer_size_estimate(answer) / 1e6
+                    if "mapping" in best["config"]:
+                        config["mapping"] = best["config"]["mapping"]
+                    best = {**best, "config": config, "_answer": answer, "_estimate": estimate,
+                            "estimate_us": estimate["total_us"], "response_mb": round(size_mb, 2),
+                            "score": math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb,
+                            "sources": best["sources"] | {"agent_hierarchy"}}
+                    info.update(adopted=True, after_us=estimate["total_us"])
+            call.result(info)
+        return best, info
 
     def try_dual_tree(self, best: dict[str, Any], choice: int | None, call_id: str | None
                       ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -539,7 +835,6 @@ class Evaluator:
                 info["reason"] = "integer_replay_screen"
             else:
                 answer = build_dual_tree(planner, prepared, option["choice"])
-                validate_answer(planner.task, planner.topology, answer, planner.network.raw)
                 estimate = replay_estimate(planner.task, planner.topology, answer, planner.network.raw)
                 size_mb = answer_size_estimate(answer) / 1e6
                 score = math.log(estimate["total_us"]) + SIZE_WEIGHT * size_mb
@@ -579,34 +874,43 @@ class AgentCCAgent(BaseAgent):
                     lambda: Planner(task, topology, sum_notation=sum_notation_enabled()))
                 timings["parse"] = round((perf_counter() - phase_started) * 1000, 3)
                 phase_started = perf_counter()
-                profiles = await asyncio.to_thread(planner.dimension_profiles, 1)
-                timings["dimension_profiles"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                seed_raws = [{"algorithm": "doubling", "split": planner.splits[0], "path_width": 1}]
-                if planner.operator == "all-reduce" and planner.allow_copy:
-                    if planner.splits[-1] >= 2:
-                        seed_raws.append({"algorithm": "rs_ag", "split": planner.splits[-1], "path_width": 1})
-                    seed_raws.append({"algorithm": "tree", "split": planner.splits[0], "path_width": 1})
-                seeds = await asyncio.to_thread(rank_portfolio, planner, seed_raws)
-                timings["seed_predictions"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                rs_seed = next((config for _, config, _ in seeds if config["algorithm"] == "rs_ag"), None)
-                mappings = await asyncio.to_thread(planner.mapping_candidates, rs_seed) if rs_seed is not None else []
+                # 0.2.16y: the model is asked before any routing; the portfolio worker
+                # generates routes while the model is thinking.
+                mapping_seed = mapping_seed_config(planner)
+                mappings = (await asyncio.to_thread(planner.mapping_candidates, mapping_seed)
+                            if mapping_seed is not None else [])
+                dims = await asyncio.to_thread(path_work_dims, planner)
                 timings["mapping_generation"] = round((perf_counter() - phase_started) * 1000, 3)
-                prompt = build_prompt(planner, profiles, seeds, mappings)
+                prompt = build_prompt(planner, dims, mappings)
                 audit["planning_ms"] = round((perf_counter() - started) * 1000, 3)
-                audit["initial_candidate_count"] = len(seeds)
                 audit["prompt_bytes"] = len(prompt.encode())
 
             evaluator = Evaluator(planner)
             with state("tool_execution"):
                 # One worker owns planning caches until the portfolio has completed.
-                portfolio = asyncio.ensure_future(asyncio.to_thread(evaluator.run_portfolio))
+                portfolio = asyncio.ensure_future(asyncio.to_thread(evaluator.portfolio_and_speculate))
             with state("reasoning"):
                 llm_started = perf_counter()
                 audit["llm_started_ms"] = round((llm_started - started) * 1000, 3)
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
-                content, metadata, call_id, error = await ask_model(messages, model_budget, max_tokens)
+                messages = [{"role": "system", "content": system_prompt()}, {"role": "user", "content": prompt}]
+                hard_budget = max(model_budget, _configured("AGENT_LLM_HARD_SECONDS",
+                                                            MODEL_HARD_FACTOR * model_budget))
+                model_task = asyncio.ensure_future(ask_model(messages, hard_budget, max_tokens))
+                done, _ = await asyncio.wait({model_task}, timeout=model_budget)
+                audit["model_wait"] = "reply"
+                if not done:
+                    # Waiting is free while the agent's own search still runs.
+                    remaining = hard_budget - (perf_counter() - llm_started)
+                    if not portfolio.done() and remaining > 0:
+                        audit["model_wait"] = "search"
+                        await asyncio.wait({model_task, portfolio}, timeout=remaining,
+                                           return_when=asyncio.FIRST_COMPLETED)
+                if model_task.done():
+                    content, metadata, call_id, error = model_task.result()
+                else:
+                    model_task.cancel()
+                    await asyncio.wait({model_task})
+                    content, metadata, call_id, error = None, None, None, "model_timeout"
                 audit["llm_ms"] = round((perf_counter() - llm_started) * 1000, 3)
                 timings["model"] = audit["llm_ms"]
                 proposals, mapping_choice, tree_choice, parse_error = (([], None, None, error) if error
@@ -646,15 +950,17 @@ class AgentCCAgent(BaseAgent):
                     recovery("agent_emergency_reference", count=0)
                     best = await asyncio.to_thread(evaluator.emergency)
                 timings["select_validate"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                best, audit["rank_mapping"] = await asyncio.to_thread(evaluator.remap, best, mapping_choice, call_id)
-                timings["rank_mapping"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                best, audit["route_refinement"] = await asyncio.to_thread(evaluator.refine, best, call_id)
-                timings["refine_validate"] = round((perf_counter() - phase_started) * 1000, 3)
-                phase_started = perf_counter()
-                best, audit["dual_tree"] = await asyncio.to_thread(evaluator.try_dual_tree, best, tree_choice, call_id)
-                timings["dual_tree_validate"] = round((perf_counter() - phase_started) * 1000, 3)
+                validated = best  # select() and emergency() return a fully validated answer
+                if evaluator.reusable(best, mapping_choice, tree_choice):
+                    best, details, steps = evaluator.speculative["result"]
+                    audit["speculative_reuse"] = True
+                    steps = {key: 0.0 for key in steps}
+                else:
+                    best, details, steps = await asyncio.to_thread(
+                        evaluator.finalize, best, mapping_choice, tree_choice, call_id)
+                    audit["speculative_reuse"] = False
+                audit.update(details)
+                timings.update(steps)
                 audit["agent_candidates"] = [Evaluator.public(row) for row in portfolio_rows]
                 audit["model_candidates"] = [Evaluator.public(row) for row in model_rows]
                 audit["selected"] = {
@@ -670,6 +976,17 @@ class AgentCCAgent(BaseAgent):
                 )
 
             with state("final_answer"):
+                # 0.2.15y: later steps are gated by Replay estimates only; the answer that is
+                # returned is validated here, falling back to the validated selection.
+                phase_started = perf_counter()
+                if best is not validated:
+                    try:
+                        validate_answer(planner.task, planner.topology, best["_answer"], planner.network.raw)
+                    except Exception as exc:  # noqa: BLE001
+                        audit["final_validation_error"] = f"{type(exc).__name__}: {exc}"
+                        recovery("validated_selection_fallback", count=0)
+                        best = validated
+                timings["final_validate"] = round((perf_counter() - phase_started) * 1000, 3)
                 answer = best["_answer"]
                 attach_metrics(answer, best["_estimate"])
                 config = best["config"]
@@ -678,7 +995,13 @@ class AgentCCAgent(BaseAgent):
                     + (f" rs_dims={config['rs_dims']}" if "rs_dims" in config else "")
                     + (f" mapping={config['mapping']}" if "mapping" in config else "")
                     + (f" first_tree_slots={config['first_tree_slots']}" if "first_tree_slots" in config else "")
+                    + (f" blocks={config['blocks']}" if "blocks" in config else "")
+                    + (f" rs_blocks={config['rs_blocks']} mid_blocks={config['mid_blocks']}"
+                       if "rs_blocks" in config else "")
+                    + (f" hier_k={config['hier_k']}" if "hier_k" in config else "")
                     + f" from {'+'.join(sorted(best['sources']))}"
+                    # The platform returns no logs, so the answer itself carries the evidence.
+                    + f" llm_ms={round(audit['llm_ms'])} model={parse_error or 'ok'}"
                 )
                 audit["solve_ms"] = round((perf_counter() - started) * 1000, 3)
                 LOGGER.info("agentcc.audit %s", _safe_json(audit))
