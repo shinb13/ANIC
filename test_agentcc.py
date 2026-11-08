@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import unittest
 from copy import deepcopy
@@ -1058,8 +1059,8 @@ class AgentLoopTests(unittest.TestCase):
         prompt = request["messages"][-1]["content"]
         self.assertIn("plane-A-ingress", prompt)
         self.assertIn("dims_us_per_MiB", prompt)
-        self.assertLess(len(prompt), 2000)
-        self.assertEqual(request["max_tokens"], 120)
+        self.assertLess(len(prompt) + len(request["messages"][0]["content"]), 1400)
+        self.assertEqual(request["max_tokens"], 48)
         changed = deepcopy(data)
         changed["topology"]["resources"][0]["capacity"] = "1GB/s"
         _, _, events_changed = self._run(['{"c":[]}'], task_input=changed)
@@ -1355,9 +1356,34 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(audit_m["rank_mapping"]["reason"], "model_kept_original")
         validate_answer(task, topology, rerun["answer"])
 
-    def test_default_model_budget_is_three_seconds(self):
+    def test_default_model_budget_is_two_seconds_up_to_three_while_searching(self):
         module = self._load_agent_module({"tools": [], "recovery": [], "requests": []})
-        self.assertEqual(module.DEFAULT_MODEL_BUDGET_SECONDS, 3.0)
+        self.assertEqual(module.DEFAULT_MODEL_BUDGET_SECONDS, 2.0)
+        self.assertEqual(module.DEFAULT_MODEL_BUDGET_SECONDS * module.MODEL_HARD_FACTOR, 3.0)
+
+    def test_model_may_answer_after_soft_budget_while_search_runs(self):
+        data = two_plane_input("all-reduce")
+        loader = AgentLoopTests._load_agent_module
+
+        def slow_search(events):
+            module = loader(events)
+            original = module.Evaluator.portfolio_and_speculate
+
+            def delayed(self):
+                result = original(self)
+                time.sleep(0.6)
+                return result
+
+            module.Evaluator.portfolio_and_speculate = delayed
+            return module
+
+        with patch.object(AgentLoopTests, "_load_agent_module", staticmethod(slow_search)):
+            result, audit, _ = self._run(['{"c":[["rs_ag",8,2,3]]}'], task_input=data, delay=0.3,
+                                         environment={"AGENT_LLM_BUDGET_SECONDS": "0.1", "AGENT_LLM_HARD_SECONDS": "1.0"})
+        self.assertEqual(audit["model_wait"], "search")
+        self.assertIsNone(audit["model_error"])
+        self.assertIn("model=ok", result["answer"]["strategy"])
+        validate_answer(data["task"], data["topology"], result["answer"])
 
     def test_answer_records_model_outcome(self):
         data = two_plane_input("all-reduce")

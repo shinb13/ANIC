@@ -56,8 +56,12 @@ LOGGER = logging.getLogger(__name__)
 # 0.2.9y: 3 s instead of 6 s.  On the platform 0.2.4y (3 s cap) scored 24.3/25 on
 # solve time against 24.1 for 0.2.8s (6 s cap); a late reply is dropped and the
 # agent's own candidates are used, recorded as a recovery.
-DEFAULT_MODEL_BUDGET_SECONDS = 3.0
-DEFAULT_MAX_OUTPUT_TOKENS = 120
+# 0.2.18y: the model is always given DEFAULT_MODEL_BUDGET_SECONDS; while the agent's own
+# search is still running it may answer until MODEL_HARD_FACTOR times that (waiting then
+# costs no solve time).  The request asks for one pick, so the reply is ~25 tokens.
+DEFAULT_MODEL_BUDGET_SECONDS = 2.0
+MODEL_HARD_FACTOR = 1.5
+DEFAULT_MAX_OUTPUT_TOKENS = 48
 MAX_PROPOSALS = 3
 PORTFOLIO_BUILDS = 4
 TOOL_NAME = "evaluate_schedule"
@@ -75,18 +79,13 @@ BLOCK_WIDTHS = (16, 8)
 BLOCK_EXTRA_WIDTHS = 0
 
 SYSTEM_PROMPT = (
-    "You pick collective-communication schedule parameters. A tool builds each pick on the "
-    "current topology, checks it and measures Replay time; the lowest cost valid one is used. "
-    "cost = ln(Replay us) + 0.1*response_MB (big responses add solve time). "
-    "Algorithms: all-gather 'doubling'. all-reduce 'rs_ag' (reduce-scatter on rs_dims dims then "
-    "all-gather; ~2x data instead of 8x; response MB grows with split), 'tree' (tiny response, "
-    "more rounds), 'doubling'. width = parallel switch paths per pair. "
-    'Reply JSON only: {"c":[[algorithm,split,width,rs_dims],...],"m":2,"t":1} (rs_dims 0 unless rs_ag). '
-    "Optional m controls remapping the best rs_ag or all-gather candidate: 0 original, 1 locality, 2 resource-aware; "
-    "omit for agent choice. Mapping path-work gains are rough screening, not Replay times. "
-    "Optional t controls a separate two-tree AllReduce trial: 0 disable, 1 split slots equally, "
-    "2 first tree gets 1/4, 3 first gets 3/4; omit for agent choice. Both are four-way trees "
-    "generated from current resource prices; integer Replay and full validation gate adoption."
+    "Pick one collective schedule. The agent builds, routes, validates and Replay-measures your pick "
+    "next to its own; lowest cost = ln(Replay us) + 0.1*response_MB wins. rs_ag: reduce-scatter on "
+    "rs_dims dims then all-gather (response grows with split); tree: tiny response, more rounds; "
+    "width: switch paths per pair. Optional m remaps the best schedule: 0 off, 1 locality, 2 resource. "
+    "Optional t, AllReduce two-tree trial: 0 off, 1 equal slots, 2 first tree 1/4, 3 first 3/4. "
+    "Omit m/t for agent choice. Gains shown are rough screens, not Replay times. "
+    'Reply JSON only: {"c":[[algorithm,split,width,rs_dims]],"m":2,"t":1} (rs_dims 0 unless rs_ag).'
 )
 
 
@@ -187,8 +186,7 @@ def path_work_dims(planner: Planner) -> list[list[Any]]:
     """
 
     info = planner.network_rank_orders()["resource"]
-    return [[step, round(cost * PROFILE_MIB, 1), "path_work_estimate"]
-            for step, cost in zip(planner.steps, info["original_mean"])]
+    return [[step, round(cost * PROFILE_MIB, 1)] for step, cost in zip(planner.steps, info["original_mean"])]
 
 
 def build_prompt(planner: Planner, dims: list[list[Any]], mappings: list) -> str:
@@ -197,7 +195,7 @@ def build_prompt(planner: Planner, dims: list[list[Any]], mappings: list) -> str
     algorithms = list(ALGORITHMS[planner.operator])
     if planner.operator == "all-reduce" and not planner.allow_copy:
         algorithms = ["doubling"]
-    tight = sorted(zip(network.resource_names, network.resource_capacity.tolist()), key=lambda item: item[1])[:3]
+    tight = sorted(zip(network.resource_names, network.resource_capacity.tolist()), key=lambda item: item[1])[:2]
     payload = {
         "op": planner.operator,
         "ranks": planner.rank_count,
@@ -207,9 +205,8 @@ def build_prompt(planner: Planner, dims: list[list[Any]], mappings: list) -> str
         "max_rounds": planner.max_rounds,
         "algorithms": algorithms,
         "max_width": MAX_PATH_WIDTH,
-        "dims_scope": "mean shortest-path work per MiB with shared-resource prices, before routing",
+        "dims_scope": "path work per MiB before routing",
         "links": {
-            "directed": network.edge_count,
             "one_way": sum((dst, src) not in capacity for src, dst in capacity),
             "unequal_reverse": sum(capacity[(dst, src)] < bw for (src, dst), bw in capacity.items()
                                    if (dst, src) in capacity),
@@ -227,19 +224,10 @@ def build_prompt(planner: Planner, dims: list[list[Any]], mappings: list) -> str
     if (planner.operator == "all-reduce" and planner.allow_copy and planner.splits[-1] >= 4
             and tree_rounds <= planner.max_rounds):
         split = planner.splits[-1]
-        payload["dual_tree_trial"] = {
-            "split": split, "width": 4, "rounds": tree_rounds,
-            "slot_partitions": [[split // 2, split // 2], [split // 4, 3 * split // 4],
-                                [3 * split // 4, split // 4]],
-            "prediction_scope": "not_yet_measured",
-        }
-    return (
-        "dims_us_per_MiB rows = [step, estimated us per MiB, source]: a routing-free estimate per XOR "
-        "dimension on this topology. The agent routes and measures candidates while you decide:\n"
-        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        + f"\nGive up to {MAX_PROPOSALS} picks likely to lower the cost, best first; you may add picks "
-        "the agent did not list."
-    )
+        payload["dual_tree_trial"] = {"split": split, "rounds": tree_rounds}
+    return ("dims_us_per_MiB rows = [XOR step, us per MiB]. The agent measures while you decide:\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\nOne pick most likely to lower the cost.")
 
 
 _ARRAY_ROW = re.compile(r"\[\s*\"(\w+)\"\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*)?\]")
@@ -870,7 +858,24 @@ class AgentCCAgent(BaseAgent):
                 llm_started = perf_counter()
                 audit["llm_started_ms"] = round((llm_started - started) * 1000, 3)
                 messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
-                content, metadata, call_id, error = await ask_model(messages, model_budget, max_tokens)
+                hard_budget = max(model_budget, _configured("AGENT_LLM_HARD_SECONDS",
+                                                            MODEL_HARD_FACTOR * model_budget))
+                model_task = asyncio.ensure_future(ask_model(messages, hard_budget, max_tokens))
+                done, _ = await asyncio.wait({model_task}, timeout=model_budget)
+                audit["model_wait"] = "reply"
+                if not done:
+                    # Waiting is free while the agent's own search still runs.
+                    remaining = hard_budget - (perf_counter() - llm_started)
+                    if not portfolio.done() and remaining > 0:
+                        audit["model_wait"] = "search"
+                        await asyncio.wait({model_task, portfolio}, timeout=remaining,
+                                           return_when=asyncio.FIRST_COMPLETED)
+                if model_task.done():
+                    content, metadata, call_id, error = model_task.result()
+                else:
+                    model_task.cancel()
+                    await asyncio.wait({model_task})
+                    content, metadata, call_id, error = None, None, None, "model_timeout"
                 audit["llm_ms"] = round((perf_counter() - llm_started) * 1000, 3)
                 timings["model"] = audit["llm_ms"]
                 proposals, mapping_choice, tree_choice, parse_error = (([], None, None, error) if error
